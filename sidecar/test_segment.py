@@ -1,0 +1,208 @@
+"""Tests for segment.py (T2.1).
+
+Two tiers:
+
+1. Pipeline tests (always run, no model weights needed) -- prove the real
+   mask -> contour -> simplify -> normalize code path end to end against a
+   synthetic, precomputed binary mask (an ellipse) via the StubEllipseModel.
+   These are the tests that matter for "is the geometry code correct".
+
+2. Real-SAM2 integration test -- runs the actual tiny SAM2 checkpoint against
+   the bundled portrait fixture, if the checkpoint file is present. Skipped
+   (not failed) if the checkpoint hasn't been downloaded, so this file is
+   still runnable in an environment where the weights were skipped as
+   impractical.
+
+Run: .venv/bin/python3.12 -m pytest test_segment.py -v
+"""
+
+import os
+
+import cv2
+import numpy as np
+import pytest
+from PIL import Image
+
+from segment import (
+    Box,
+    Point,
+    largest_external_contour,
+    load_model,
+    normalize_polygon,
+    polygon_bbox,
+    segment,
+    simplify_polygon,
+)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT = os.path.join(HERE, "checkpoints", "sam2.1_hiera_tiny.pt")
+MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
+PORTRAIT = os.path.join(HERE, "fixtures", "portrait.jpg")
+
+
+def _make_synthetic_image(tmp_path, w=400, h=300):
+    """A plain gray canvas -- content doesn't matter for the stub backend,
+    only image dimensions do (for normalization)."""
+    img = Image.new("RGB", (w, h), color=(128, 128, 128))
+    path = os.path.join(tmp_path, "synthetic.png")
+    img.save(path)
+    return path, w, h
+
+
+# --------------------------------------------------------------------------
+# 1. Pipeline tests against a synthetic/precomputed mask (stub backend)
+# --------------------------------------------------------------------------
+
+
+def test_stub_box_prompt_returns_polygon_matching_bbox(tmp_path):
+    path, w, h = _make_synthetic_image(tmp_path)
+    box = {"x": 0.2, "y": 0.3, "w": 0.4, "h": 0.35}
+
+    out = segment(path, box=box, backend="stub", target_min=10, target_max=30)
+
+    assert 10 <= len(out["polygon"]) <= 30
+    for p in out["polygon"]:
+        assert 0.0 <= p["x"] <= 1.0
+        assert 0.0 <= p["y"] <= 1.0
+
+    # bbox of the returned polygon must be close to the prompted box (an
+    # ellipse inscribed in the box touches the box edges at its four
+    # extrema, so the bboxes should match near-exactly).
+    bb = out["bbox"]
+    assert bb["x"] == pytest.approx(box["x"], abs=0.02)
+    assert bb["y"] == pytest.approx(box["y"], abs=0.02)
+    assert bb["w"] == pytest.approx(box["w"], abs=0.02)
+    assert bb["h"] == pytest.approx(box["h"], abs=0.02)
+    assert out["score"] == 1.0
+    assert out["backend"] == "stub-ellipse"
+
+
+def test_stub_point_prompt_centers_mask_on_click(tmp_path):
+    path, w, h = _make_synthetic_image(tmp_path)
+    out = segment(path, points=[{"x": 0.5, "y": 0.5}], backend="stub")
+    bb = out["bbox"]
+    cx = bb["x"] + bb["w"] / 2
+    cy = bb["y"] + bb["h"] / 2
+    assert cx == pytest.approx(0.5, abs=0.02)
+    assert cy == pytest.approx(0.5, abs=0.02)
+
+
+def test_simplify_reduces_point_count_and_preserves_area():
+    """Direct unit test of the Douglas-Peucker step: build a many-point
+    circular contour, simplify it, and check N -> M lands in range while
+    IoU against the original polygon stays high (simplification isn't
+    destroying the shape)."""
+    h = w = 500
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (250, 250), 180, 1, thickness=-1)
+
+    raw = largest_external_contour(mask.astype(bool))
+    n_raw = len(raw)
+    assert n_raw > 30  # a circle rasterized at this radius has hundreds of contour points
+
+    simplified = simplify_polygon(raw, target_min=10, target_max=30)
+    n_simplified = len(simplified)
+    assert 10 <= n_simplified <= 30
+
+    poly_mask = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(poly_mask, [simplified.reshape(-1, 1, 2).astype(np.int32)], 1)
+    inter = np.logical_and(poly_mask.astype(bool), mask.astype(bool)).sum()
+    union = np.logical_or(poly_mask.astype(bool), mask.astype(bool)).sum()
+    iou = inter / union
+    assert iou > 0.9
+
+    # Recorded for the acceptance report: raw -> simplified node count.
+    print(f"circle contour: {n_raw} raw points -> {n_simplified} simplified points, IoU={iou:.4f}")
+
+
+def test_polygon_is_closed_ring_in_order():
+    """cv2.findContours returns points already ordered around the boundary
+    (a closed ring, first point not repeated at the end). Confirm that
+    invariant holds through simplify + normalize, and that consecutive
+    points don't jump erratically (rough monotonic angular progression
+    around the centroid for a convex-ish shape)."""
+    h = w = 300
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(mask, (150, 150), (100, 60), 0, 0, 360, 1, thickness=-1)
+
+    raw = largest_external_contour(mask.astype(bool))
+    simplified = simplify_polygon(raw, 10, 30)
+    polygon = normalize_polygon(simplified, w, h)
+
+    cx = sum(p["x"] for p in polygon) / len(polygon)
+    cy = sum(p["y"] for p in polygon) / len(polygon)
+    angles = [np.arctan2(p["y"] - cy, p["x"] - cx) for p in polygon]
+    # unwrap and check monotonic (allow either winding direction)
+    diffs = np.diff(angles)
+    # wrap diffs into (-pi, pi]
+    diffs = (diffs + np.pi) % (2 * np.pi) - np.pi
+    same_sign = all(d >= -1e-6 for d in diffs) or all(d <= 1e-6 for d in diffs)
+    assert same_sign, "polygon points are not in consistent angular (boundary) order"
+
+
+def test_missing_mask_raises():
+    empty_mask = np.zeros((50, 50), dtype=bool)
+    with pytest.raises(ValueError):
+        largest_external_contour(empty_mask)
+
+
+def test_multi_blob_mask_keeps_only_largest_external_contour():
+    """Two disjoint blobs -> we must keep exactly the larger one (a path
+    mask is a single closed contour; see segment.py module docstring)."""
+    h = w = 300
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (80, 80), 40, 1, thickness=-1)  # small blob, area ~ pi*40^2
+    cv2.circle(mask, (220, 220), 70, 1, thickness=-1)  # big blob, area ~ pi*70^2
+
+    contour = largest_external_contour(mask.astype(bool))
+    area = cv2.contourArea(contour.reshape(-1, 1, 2))
+    # should match the big blob, not the small one
+    assert area > 10000  # pi*70^2 ~= 15393; pi*40^2 ~= 5027
+
+
+def test_segment_requires_at_least_one_prompt(tmp_path):
+    path, _, _ = _make_synthetic_image(tmp_path)
+    with pytest.raises(ValueError):
+        segment(path, backend="stub")
+
+
+# --------------------------------------------------------------------------
+# 2. Real SAM2 integration test (skipped if checkpoint not downloaded)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not os.path.exists(CHECKPOINT) or not os.path.exists(PORTRAIT),
+    reason="real SAM2 checkpoint or portrait fixture not present locally; see README to fetch both",
+)
+def test_real_sam2_face_segmentation_on_portrait():
+    model = load_model("sam2", checkpoint=CHECKPOINT, model_cfg=MODEL_CFG, device="cpu")
+
+    # Box roughly bracketing the face in fixtures/portrait.jpg (960x1431,
+    # Mona Lisa -- see README for how this fixture was chosen/fetched).
+    box = {"x": 0.344, "y": 0.105, "w": 0.271, "h": 0.217}
+    out = segment(PORTRAIT, box=box, backend="sam2", model=model, target_min=10, target_max=30)
+
+    assert out["backend"] == "sam2"
+    assert out["score"] is not None and out["score"] > 0.5
+    assert 10 <= len(out["polygon"]) <= 30
+
+    prompt_bb = (box["x"], box["y"], box["x"] + box["w"], box["y"] + box["h"])
+    pred_bb = out["bbox"]
+    pred = (pred_bb["x"], pred_bb["y"], pred_bb["x"] + pred_bb["w"], pred_bb["y"] + pred_bb["h"])
+    ix0, iy0 = max(prompt_bb[0], pred[0]), max(prompt_bb[1], pred[1])
+    ix1, iy1 = min(prompt_bb[2], pred[2]), min(prompt_bb[3], pred[3])
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    area_prompt = (prompt_bb[2] - prompt_bb[0]) * (prompt_bb[3] - prompt_bb[1])
+    area_pred = (pred[2] - pred[0]) * (pred[3] - pred[1])
+    iou = inter / (area_prompt + area_pred - inter)
+
+    print(f"real SAM2: score={out['score']:.3f} raw={out['num_points_raw']} "
+          f"simplified={out['num_points_simplified']} bbox_iou_vs_prompt={iou:.3f}")
+    assert iou > 0.4  # face mask bbox should substantially overlap the prompted box
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

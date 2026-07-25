@@ -27,21 +27,118 @@ local images_by_id = {
   [102] = {id = 102, filename = "DSC_0002.NEF", path = "/photos", rating = 3},
   [103] = {id = 103, filename = "OTHER.NEF",   path = "/photos", rating = 4},
 }
+-- attach_tag/detach_tag mutate the tag's own array part (see stub_tags
+-- below), mirroring the real image:attach_tag(tag)/image:detach_tag(tag)
+-- Lua API used by methods.tag_photo.
+for _, img in pairs(images_by_id) do
+  img.attach_tag = function(self, tag)
+    for _, v in ipairs(tag) do if v == self.id then return end end
+    table.insert(tag, self.id)
+  end
+  img.detach_tag = function(self, tag)
+    for i, v in ipairs(tag) do
+      if v == self.id then table.remove(tag, i); return end
+    end
+  end
+end
 local iter_list = {}
 for _, img in pairs(images_by_id) do table.insert(iter_list, img) end
 local stub_db = setmetatable(iter_list, {
   __index = function(_, k) return images_by_id[k] end,
 })
+-- Real darktable exposes dt.database.get_image(id) as the by-real-id lookup
+-- (dt.database[n] is positional/OFFSET, a different thing entirely -- see
+-- src-dt/src/lua/database.c:database_numindex vs database_get_image).
+stub_db.get_image = function(id) return images_by_id[id] end
+
+-- ---- Stub dt.tags -----------------------------------------------------
+-- A tag object's array part holds the ids of images it's attached to, so
+-- both `#tag` (count) and `tag:get_tagged_images()` work off plain ipairs.
+local tags_by_name = {}
+local tags_array = {}
+local function make_tag(name)
+  local tag = {name = name}
+  tag.get_tagged_images = function(self)
+    local imgs = {}
+    for _, imgid in ipairs(self) do table.insert(imgs, images_by_id[imgid]) end
+    return imgs
+  end
+  return tag
+end
+local stub_tags = setmetatable({}, {
+  __index = function(_, k)
+    if k == "find" then
+      return function(name) return tags_by_name[name] end
+    elseif k == "create" then
+      return function(name)
+        local tag = make_tag(name)
+        tags_by_name[name] = tag
+        table.insert(tags_array, tag)
+        return tag
+      end
+    else
+      return tags_array[k]
+    end
+  end,
+})
 
 local dt_log = {}
 local stub_dt = {
   database = stub_db,
+  -- dt.collection is the currently-open lighttable view; these tests don't
+  -- exercise the collection-vs-library distinction itself (that's a
+  -- darktable-core behavior, not plugin logic), so point it at the same
+  -- fixture data as dt.database.
+  collection = stub_db,
+  tags = stub_tags,
   print_log = function(msg) table.insert(dt_log, msg) end,
   control = {
     dispatch = function(_) end,
     sleep = function(_) end,
   },
 }
+local gui_view_state = {name = "lighttable"}
+stub_dt.gui = {
+  -- Minimal stub: empty action_images means the selection never "resolves"
+  -- (see open_darkroom's diagnostic pre-check), so most tests hit the
+  -- early-return diagnostic branch without needing to simulate an actual
+  -- lighttable<->darkroom view switch. current_view is stateful (records
+  -- the last view "switched" to) so the same-view-is-a-pipeline-no-op bug
+  -- (bugreport 2026-07-25) can actually be exercised: bouncing through
+  -- lighttable must be visible as a real state change, not a fixed stub.
+  selection = function(sel) return sel or {} end,
+  action_images = {},
+  current_view = function(target)
+    if target then gui_view_state = {name = target.name} end
+    return gui_view_state
+  end,
+  views = {
+    darkroom = {name = "darkroom"},
+    lighttable = {name = "lighttable"},
+  },
+}
+
+-- ---- Stub dt.develop --------------------------------------------------
+-- Records every call so tests can assert exactly what the Lua wrapper
+-- methods (dev_retouch_*) forwarded to the (real, C-only, unstubbable) core
+-- binding -- these tests lock in the bridge-layer arg validation/defaults
+-- contract, not the C logic itself (see PLAN.md's retouch section).
+local develop_calls = {}
+stub_dt.develop = {
+  retouch_add_shape = function(...)
+    table.insert(develop_calls, {name = "retouch_add_shape", args = {...}})
+    return {ok = true, formid = 42, algorithm = "heal", wavelet_scale = 2}
+  end,
+  retouch_delete_shape = function(...)
+    table.insert(develop_calls, {name = "retouch_delete_shape", args = {...}})
+    return {ok = true}
+  end,
+  retouch_list_shapes = function(...)
+    table.insert(develop_calls, {name = "retouch_list_shapes", args = {...}})
+    return {module = "retouch", instance = 0, shapes = {}}
+  end,
+}
+
 -- Make `require("darktable")` return our stub by pre-populating package.loaded.
 package.loaded.darktable = stub_dt
 
@@ -103,12 +200,238 @@ do
   table.remove(iter_list)
 end
 
+-- ---- methods.view_photos: scope defaults to the open collection, not the
+-- whole library (bug: view_photos was scanning dt.database unconditionally
+-- and returning photos outside whatever collection/filter was open) --------
+do
+  -- Collection narrower than the library: only image 103.
+  stub_dt.collection = setmetatable({images_by_id[103]}, {
+    __index = function(_, k) return images_by_id[k] end,
+  })
+  local scoped = internals.methods.view_photos({limit = 10})
+  assertEq(#scoped, 1, "view_photos default scope only sees the open collection")
+  assertEq(scoped[1].id, "103", "view_photos default scope returns the collection's image")
+
+  local whole = internals.methods.view_photos({limit = 10, scope = "library"})
+  assertEq(#whole, 3, "view_photos scope=library ignores the open collection")
+
+  stub_dt.collection = stub_db
+end
+
 -- ---- methods.rate_photos ---------------------------------------------------
 do
   local result = internals.methods.rate_photos({photo_ids = {"101", "102"}, rating = 1})
   assertEq(result.updated, 2, "rate_photos updated count")
   assertEq(images_by_id[101].rating, 1, "rate_photos changed image 101 rating")
   assertEq(images_by_id[102].rating, 1, "rate_photos changed image 102 rating")
+end
+
+-- ---- methods.open_darkroom: real-id lookup (bugreport 2026-07-24: image ids
+-- from view_photos/list_photos_in_collection are real database ids, NOT
+-- positions -- dt.database[id] is a positional OFFSET lookup and returning
+-- the wrong/no image for any id past the library's row count or past any
+-- id gap; dt.database.get_image(id) is the actual by-id lookup) ------------
+do
+  local result = internals.methods.open_darkroom({image_id = "103"})
+  assertTrue(result.diagnostic ~= nil,
+    "open_darkroom (stubbed gui) hits the no-view-switch diagnostic branch")
+  assertEq(result.requested_image_id, 103,
+    "open_darkroom resolves real image id 103 via get_image, not a position")
+end
+
+do
+  local ok, err = pcall(internals.methods.open_darkroom, {image_id = "999999"})
+  assertTrue(not ok, "open_darkroom errors for an id with no matching image")
+  assertTrue(string.find(err or "", "image not found") ~= nil,
+    "open_darkroom error names the missing id")
+end
+
+-- ---- methods.open_darkroom: bugreport 2026-07-25 -- switching
+-- current_view to darkroom while ALREADY in darkroom is a pipeline no-op
+-- (views/view.c only calls enter()/dt_dev_load_image() on a real
+-- old_view != new_view transition), so opening a second image right after
+-- the first must bounce through lighttable to force a genuine reload. -----
+do
+  -- Selection resolves cleanly this time (unlike the diagnostic-branch
+  -- tests above) so execution reaches the actual view-switch logic.
+  stub_dt.gui.current_view(stub_dt.gui.views.darkroom)
+  stub_dt.gui.action_images = {images_by_id[103]}
+
+  local result = internals.methods.open_darkroom({image_id = "103"})
+  assertTrue(result.bounced_through_lighttable,
+    "open_darkroom bounces through lighttable when already in darkroom")
+  assertEq(result.view, "darkroom",
+    "open_darkroom ends back in darkroom after the forced bounce")
+
+  stub_dt.gui.action_images = {}
+end
+
+do
+  -- Control case: NOT already in darkroom (coming from lighttable) should
+  -- NOT bounce -- the real view.c transition already fires enter() on its
+  -- own, so a bounce here would just be a pointless extra round trip.
+  stub_dt.gui.current_view(stub_dt.gui.views.lighttable)
+  stub_dt.gui.action_images = {images_by_id[103]}
+
+  local result = internals.methods.open_darkroom({image_id = "103"})
+  assertTrue(not result.bounced_through_lighttable,
+    "open_darkroom does not bounce when coming from lighttable")
+  assertEq(result.view, "darkroom", "open_darkroom still ends in darkroom")
+
+  stub_dt.gui.action_images = {}
+end
+
+-- ---- methods.dev_retouch_add_shape / dev_retouch_delete_shape /
+-- dev_retouch_list_shapes: bridge-layer arg validation/defaults/forwarding
+-- contract (the actual shape-creation C logic lives in src/lua/develop.c
+-- and can only be verified against a real darktable process). ------------
+do
+  develop_calls = {}
+  local result = internals.methods.dev_retouch_add_shape({
+    op = "retouch",
+    algorithm = "heal",
+    target = {x = 0.4, y = 0.3},
+    source = {x = 0.35, y = 0.3},
+    radius = 0.02,
+  })
+  assertEq(result.formid, 42, "dev_retouch_add_shape forwards the C result")
+  assertEq(#develop_calls, 1, "dev_retouch_add_shape calls dt.develop.retouch_add_shape once")
+  local call = develop_calls[1]
+  assertEq(call.name, "retouch_add_shape", "correct C function called")
+  assertEq(call.args[1], "retouch", "op forwarded")
+  assertEq(call.args[2], 0, "instance defaults to 0")
+  assertEq(call.args[3], "heal", "algorithm forwarded")
+  assertEq(call.args[4], 0.4, "target.x forwarded")
+  assertEq(call.args[5], 0.3, "target.y forwarded")
+  assertEq(call.args[6], 0.02, "radius forwarded")
+  assertEq(call.args[7], 0.0, "feather defaults to 0.0")
+  assertEq(call.args[8], 0.35, "source.x forwarded")
+  assertEq(call.args[9], 0.3, "source.y forwarded")
+  assertEq(call.args[10], nil, "wavelet_scale omitted -> nil (C default)")
+  assertEq(call.args[11], 1.0, "opacity defaults to 1.0")
+end
+
+do
+  develop_calls = {}
+  internals.methods.dev_retouch_add_shape({
+    op = "retouch",
+    instance = 1,
+    algorithm = "clone",
+    target = {x = 0.5, y = 0.5},
+    source = {x = 0.6, y = 0.6},
+    radius = 0.03,
+    feather = 0.1,
+    wavelet_scale = 3,
+    opacity = 0.8,
+  })
+  local call = develop_calls[1]
+  assertEq(call.args[2], 1, "instance forwarded when given")
+  assertEq(call.args[7], 0.1, "feather forwarded when given")
+  assertEq(call.args[10], 3, "wavelet_scale forwarded when given")
+  assertEq(call.args[11], 0.8, "opacity forwarded when given")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_retouch_add_shape, {
+    op = "retouch", algorithm = "heal", target = {x = 0.4, y = 0.3}, radius = 0.02,
+  })
+  assertTrue(not ok, "dev_retouch_add_shape errors without a source point")
+  assertTrue(string.find(err or "", "source") ~= nil, "error mentions source")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_retouch_add_shape, {
+    op = "retouch", algorithm = "heal", shape_type = "path",
+    target = {x = 0.4, y = 0.3}, source = {x = 0.35, y = 0.3}, radius = 0.02,
+  })
+  assertTrue(not ok, "dev_retouch_add_shape errors on unsupported shape_type")
+  assertTrue(string.find(err or "", "circle") ~= nil, "error mentions circle")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_retouch_delete_shape({op = "retouch", formid = 42})
+  assertTrue(result.ok, "dev_retouch_delete_shape forwards the C result")
+  local call = develop_calls[1]
+  assertEq(call.name, "retouch_delete_shape", "correct C function called")
+  assertEq(call.args[1], "retouch", "op forwarded")
+  assertEq(call.args[2], 0, "instance defaults to 0")
+  assertEq(call.args[3], 42, "formid forwarded")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_retouch_list_shapes({op = "retouch"})
+  assertEq(result.module, "retouch", "dev_retouch_list_shapes forwards the C result")
+  local call = develop_calls[1]
+  assertEq(call.name, "retouch_list_shapes", "correct C function called")
+  assertEq(call.args[1], "retouch", "op forwarded")
+  assertEq(call.args[2], 0, "instance defaults to 0")
+end
+
+-- ---- methods.tag_photo ------------------------------------------------------
+do
+  local result = internals.methods.tag_photo({photo_ids = {"101", "102"}, tags = {"keep"}})
+  assertEq(result.updated, 2, "tag_photo updated count")
+  assertEq(#result.tags_created, 1, "tag_photo created one new tag")
+  assertEq(result.tags_created[1], "keep", "tag_photo reports created tag name")
+  assertEq(#tags_by_name["keep"], 2, "tag 'keep' now attached to 2 images")
+end
+
+do
+  -- Re-attaching an existing tag must not report it as newly created, and
+  -- attaching to a photo that's already tagged must not duplicate the entry.
+  local result = internals.methods.tag_photo({photo_ids = {"101", "999"}, tags = {"keep"}})
+  assertEq(#result.tags_created, 0, "tag_photo does not re-create an existing tag")
+  assertEq(result.updated, 1, "tag_photo only counts photos that exist")
+  assertEq(result.missing_photos[1], "999", "tag_photo reports missing photo id")
+  assertEq(#tags_by_name["keep"], 2, "re-attaching an existing tag does not duplicate")
+end
+
+do
+  local result = internals.methods.tag_photo({photo_ids = {"101"}, remove_tags = {"keep"}})
+  assertEq(result.updated, 1, "tag_photo remove_tags updated count")
+  assertEq(#tags_by_name["keep"], 1, "detaching removes image from tag")
+end
+
+do
+  local resp = internals.handle({id = "tp1", method = "tag_photo", params = {photo_ids = {}}})
+  assertTrue(resp.error ~= nil, "tag_photo errors on empty photo_ids")
+  assertTrue(string.find(resp.error or "", "photo_ids") ~= nil, "error mentions photo_ids")
+end
+
+do
+  local resp = internals.handle({id = "tp2", method = "tag_photo", params = {photo_ids = {"101"}}})
+  assertTrue(resp.error ~= nil, "tag_photo errors when neither tags nor remove_tags given")
+end
+
+-- ---- methods.list_collections -----------------------------------------------
+do
+  local result = internals.methods.list_collections({})
+  assertEq(result.count, 1, "list_collections returns one tag so far")
+  assertEq(result.collections[1].name, "keep", "list_collections returns tag name")
+  assertEq(result.collections[1].count, 1, "list_collections returns tag photo count")
+end
+
+do
+  local result = internals.methods.list_collections({filter = "nope"})
+  assertEq(result.count, 0, "list_collections filter excludes non-matching tags")
+end
+
+-- ---- methods.list_photos_in_collection --------------------------------------
+do
+  local result = internals.methods.list_photos_in_collection({collection = "keep"})
+  assertTrue(result.found, "list_photos_in_collection finds existing tag")
+  assertEq(result.count, 1, "list_photos_in_collection returns one photo")
+  assertEq(result.photos[1].id, "102", "list_photos_in_collection returns correct photo id")
+  assertEq(result.photos[1].path, "/photos/DSC_0002.NEF",
+    "list_photos_in_collection returns absolute file path")
+end
+
+do
+  local result = internals.methods.list_photos_in_collection({collection = "nonexistent"})
+  assertTrue(not result.found, "list_photos_in_collection reports not found for unknown tag")
+  assertEq(result.count, 0, "list_photos_in_collection returns zero photos for unknown tag")
 end
 
 -- ---- methods.import_batch --------------------------------------------------
@@ -201,7 +524,9 @@ do
   local stub_db_inner = {}
   stub_db_inner[101] = make_stub_image(101)
   stub_db_inner[102] = make_stub_image(102)
-  stub_dt.database = setmetatable({}, {__index = stub_db_inner})
+  stub_dt.database = setmetatable({
+    get_image = function(id) return stub_db_inner[id] end,
+  }, {__index = stub_db_inner})
 
   local result = internals.methods.apply_preset({
     preset_name = "beta",
@@ -224,7 +549,7 @@ do
   local original_styles = stub_dt.styles
   local original_db = stub_dt.database
   stub_dt.styles = fake_styles
-  stub_dt.database = setmetatable({}, {__index = function() return nil end})
+  stub_dt.database = {get_image = function(_) return nil end}
 
   local result = internals.methods.apply_preset({
     preset_name = "alpha",

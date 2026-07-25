@@ -25,10 +25,32 @@ class TestDarktableMCPServer:
             "apply_ratings_batch",
             "open_in_darktable",
             "view_photos",
+            "get_contact_sheet",
             "rate_photos",
+            "tag_photo",
+            "set_photo_note",
+            "get_photo_note",
+            "list_collections",
+            "list_photos_in_collection",
             "import_batch",
             "list_styles",
             "apply_preset",
+            "open_image_in_darkroom",
+            "navigate_photo",
+            "get_current_image",
+            "list_modules",
+            "get_params",
+            "set_params",
+            "get_preview",
+            "enable_module",
+            "add_instance",
+            "get_viewport",
+            "add_path_mask",
+            "retouch_add_shape",
+            "retouch_delete_shape",
+            "retouch_list_shapes",
+            "mask_object",
+            "mask_raster",
         }
         assert set(server.list_tools()) == expected_tools
 
@@ -137,6 +159,47 @@ async def test_handle_rate_photos_returns_count():
     server.bridge.call.assert_called_once_with(
         "rate_photos", {"photo_ids": ["1", "2", "3"], "rating": 4}
     )
+
+
+@pytest.mark.asyncio
+async def test_handle_set_photo_note_saved():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"updated": 1}
+    result = await server._handle_set_photo_note({"photo_id": "1", "note": "sharp, good crop"})
+    assert "saved" in result[0].text.lower()
+    assert "1" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "set_photo_note", {"photo_id": "1", "note": "sharp, good crop"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_set_photo_note_missing_photo():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"updated": 0}
+    result = await server._handle_set_photo_note({"photo_id": "999", "note": "x"})
+    assert "not found" in result[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_handle_get_photo_note_returns_text():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"found": True, "note": "sharp, good crop"}
+    result = await server._handle_get_photo_note({"photo_id": "1"})
+    assert result[0].text == "sharp, good crop"
+    server.bridge.call.assert_called_once_with("get_photo_note", {"photo_id": "1"})
+
+
+@pytest.mark.asyncio
+async def test_handle_get_photo_note_missing_photo():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"found": False}
+    result = await server._handle_get_photo_note({"photo_id": "999"})
+    assert "not found" in result[0].text.lower()
 
 
 @pytest.mark.asyncio
@@ -301,3 +364,216 @@ async def test_handle_export_images_validates_required_args():
     assert "output_path" in r[0].text
     r = await server._handle_export_images({"output_path": "/tmp/x"})
     assert "photo_ids" in r[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_success():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "formid": 42, "algorithm": "heal", "wavelet_scale": 2,
+        "radius": 0.02, "feather": 0.1, "opacity": 1.0,
+    }
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "heal",
+        "target": {"x": 0.4, "y": 0.3},
+        "source": {"x": 0.35, "y": 0.3},
+        "radius": 0.02,
+        "wavelet_scale": 2,
+    })
+    assert "formid=42" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_retouch_add_shape",
+        {
+            "op": "retouch",
+            "instance": 0,
+            "algorithm": "heal",
+            "target": {"x": 0.4, "y": 0.3},
+            "source": {"x": 0.35, "y": 0.3},
+            "radius": 0.02,
+            "feather": 0.0,
+            "opacity": 1.0,
+            "wavelet_scale": 2,
+        },
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_requires_source():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "heal",
+        "target": {"x": 0.4, "y": 0.3},
+        "radius": 0.02,
+    })
+    assert "source" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_rejects_non_circle():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "heal",
+        "shape_type": "path",
+        "target": {"x": 0.4, "y": 0.3},
+        "source": {"x": 0.35, "y": 0.3},
+        "radius": 0.02,
+    })
+    assert "circle" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_propagates_c_error():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"error": "300 shape limit reached"}
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "clone",
+        "target": {"x": 0.4, "y": 0.3},
+        "source": {"x": 0.35, "y": 0.3},
+        "radius": 0.02,
+    })
+    assert "300 shape limit reached" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_delete_shape_success():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"ok": True}
+    result = await server._handle_retouch_delete_shape({"formid": 42})
+    assert "42" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_retouch_delete_shape",
+        {"op": "retouch", "instance": 0, "formid": 42},
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_delete_shape_requires_formid():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_retouch_delete_shape({})
+    assert "formid" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_list_shapes_formats_shapes():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "module": "retouch", "instance": 0,
+        "num_scales": 4, "curr_scale": 1, "merge_from_scale": 0,
+        "shapes": [
+            {
+                "formid": 42, "algorithm": "heal", "shape_type": "circle",
+                "target": {"x": 0.4, "y": 0.3}, "source": {"x": 0.35, "y": 0.3},
+                "radius": 0.02, "feather": 0.1, "wavelet_scale": 2,
+            },
+        ],
+    }
+    result = await server._handle_retouch_list_shapes({})
+    text = result[0].text
+    assert "shapes=1" in text
+    assert "formid=42" in text
+    assert "algorithm=heal" in text
+    server.bridge.call.assert_called_once_with(
+        "dev_retouch_list_shapes", {"op": "retouch", "instance": 0}, timeout=15.0
+    )
+
+
+COLLECTION_FIXTURE = [
+    {"id": "1", "filename": "a.NEF", "path": "/photos/a.NEF", "rating": 0, "capture_time": "", "selected": False},
+    {"id": "2", "filename": "b.NEF", "path": "/photos/b.NEF", "rating": 0, "capture_time": "", "selected": False},
+    {"id": "3", "filename": "c.NEF", "path": "/photos/c.NEF", "rating": 0, "capture_time": "", "selected": False},
+]
+
+
+def _bridge_router(responses):
+    def _call(method, params=None, timeout=None):
+        return responses[method]
+    bridge = Mock()
+    bridge.call = Mock(side_effect=_call)
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_navigate_photo_next_opens_neighbor():
+    server = DarktableMCPServer()
+    server.bridge = _bridge_router({
+        "dev_current_image": {"has_image": True, "id": 1, "path": "/photos/a.NEF"},
+        "get_collection_images": COLLECTION_FIXTURE,
+        "open_darkroom": {"view": "darkroom", "path": "/photos/b.NEF"},
+    })
+    result = await server._handle_navigate_photo({"direction": "next"})
+    text = result[0].text
+    assert "Opened image 2 in darkroom" in text
+    assert "next photo: 2/3" in text
+    assert "b.NEF" in text
+
+
+@pytest.mark.asyncio
+async def test_navigate_photo_previous_opens_neighbor():
+    server = DarktableMCPServer()
+    server.bridge = _bridge_router({
+        "dev_current_image": {"has_image": True, "id": 2, "path": "/photos/b.NEF"},
+        "get_collection_images": COLLECTION_FIXTURE,
+        "open_darkroom": {"view": "darkroom", "path": "/photos/a.NEF"},
+    })
+    result = await server._handle_navigate_photo({"direction": "previous"})
+    assert "Opened image 1 in darkroom" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_navigate_photo_stops_at_start():
+    server = DarktableMCPServer()
+    server.bridge = _bridge_router({
+        "dev_current_image": {"has_image": True, "id": 1, "path": "/photos/a.NEF"},
+        "get_collection_images": COLLECTION_FIXTURE,
+    })
+    result = await server._handle_navigate_photo({"direction": "previous"})
+    assert "Already at the first photo" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_navigate_photo_stops_at_end():
+    server = DarktableMCPServer()
+    server.bridge = _bridge_router({
+        "dev_current_image": {"has_image": True, "id": 3, "path": "/photos/c.NEF"},
+        "get_collection_images": COLLECTION_FIXTURE,
+    })
+    result = await server._handle_navigate_photo({"direction": "next"})
+    assert "Already at the last photo" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_navigate_photo_no_image_open():
+    server = DarktableMCPServer()
+    server.bridge = _bridge_router({"dev_current_image": {"has_image": False}})
+    result = await server._handle_navigate_photo({"direction": "next"})
+    assert "No image open in darkroom" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_navigate_photo_current_not_in_collection():
+    server = DarktableMCPServer()
+    server.bridge = _bridge_router({
+        "dev_current_image": {"has_image": True, "id": 999, "path": "/photos/z.NEF"},
+        "get_collection_images": COLLECTION_FIXTURE,
+    })
+    result = await server._handle_navigate_photo({"direction": "next"})
+    assert "not in the currently open collection" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_navigate_photo_rejects_bad_direction():
+    server = DarktableMCPServer()
+    result = await server._handle_navigate_photo({"direction": "sideways"})
+    assert "direction must be" in result[0].text

@@ -32,7 +32,18 @@ def _cache_dir() -> Path:
 
 
 def _plugin_path() -> Path:
+    """Legacy per-user plugin path (old `darktable-mcp install-plugin` CLI)."""
     return Path.home() / ".config" / "darktable" / "lua" / "darktable_mcp.lua"
+
+
+def _system_plugin_path() -> Path:
+    """System-wide plugin path baked in by the darktable-agentic .deb --
+    already on darktable's Lua package.path (see
+    packaging-deb/build-deb.sh), so a per-user copy/symlink is not required
+    for the plugin to be requireable at darktable startup. Checked as an
+    alternative to the legacy per-user path below, not a replacement for it,
+    so existing per-user installs (from the old CLI) keep working too."""
+    return Path("/usr/share/darktable/lua/darktable_mcp.lua")
 
 
 class Bridge:
@@ -48,10 +59,16 @@ class Bridge:
         self._plugin_path = plugin_path or _plugin_path()
 
     def call(self, method: str, params: dict[str, Any], timeout: float = 5.0) -> Any:
-        if not self._plugin_path.is_file():
+        # Accept either the legacy per-user plugin path or the system-wide
+        # path installed by the darktable-agentic .deb -- the plugin is
+        # "present" if either exists (fixes: server used to refuse RPC on a
+        # system-wide-only install even though the plugin was in fact loaded
+        # via darktable's package.path, because it only ever checked the old
+        # per-user path).
+        if not self._plugin_path.is_file() and not _system_plugin_path().is_file():
             raise BridgePluginNotInstalledError(
-                f"plugin not installed at {self._plugin_path}. "
-                "Run: darktable-mcp install-plugin"
+                f"plugin not installed at {self._plugin_path} or "
+                f"{_system_plugin_path()}. Run: darktable-mcp install-plugin"
             )
 
         self._cache_dir.mkdir(parents=True, exist_ok=True)

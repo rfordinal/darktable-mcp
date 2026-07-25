@@ -1,5 +1,12 @@
--- darktable_mcp: long-running plugin that exposes view_photos and
--- rate_photos to the Python MCP server via file-based JSON requests.
+-- darktable_mcp: long-running plugin that exposes view_photos, rate_photos,
+-- tag_photo, list_collections, list_photos_in_collection (tag-backed --
+-- darktable's Lua API has no separate "collection" object), and the
+-- darktable.develop.* darkroom-editing bridge (open_darkroom,
+-- dev_version, dev_active_modules, dev_current_image, dev_get_params,
+-- dev_set_params, dev_preview, dev_history_count, dev_enable_module,
+-- dev_add_instance, dev_get_viewport, dev_add_path_mask,
+-- dev_remove_last_instance, dev_set_raster_source) to the Python MCP server via file-based JSON
+-- requests.
 --
 -- Loaded via `require "darktable_mcp"` from ~/.config/darktable/luarc.
 -- Spawns a worker via dt.control.dispatch that polls
@@ -7,6 +14,7 @@
 -- dispatches them to the method registry, and writes
 -- response-<uuid>.json. See:
 --   docs/superpowers/specs/2026-04-27-ipc-bridge-mvp-design.md
+--   ../../PLAN.md §3 (darktable.develop.* Lua API) and §5 T1.6
 
 local dt = require("darktable")
 
@@ -193,13 +201,20 @@ local function _image_full_path(image)
   return dir .. (image.filename or "")
 end
 
+-- dt.collection is the currently active lighttable view (whatever filter/
+-- filmroll/collect-module rule is open right now); dt.database is the WHOLE
+-- library regardless of what's open. Default to the former so "browse my
+-- photos" means "what I'm actually looking at", not a random slice of
+-- everything ever imported. scope="library" opts back into the old
+-- whole-library behavior for callers that explicitly want it.
 methods.view_photos = function(p)
   p = p or {}
   local out, count = {}, 0
   local limit = p.limit or 100
   local filter = p.filter or ""
   local rating_min = p.rating_min
-  for _, image in ipairs(dt.database) do
+  local source = (p.scope == "library") and dt.database or dt.collection
+  for _, image in ipairs(source) do
     if count >= limit then break end
     local include = true
     if rating_min and (image.rating or 0) < rating_min then include = false end
@@ -220,17 +235,151 @@ methods.view_photos = function(p)
   return out
 end
 
+-- Full, unfiltered dump of the current collection for get_contact_sheet
+-- (T?.?, contact-sheet spec): filter/sort/offset/limit all happen in Python
+-- on this raw list -- view_photos already does filter+limit lua-side, but
+-- contact_sheet needs total_matching (post-filter, pre-page count) and
+-- offset-based pagination, which only work if the whole collection crosses
+-- the bridge once rather than being re-fetched per page. dt.gui.selection()
+-- is otherwise only used internally by open_darkroom (see below); here it's
+-- surfaced per-image so Python's filter="selected" has something to check.
+methods.get_collection_images = function(p)
+  p = p or {}
+  local source = (p.scope == "library") and dt.database or dt.collection
+  local selected_ids = {}
+  for _, img in ipairs(dt.gui.selection()) do
+    selected_ids[tostring(img.id)] = true
+  end
+  local out = {}
+  for _, image in ipairs(source) do
+    table.insert(out, {
+      id = tostring(image.id),
+      filename = image.filename,
+      path = _image_full_path(image),
+      rating = image.rating or 0,
+      capture_time = image.exif_datetime_taken or "",
+      selected = selected_ids[tostring(image.id)] or false,
+    })
+  end
+  return out
+end
+
 methods.rate_photos = function(p)
   p = p or {}
   local updated = 0
   for _, photo_id in ipairs(p.photo_ids or {}) do
-    local image = dt.database[tonumber(photo_id)]
+    local image = dt.database.get_image(tonumber(photo_id))
     if image then
       image.rating = p.rating
       updated = updated + 1
     end
   end
   return {updated = updated}
+end
+
+-- Tags are darktable's only persistent, user-named grouping of photos
+-- (there is no separate "collection" object in the Lua API) so
+-- list_collections / list_photos_in_collection surface dt.tags as the
+-- practical equivalent of Lightroom-style collections.
+methods.tag_photo = function(p)
+  p = p or {}
+  local photo_ids = p.photo_ids or {}
+  if #photo_ids == 0 then error("tag_photo: photo_ids required and non-empty") end
+  local add_names = p.tags or {}
+  local remove_names = p.remove_tags or {}
+  if #add_names == 0 and #remove_names == 0 then
+    error("tag_photo: at least one of tags or remove_tags required")
+  end
+
+  local created = {}
+  local add_tags = {}
+  for _, name in ipairs(add_names) do
+    local tag = dt.tags.find(name)
+    if not tag then
+      tag = dt.tags.create(name)
+      table.insert(created, name)
+    end
+    table.insert(add_tags, tag)
+  end
+
+  local remove_tags = {}
+  for _, name in ipairs(remove_names) do
+    local tag = dt.tags.find(name)
+    if tag then table.insert(remove_tags, tag) end
+  end
+
+  local updated, missing_photos = 0, {}
+  for _, photo_id in ipairs(photo_ids) do
+    local image = dt.database.get_image(tonumber(photo_id))
+    if image then
+      for _, tag in ipairs(add_tags) do image:attach_tag(tag) end
+      for _, tag in ipairs(remove_tags) do image:detach_tag(tag) end
+      updated = updated + 1
+    else
+      table.insert(missing_photos, tostring(photo_id))
+    end
+  end
+
+  return {updated = updated, missing_photos = missing_photos, tags_created = created}
+end
+
+-- AI assessments/notes are stored in the standard dc:description xmp field
+-- (image.description in darktable's Lua API), not a custom field, so they
+-- round-trip through any xmp-aware tool and show up in darktable's own
+-- metadata panel like a human-written caption would.
+methods.set_photo_note = function(p)
+  p = p or {}
+  if not p.photo_id then error("set_photo_note: photo_id required") end
+  local image = dt.database.get_image(tonumber(p.photo_id))
+  if not image then return {updated = 0} end
+  image.description = p.note or ""
+  return {updated = 1}
+end
+
+methods.get_photo_note = function(p)
+  p = p or {}
+  if not p.photo_id then error("get_photo_note: photo_id required") end
+  local image = dt.database.get_image(tonumber(p.photo_id))
+  if not image then return {found = false} end
+  return {found = true, note = image.description or ""}
+end
+
+methods.list_collections = function(p)
+  p = p or {}
+  local filter = p.filter or ""
+  local out = {}
+  for _, tag in ipairs(dt.tags) do
+    local include = true
+    if filter ~= "" then
+      local ok = string.find(string.lower(tag.name), string.lower(filter), 1, true)
+      if not ok then include = false end
+    end
+    if include then
+      table.insert(out, {name = tag.name, count = #tag})
+    end
+  end
+  return {collections = out, count = #out}
+end
+
+methods.list_photos_in_collection = function(p)
+  p = p or {}
+  local name = p.collection
+  if not name or name == "" then error("list_photos_in_collection: collection required") end
+  local tag = dt.tags.find(name)
+  if not tag then return {found = false, collection = name, photos = {}, count = 0} end
+
+  local limit = p.limit or 1000
+  local out = {}
+  for _, image in ipairs(tag:get_tagged_images()) do
+    if #out >= limit then break end
+    table.insert(out, {
+      id = tostring(image.id),
+      filename = image.filename,
+      path = _image_full_path(image),
+      rating = image.rating or 0,
+    })
+  end
+  return {found = true, collection = name, photos = out, count = #out}
 end
 
 methods.import_batch = function(p)
@@ -316,7 +465,7 @@ methods.apply_preset = function(p)
   local applied = 0
   local missed = {}
   for _, photo_id in ipairs(photo_ids) do
-    local image = dt.database[tonumber(photo_id)]
+    local image = dt.database.get_image(tonumber(photo_id))
     if image then
       image:apply_style(style)
       applied = applied + 1
@@ -325,6 +474,426 @@ methods.apply_preset = function(p)
     end
   end
   return {applied = applied, missed = missed, preset_name = preset_name}
+end
+
+-- ---- darktable.develop.* bridge (T1.6) -------------------------------------
+-- Promoted from darktable-mcp/spike/spike_methods.lua (T0.3/T1.1-T1.5 probes)
+-- into the clean bridge once the underlying C API stabilized. These wrap the
+-- NEW Lua namespace `darktable.develop` (src/lua/develop.c, registered in
+-- src/lua/init.c) added on branch agentic-mcp: version/active_modules/
+-- get_params/set_params/preview/history_count, all scalar-only for now (see
+-- PLAN.md §3.1 Risk #2 -- arrays/curves and masks are out of scope here).
+--
+-- open_darkroom is pure-Lua (no C change): it drives the selection +
+-- current_view + async-poll technique sketched by the T0.3 spike, since
+-- headless darkroom entry has no mouse to resolve dt_act_on_get_main_image()
+-- via hover (see common/act_on.c:_get_main_image_hover). CORRECTION
+-- (2026-07-24 bugreport): this comment used to claim the spike "proved" this
+-- works -- it didn't. spike/run_spike.py's own sub-goal A branch explicitly
+-- anticipates open_darkroom possibly NOT switching view and treats that as a
+-- valid (documented-negative) spike outcome; no pass was ever recorded. This
+-- worker_loop also runs on darktable's Lua thread pool (see call.c
+-- stacked_job_queue / GThreadPool), not the GTK main thread, so
+-- dt.gui.current_view(view) only *schedules* the switch on the GTK context
+-- (g_main_context_invoke(), control/control.c:630) rather than performing it
+-- inline -- hence the poll below. But scheduling the view switch is not
+-- sufficient: views/darkroom.c's try_enter() independently re-resolves the
+-- target image via dt_act_on_get_main_image() (common/act_on.c:650), which
+-- can silently prefer mouseover/stale active_images over the Lua selection
+-- we just set, or require the image to be part of the CURRENT lighttable
+-- collection filter -- see the pre-check below, added after a real-world
+-- failure where the switch never happened and try_enter() gave no error
+-- back to Lua at all (darkroom.c:1150, "no image to open!" is GUI-log only).
+
+methods.open_darkroom = function(p)
+  p = p or {}
+  local image_id = tonumber(p.image_id)
+  if not image_id then error("open_darkroom: image_id required") end
+  local image = dt.database.get_image(image_id)
+  if not image then error("open_darkroom: image not found: " .. tostring(image_id)) end
+
+  dt.gui.selection({ image })
+
+  -- Diagnostic pre-check (bugreport 2026-07-24): try_enter() in
+  -- views/darkroom.c does NOT read this Lua selection directly -- it
+  -- resolves the target image via dt_act_on_get_main_image()
+  -- (common/act_on.c:650), which can silently prefer mouseover or stale
+  -- view_manager->active_images over the selection we just set (if the
+  -- "activate images by" preference, plugins/lighttable/act_on, is hover
+  -- mode -- act_on.c:34), and either way requires the image to be part of
+  -- the CURRENT lighttable collection filter (its selection-table fallback
+  -- JOINs against memory.collected_images -- act_on.c:582,632). If any of
+  -- that fails, try_enter() just logs "no image to open!" and aborts with
+  -- no error back to Lua (darkroom.c:1150), which used to show up here as a
+  -- silent 3000ms timeout stuck in "lighttable" with zero diagnostics.
+  -- dt.gui.action_images (lua/gui.c:85) calls the exact same
+  -- dt_act_on_get_images() resolution try_enter() uses, so checking it here
+  -- catches all three failure modes up front instead of burning the full
+  -- poll timeout on a switch that could never succeed.
+  local action_ids = {}
+  for _, img in ipairs(dt.gui.action_images) do
+    table.insert(action_ids, img.id)
+  end
+  local resolves_to_target = (#action_ids == 1 and action_ids[1] == image.id)
+  if not resolves_to_target then
+    return {
+      view = dt.gui.current_view().name,
+      requested_image_id = image_id,
+      selection_count = #dt.gui.selection(),
+      waited_ms_for_view_switch = 0,
+      action_images = action_ids,
+      diagnostic = "selection did not resolve to the requested image via darktable's " ..
+        "act-on resolution (dt.gui.action_images = {" .. table.concat(action_ids, ",") ..
+        "}); darkroom entry would silently fail without ever switching view. Likely " ..
+        "cause: the 'activate images by' preference is set to mouseover and something " ..
+        "else is hovered/active, OR image " .. tostring(image_id) .. " is not part of " ..
+        "the current lighttable collection filter.",
+    }
+  end
+
+  -- Bugreport 2026-07-25: switching current_view to darkroom while ALREADY
+  -- IN darkroom (opening a second image right after the first) does NOT
+  -- reload the new image. views/view.c's dt_view_manager_switch_by_view
+  -- only calls the target view's enter() -- which is what calls
+  -- dt_dev_load_image() for the new image_storage.id, views/darkroom.c:3860
+  -- -- when new_view != old_view (view.c:443-444: "if(new_view != old_view
+  -- && new_view->enter) new_view->enter(new_view);"). try_enter() alone
+  -- (which DOES re-run and sets image_storage.id) is not enough: the actual
+  -- pixelpipe/history/GUI reload lives in enter(), so without a real view
+  -- transition darkroom keeps rendering the previous image while this
+  -- method still reports "view=darkroom" as if it had switched. Force a
+  -- genuine transition by bouncing through lighttable first so enter() is
+  -- guaranteed to run again for the new image.
+  local bounced = false
+  if dt.gui.current_view().name == "darkroom" then
+    bounced = true
+    dt.gui.current_view(dt.gui.views.lighttable)
+    local left = dt.gui.current_view()
+    local left_wait = 0
+    while left.name == "darkroom" and left_wait < 3000 do
+      if dt.control and dt.control.sleep then
+        dt.control.sleep(100)
+        left_wait = left_wait + 100
+      else
+        break
+      end
+      left = dt.gui.current_view()
+    end
+  end
+
+  dt.gui.current_view(dt.gui.views.darkroom)
+
+  local current = dt.gui.current_view()
+  local waited_ms = 0
+  while current.name ~= "darkroom" and waited_ms < 3000 do
+    if dt.control and dt.control.sleep then
+      dt.control.sleep(100)
+      waited_ms = waited_ms + 100
+    else
+      break
+    end
+    current = dt.gui.current_view()
+  end
+
+  return {
+    view = current.name,
+    requested_image_id = image_id,
+    selection_count = #dt.gui.selection(),
+    waited_ms_for_view_switch = waited_ms,
+    bounced_through_lighttable = bounced,
+    -- Absolute file path of the opened image (dir + filename joined via the
+    -- module-local _image_full_path helper, same one view_photos uses).
+    -- T3.3's mask_raster needs this to feed the actual image file to the
+    -- matting sidecar without a dedicated new bridge method.
+    path = _image_full_path(image),
+  }
+end
+
+-- Version handshake (PLAN.md §3.5): {api, dt_lua_api, min_bridge}. Callers
+-- can refuse to run if the C binding is older than the bridge expects.
+methods.dev_version = function(p)
+  return dt.develop.version()
+end
+
+-- {op, instance, id, multi_name, enabled, has_introspection} per active
+-- module on the image currently open in darkroom.
+methods.dev_active_modules = function(p)
+  local mods = dt.develop.active_modules()
+  local out = {}
+  for i, m in ipairs(mods) do
+    out[i] = {
+      op = m.op,
+      instance = m.instance,
+      id = m.id,
+      multi_name = m.multi_name,
+      enabled = m.enabled,
+      has_introspection = m.has_introspection,
+    }
+  end
+  -- count disambiguates the empty case (Lua {} would JSON-encode ambiguously)
+  return { count = #out, modules = out }
+end
+
+-- Report the image currently open in darkroom: {has_image, id, path, filename}.
+-- Lets the server resolve the source file for an image the user opened BY HAND
+-- in the GUI (no open_darkroom call, so no MCP-side path cache). Returns the C
+-- result verbatim; has_image=false when no darkroom image is loaded.
+methods.dev_current_image = function(p)
+  return dt.develop.current_image()
+end
+
+-- Typed field map for one module instance (PLAN.md §3.1): scalar fields come
+-- back as {value, min, max, default}. Returns the C result verbatim --
+-- {op, instance, id, fields=...} on success, {error=...} if op/instance is
+-- unknown.
+methods.dev_get_params = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_get_params: op required") end
+  local instance = tonumber(p.instance) or 0
+  return dt.develop.get_params(op, instance)
+end
+
+-- Write fields, push history, reprocess. `fields` is a plain Lua table of
+-- field=value. Returns the clamp report verbatim (PLAN.md §3.2):
+-- {ok, applied, clamped, unknown_fields} -- out-of-range values are clamped
+-- to introspection Min/Max (never rejected) and every clamp is reported.
+methods.dev_set_params = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_set_params: op required") end
+  local instance = tonumber(p.instance) or 0
+  local fields = p.fields
+  if type(fields) ~= "table" then error("dev_set_params: fields table required") end
+  return dt.develop.set_params(op, instance, fields)
+end
+
+-- Read-only history entry count for the open image (used to confirm history
+-- coalescing per §3.3 and that preview() never writes to it).
+methods.dev_history_count = function(p)
+  return dt.develop.history_count()
+end
+
+-- PNG of the CURRENT LIVE darkroom edit, grabbed from preview_pipe->backbuf,
+-- NO DB write (PLAN.md §3.4). Returns the C result verbatim:
+-- {status="ok", path, width, height} | {status="processing", stale_preview,
+-- ...} | {error=...}. `path` is a container path under $XDG_CACHE_HOME
+-- (/run/cache-mcp in the docker bridge); the Python server remaps
+-- /run -> the bridge run_dir so the host-side MCP client can read the file.
+--
+-- Optional `region` = {x,y,w,h} normalized 0..1 of the visible frame, passed
+-- through to dt.develop.preview(max_w, max_h, x, y, w, h) for a full-detail
+-- crop render (grain/sharpen/noise inspection). Omit for the full frame.
+methods.dev_preview = function(p)
+  p = p or {}
+  local max_w = tonumber(p.max_w) or 0
+  local max_h = tonumber(p.max_h) or 0
+  local region = p.region
+  if type(region) == "table" and region.x ~= nil and region.y ~= nil
+     and region.w ~= nil and region.h ~= nil then
+    return dt.develop.preview(max_w, max_h,
+      tonumber(region.x), tonumber(region.y), tonumber(region.w), tonumber(region.h))
+  end
+  return dt.develop.preview(max_w, max_h)
+end
+
+-- Toggle a module instance on/off and commit to history (PLAN.md T1.7).
+-- Many modules ship OFF by default (grain, sharpen, vignette, tonecurve,
+-- ...) and produce no visible effect until enabled -- this is the missing
+-- prerequisite step before set_params on those. Returns the C result
+-- verbatim: {ok, op, instance, enabled} | {error=...}.
+methods.dev_enable_module = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_enable_module: op required") end
+  local instance = tonumber(p.instance) or 0
+  local enabled = p.enabled
+  if enabled == nil then enabled = true end
+  return dt.develop.enable_module(op, instance, enabled and true or false)
+end
+
+-- Add a new masked/parametric instance of a module (mirrors the GUI
+-- "new instance" action) -- the base step for local edits (dodge/burn on a
+-- second exposure instance, a second sharpen for a specific area, etc).
+-- Returns the C result verbatim: {ok, op, instance=<new multi_priority>,
+-- base_instance, multi_name} | {error=...}.
+methods.dev_add_instance = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_add_instance: op required") end
+  return dt.develop.add_instance(op)
+end
+
+-- Build a drawn PATH mask from a normalized polygon and attach it to a
+-- module's blend so the module's effect is restricted to that region
+-- (PLAN.md T2.2, promoted from darktable-mcp/spike/spike_methods.lua once
+-- the underlying C binding (add_path_mask_cb, src/lua/develop.c) stabilized).
+-- `points` is a Lua array of {x=..,y=..} normalized 0..1 (>=3 nodes,
+-- typically the polygon returned by the segmentation sidecar via T2.3's
+-- mask_object). Returns the C result verbatim: {ok, op, instance, formid,
+-- mask_id, points=<node count>, opacity, feather, smooth, mask_mode} |
+-- {error=...}. `feather` (optional) is a fraction of the mask bbox; `smooth`
+-- (optional bool, default true) uses Catmull-Rom bezier handles so curved
+-- subjects are not faceted. nil args fall back to the C-side defaults.
+methods.dev_add_path_mask = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_add_path_mask: op required") end
+  local instance = tonumber(p.instance) or 0
+  local points = p.points
+  if type(points) ~= "table" then error("dev_add_path_mask: points array required") end
+  local opacity = tonumber(p.opacity)
+  if opacity == nil then opacity = 1.0 end
+  local feather = tonumber(p.feather) -- nil -> C default (0.02)
+  local smooth
+  if p.smooth ~= nil then smooth = p.smooth and true or false end -- nil -> C default (true)
+  return dt.develop.add_path_mask(op, instance, points, opacity, feather, smooth)
+end
+
+-- Retouch module: local heal/clone shapes tied to the module's own wavelet
+-- scale + rt_forms array (dt.develop.retouch_add_shape/delete_shape/
+-- list_shapes, src/lua/develop.c) -- distinct from dev_add_path_mask's
+-- generic "restrict this module's blend to a region". Only circle shapes /
+-- heal+clone algorithms are supported this phase; ellipse/path/brush and
+-- blur/fill are a later phase (see PLAN.md).
+methods.dev_retouch_add_shape = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_retouch_add_shape: op required") end
+  local instance = tonumber(p.instance) or 0
+  if p.shape_type and p.shape_type ~= "circle" then
+    error("dev_retouch_add_shape: only shape_type 'circle' supported in this build")
+  end
+  local algorithm = p.algorithm
+  if not algorithm or algorithm == "" then error("dev_retouch_add_shape: algorithm required") end
+  local target = p.target
+  if type(target) ~= "table" or tonumber(target.x) == nil or tonumber(target.y) == nil then
+    error("dev_retouch_add_shape: target {x,y} required")
+  end
+  local source = p.source
+  if type(source) ~= "table" or tonumber(source.x) == nil or tonumber(source.y) == nil then
+    error("dev_retouch_add_shape: source {x,y} required for heal/clone")
+  end
+  local radius = tonumber(p.radius)
+  if radius == nil then error("dev_retouch_add_shape: radius required") end
+  local feather = tonumber(p.feather) or 0.0
+  local scale = tonumber(p.wavelet_scale) -- nil -> C default (module's curr_scale)
+  local opacity = tonumber(p.opacity)
+  if opacity == nil then opacity = 1.0 end
+  return dt.develop.retouch_add_shape(op, instance, algorithm,
+    tonumber(target.x), tonumber(target.y), radius, feather,
+    tonumber(source.x), tonumber(source.y), scale, opacity)
+end
+
+methods.dev_retouch_delete_shape = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_retouch_delete_shape: op required") end
+  local instance = tonumber(p.instance) or 0
+  local formid = tonumber(p.formid)
+  if formid == nil then error("dev_retouch_delete_shape: formid required") end
+  return dt.develop.retouch_delete_shape(op, instance, formid)
+end
+
+methods.dev_retouch_list_shapes = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_retouch_list_shapes: op required") end
+  local instance = tonumber(p.instance) or 0
+  return dt.develop.retouch_list_shapes(op, instance)
+end
+
+-- Rollback helper for mask_object (T2.3, ACCEPTANCE T2.3-S2 / PLAN.md gap
+-- "no orphan instance"): removes the most-recently-created multi-instance of
+-- `op` via the SAME "new instance" GUI action darktable's own module header
+-- button uses -- dt.gui.action("iop/"..op, -1, "instance", "delete"), which
+-- dt_action_process resolves to dt_iop_module_t* and dispatches to
+-- _gui_delete_callback -> dt_dev_module_remove (src/develop/imageop.c:480,
+-- :4074 DT_ACTION_EFFECT_DELETE case). No C change needed -- this reuses the
+-- existing action-system passthrough darktable.gui.action() already exposes
+-- (same mechanism as the T0.3 spike's `nudge`).
+--
+-- `-1` asks dt_action_process to count instances of this op from the TAIL of
+-- dev->iop (src/gui/accelerators.c _process_action: `instance<0` walks
+-- g_list_last/g_list_previous). dt_dev_module_duplicate always inserts a new
+-- instance immediately after the base (multi_priority 0) instance in
+-- iop_order (src/develop/develop.c:3706 dt_ioppr_move_iop_after), so right
+-- after mask_object's own add_instance(op) call the newest instance IS the
+-- last (or only other) entry among this op's instances -- `-1` targets it
+-- exactly. This is a narrow, single-purpose primitive for "undo the instance
+-- I just created a moment ago", NOT a general "delete instance N" API: if
+-- other instances of the same op were added/reordered by someone else
+-- between add_instance and the rollback, `-1` may not resolve to the
+-- intended instance. Requires >=2 instances of `op` to exist -- darktable's
+-- own multi_show.close guard (imageop.c:_get_multi_show) -- which is always
+-- true right after add_instance succeeded.
+methods.dev_remove_last_instance = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_remove_last_instance: op required") end
+  local action_path = "iop/" .. op
+  -- IMPORTANT: the trailing `size` arg (any value != DT_READ_ACTION_ONLY,
+  -- i.e. != -FLT_MAX) is NOT optional here. dt_action_process gates every
+  -- state-changing effect behind DT_PERFORM_ACTION(move_size) (src/common/
+  -- action.h: `(move_size) != DT_READ_ACTION_ONLY`); omitting it (as a bare
+  -- 4-arg dt.gui.action call defaults move_size to DT_READ_ACTION_ONLY,
+  -- src/lua/gui.c _action_cb) makes this call-and-return a harmless READ
+  -- that resolves the target module and returns 0 WITHOUT invoking
+  -- _gui_delete_callback -- confirmed empirically: it returns a valid
+  -- (non-NaN) value and reports ok=true while leaving dev->iop completely
+  -- unchanged. `1.0` below is the "perform it" trigger value, not a
+  -- meaningful magnitude (the instance/delete effect ignores its size).
+  local ok, ret = pcall(function()
+    return dt.gui.action(action_path, -1, "instance", "delete", 1.0)
+  end)
+  if not ok then
+    return { ok = false, op = op, error = "dt.gui.action raised: " .. tostring(ret) }
+  end
+  if ret ~= ret then -- NaN: dt_action_process's DT_ACTION_NOT_VALID sentinel
+    return { ok = false, op = op,
+             error = "dt.gui.action returned invalid (only one instance, or action path not found)" }
+  end
+  return { ok = true, op = op }
+end
+
+-- Read-only darkroom canvas zoom/pan for the main window and, when open on a
+-- second monitor, the preview2 window. Returns the C result verbatim:
+-- {main={...}, preview2={active=bool,...}} | {error=...}. Each viewport carries
+-- a `region` {x,y,w,h} (top-left, normalized 0..1, clamped to [0,1]) = the crop
+-- of the full image visible in that window; pass it straight into get_preview's
+-- `region`. Raw zoom_x/zoom_y are center-relative (can be negative), NOT a
+-- drop-in region.
+methods.dev_get_viewport = function(p)
+  return dt.develop.get_viewport()
+end
+
+-- T3.3 (promoted from darktable-mcp/spike/spike_methods.lua once the T3.1
+-- go/no-go spike proved the underlying C binding, src/lua/develop.c
+-- set_raster_source_cb): wire a downstream (consumer) module's blend to
+-- consume the RASTER mask emitted by an upstream (source) module -- e.g. the
+-- stock iop/rasterfile.c producer (T3.1, IOP_FLAGS_WRITE_RASTER) reading an
+-- external PFM/PNG file. This is the ONE piece add_path_mask (T2.2, drawn
+-- masks only) cannot do: a soft, per-pixel raster alpha instead of a hard
+-- polygon boundary. opacity is 0..100 (percent, default 100.0) matching the
+-- C binding's own blend_params->opacity scale -- NOT the 0..1 fraction
+-- add_path_mask uses; mask_raster (T3.3, server.py) converts its 0..1
+-- input before calling this. Returns the C result verbatim: {ok, consumer,
+-- consumer_instance, source, source_instance, raster_mask_source,
+-- raster_mask_instance, mask_mode, opacity} | {error=...}. The source
+-- module must be EARLIER in the pixelpipe (lower iop_order) than the
+-- consumer, or the C side returns an error.
+methods.dev_set_raster_source = function(p)
+  p = p or {}
+  local cop = p.consumer_op or p.op
+  if not cop or cop == "" then error("dev_set_raster_source: consumer_op required") end
+  local sop = p.source_op
+  if not sop or sop == "" then error("dev_set_raster_source: source_op required") end
+  local cinst = tonumber(p.consumer_instance) or 0
+  local sinst = tonumber(p.source_instance) or 0
+  if p.opacity ~= nil then
+    return dt.develop.set_raster_source(cop, cinst, sop, sinst, tonumber(p.opacity))
+  end
+  return dt.develop.set_raster_source(cop, cinst, sop, sinst)
 end
 
 -- ---- Dispatch --------------------------------------------------------------
