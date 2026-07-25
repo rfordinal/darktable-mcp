@@ -5,8 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "darktable-mcp"
 version = "1.0.14"
-description = "MCP server for darktable photo management with headless library operations"
+description = "MCP server bridging an AI assistant into a live darktable session for collaborative RAW editing, masking, and library management"
 authors = [{name = "w1ne", email = "14119286+w1ne@users.noreply.github.com"}]
+maintainers = [{name = "Roman Fordinal", email = "roman.fordinal@comsultia.com"}]
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.10"
@@ -50,9 +51,10 @@ vision = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/w1ne/darktable-mcp"
-Repository = "https://github.com/w1ne/darktable-mcp"
-Issues = "https://github.com/w1ne/darktable-mcp/issues"
+Homepage = "https://github.com/rfordinal/darktable-mcp"
+Repository = "https://github.com/rfordinal/darktable-mcp"
+Issues = "https://github.com/rfordinal/darktable-mcp/issues"
+Upstream = "https://github.com/w1ne/darktable-mcp"
 
 [project.scripts]
 darktable-mcp = "darktable_mcp:main"

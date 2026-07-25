@@ -6,9 +6,9 @@ import sys
 
 from .server import DarktableMCPServer
 
-__version__ = "0.1.0"
-__author__ = "w1ne"
-__email__ = "14119286+w1ne@users.noreply.github.com"
+__version__ = "1.0.14"
+__author__ = "Roman Fordinal"
+__email__ = "roman.fordinal@comsultia.com"
 
 logger = logging.getLogger(__name__)
 
