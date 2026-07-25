@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import queue
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -129,11 +130,20 @@ def thumb_cache_path(image_id: str, source_path: str, width: int) -> Path:
     return cache_root() / "contact-sheet-thumbs" / f"{digest}.jpg"
 
 
-def render_thumbnail_for(cli: CLIWrapper, image_id: str, source_path: str, width: int) -> Path:
+def render_thumbnail_for(
+    cli: CLIWrapper,
+    image_id: str,
+    source_path: str,
+    width: int,
+    worker_configdir: Optional[Path] = None,
+) -> Path:
     """Render (or reuse a cached render of) a width-capped JPEG for one source
     image via darktable-cli, respecting any XMP sidecar edit history next to
     it. Raises ExportError on failure -- caller marks that cell as errored
-    rather than failing the whole sheet."""
+    rather than failing the whole sheet.
+
+    `worker_configdir`, when given, is passed through as this export's
+    `--configdir` instead of `cli`'s own -- see render_thumbnails() for why."""
     out_path = thumb_cache_path(image_id, source_path, width)
     if out_path.is_file():
         return out_path
@@ -148,6 +158,7 @@ def render_thumbnail_for(cli: CLIWrapper, image_id: str, source_path: str, width
             max_width=width,
             max_height=width * 8,  # width-bound only; aspect ratio preserved by darktable-cli
             timeout=RENDER_TIMEOUT,
+            configdir=worker_configdir,
         )
         os.replace(tmp_path, out_path)
         return out_path
@@ -161,17 +172,39 @@ def render_thumbnails(
     """Render every item's thumbnail in parallel (subprocess-per-image, so
     threads only wait on I/O). Returns image_id -> (path or None, error or
     None); a failed render never raises past here -- one bad photo must not
-    take down the whole sheet (acceptance criterion #8)."""
+    take down the whole sheet (acceptance criterion #8).
+
+    Every export needs an exclusive `--configdir` -- concurrent darktable-cli
+    processes sharing one race to create/open its library.db and fail with a
+    locked/half-initialized db (empty stderr, "Export failed: Unknown
+    error"), while whichever one wins the race then looks "fixed" forever on
+    retries because its render is thumbnail-cached. THUMB_RENDER_WORKERS
+    configdirs are pre-created and handed out through a Queue that each
+    worker acquires before exporting and returns after (success or failure).
+    A position-based round robin (item index mod worker count) is NOT
+    enough: ThreadPoolExecutor doesn't dispatch in lockstep, so a later item
+    assigned the same directory as an earlier, still-running one can start
+    concurrently with it whenever task completion order doesn't match
+    dispatch order -- reproducing the exact same race, just less often."""
+    worker_configdirs = [cli.configdir / f"worker-{i}" for i in range(THUMB_RENDER_WORKERS)]
+    for d in worker_configdirs:
+        d.mkdir(parents=True, exist_ok=True)
+    configdir_pool: "queue.Queue[Path]" = queue.Queue()
+    for d in worker_configdirs:
+        configdir_pool.put(d)
 
     def _one(item: Dict[str, Any]) -> Tuple[str, Optional[Path], Optional[str]]:
         image_id = str(item["id"])
+        worker_configdir = configdir_pool.get()
         try:
-            path = render_thumbnail_for(cli, image_id, item["path"], width)
+            path = render_thumbnail_for(cli, image_id, item["path"], width, worker_configdir)
             return image_id, path, None
         except ExportError as e:
             return image_id, None, str(e)
         except Exception as e:  # noqa: BLE001 - one bad file must not abort the sheet
             return image_id, None, str(e)
+        finally:
+            configdir_pool.put(worker_configdir)
 
     results: Dict[str, Tuple[Optional[Path], Optional[str]]] = {}
     with ThreadPoolExecutor(max_workers=THUMB_RENDER_WORKERS) as pool:

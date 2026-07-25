@@ -92,6 +92,7 @@ class CLIWrapper:
         max_width: Optional[int] = None,
         max_height: Optional[int] = None,
         timeout: int = EXPORT_TIMEOUT_DEFAULT,
+        configdir: Optional[Path] = None,
     ) -> bool:
         """Export an image using darktable-cli.
 
@@ -103,6 +104,13 @@ class CLIWrapper:
             max_width: Maximum width in pixels
             max_height: Maximum height in pixels
             timeout: subprocess timeout in seconds (default 120 s).
+            configdir: Override for this call's `--configdir`. Callers that
+                run several exports concurrently against the same
+                CLIWrapper must pass distinct directories per concurrent
+                slot -- darktable-cli races itself creating library.db the
+                first time two processes share a not-yet-initialized
+                configdir, and both open a locked/corrupt db and fail with
+                an empty stderr. Defaults to `self.configdir`.
 
         Returns:
             bool: True if export successful
@@ -111,13 +119,15 @@ class CLIWrapper:
             ExportError: If export fails
         """
         try:
+            active_configdir = Path(configdir) if configdir else self.configdir
+            active_configdir.mkdir(parents=True, exist_ok=True)
             cmd = [
                 self.darktable_cli_path,
                 str(input_path),
                 str(output_path),
                 "--core",
                 "--configdir",
-                str(self.configdir),
+                str(active_configdir),
             ]
 
             fmt = format_type.lower()
