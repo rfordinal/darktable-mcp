@@ -6,7 +6,7 @@ import sys
 
 from .server import DarktableMCPServer
 
-__version__ = "1.0.14"
+__version__ = "1.0.20"
 __author__ = "Roman Fordinal"
 __email__ = "roman.fordinal@comsultia.com"
 

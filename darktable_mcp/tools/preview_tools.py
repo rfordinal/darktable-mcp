@@ -56,16 +56,16 @@ XMP_TEMPLATE = """<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 
 
 def _import_vision_libs():
-    """Lazy-import the optional [vision] deps with a helpful error."""
+    """Lazy-import rawpy/Pillow/pyexiv2 (base deps -- see pyproject.toml)."""
     try:
         import rawpy  # type: ignore[import-untyped]
         from PIL import Image, ImageOps  # type: ignore[import-untyped]
         import pyexiv2  # type: ignore[import-untyped]
     except ImportError as exc:
         raise DarktableMCPError(
-            "Vision-rating tools require optional deps. Install with: "
-            "pip install 'darktable-mcp[vision]'  "
-            f"(missing: {exc.name})"
+            "Preview deps missing from the darktable-mcp environment "
+            f"(missing: {exc.name}). Re-sync the venv: `uv sync` in the "
+            "darktable-mcp project dir, then restart the MCP server."
         ) from exc
     return rawpy, Image, ImageOps, pyexiv2
 

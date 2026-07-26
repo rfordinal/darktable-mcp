@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darktable-mcp"
-version = "1.0.14"
+version = "1.0.20"
 description = "MCP server bridging an AI assistant into a live darktable session for collaborative RAW editing, masking, and library management"
 authors = [{name = "w1ne", email = "14119286+w1ne@users.noreply.github.com"}]
 maintainers = [{name = "Roman Fordinal", email = "roman.fordinal@comsultia.com"}]
@@ -34,6 +34,16 @@ dependencies = [
     # GrabCut-fallback selection order.
     "opencv-python-headless>=4.9,<5",
     "numpy>=1.24,<3",
+    # extract_previews / apply_ratings_batch (preview_tools.py) are unconditionally
+    # registered MCP tools, not opt-in -- their deps must always be installed.
+    # NOTE: the real deploy target is the .deb (packaging-deb/build-deb-mcp.sh),
+    # whose venv is built fresh inside a ubuntu:24.04 "noble" docker container
+    # (glibc 2.39) -- do NOT cap these versions for an older host's glibc; that
+    # breaks pip resolution inside the noble build container (see CLAUDE.md
+    # "extract_previews" entry for the story of getting this wrong once).
+    "rawpy>=0.19",
+    "Pillow>=10.0",
+    "pyexiv2>=2.12",
 ]
 
 [project.optional-dependencies]
@@ -43,11 +53,6 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.5.0",
-]
-vision = [
-    "rawpy>=0.19",
-    "Pillow>=10.0",
-    "pyexiv2>=2.12",
 ]
 
 [project.urls]
