@@ -1,11 +1,21 @@
 """Tests for the main MCP server."""
 
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
 from darktable_mcp.server import DarktableMCPServer
+from darktable_mcp.utils.viewport_coords import ViewportCoordinateError
+
+# dev_current_image reply used wherever a viewport snapshot has to be bound to
+# a concrete darkroom image (the id/filename from the 2026-07-26 bugreport).
+IMAGE_13406 = {
+    "has_image": True,
+    "id": 13406,
+    "filename": "20260724_0108.ARW",
+    "path": "/photos/20260724_0108.ARW",
+}
 
 
 class TestDarktableMCPServer:
@@ -45,9 +55,13 @@ class TestDarktableMCPServer:
             "enable_module",
             "add_instance",
             "get_viewport",
+            "capture_viewport",
             "add_path_mask",
             "retouch_add_shape",
+            "retouch_add_shape_in_viewport",
+            "retouch_update_shape_in_viewport",
             "retouch_delete_shape",
+            "retouch_delete_shapes",
             "retouch_list_shapes",
             "mask_object",
             "mask_raster",
@@ -489,6 +503,250 @@ async def test_handle_retouch_list_shapes_formats_shapes():
     )
 
 
+@pytest.mark.asyncio
+async def test_handle_capture_viewport_success():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": {"region": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}}},
+        IMAGE_13406,
+        {"path": "/tmp/preview.png", "width": 647, "height": 702},
+        IMAGE_13406,
+    ]
+    result = await server._handle_capture_viewport({"return_image": False})
+    text = result[0].text
+    assert "snapshot_id=vp_" in text
+    assert "647x702" in text
+    assert "id=13406" in text
+    assert len(server._viewport_snapshots) == 1
+    snapshot = next(iter(server._viewport_snapshots.values()))
+    assert snapshot["region"] == {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}
+    assert snapshot["render"] == {"path": "/tmp/preview.png", "width": 647, "height": 702}
+    # The snapshot must carry the image it is a picture of, so later mutating
+    # calls can refuse to write to a different photo.
+    assert snapshot["image"]["id"] == 13406
+
+
+@pytest.mark.asyncio
+async def test_handle_capture_viewport_preview2_inactive():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "main": {"region": {"x": 0, "y": 0, "w": 1, "h": 1}},
+        "preview2": {"active": False},
+    }
+    result = await server._handle_capture_viewport({"viewport": "preview2"})
+    assert "viewport_not_active" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_in_viewport_success():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "preview2",
+        "region": {"x": 0.4, "y": 0.2, "w": 0.2, "h": 0.2},
+        "render": {"path": "/tmp/snap.png", "width": 1000, "height": 1000},
+        "image": IMAGE_13406,
+    })
+    # Two-stage pipeline: dev_backtransform_point(target), dev_backtransform_point
+    # (source), then dev_retouch_add_shape. Identity backtransform here (no
+    # orientation/crop/lens-correction active) so the final mask-space values
+    # equal the display-frame ones computed by the viewport affine step.
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"x": 0.5, "y": 0.3, "len1": 0.02},
+        {"x": 0.52, "y": 0.3},
+        {"ok": True, "formid": 99, "algorithm": "heal", "wavelet_scale": 0},
+    ]
+    result = await server._handle_retouch_add_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "algorithm": "heal",
+        "target": {"x": 0.5, "y": 0.5},
+        "source": {"x": 0.6, "y": 0.5},
+        "radius": 0.1,
+        "return_preview": False,
+    })
+    text = result[0].text
+    assert "formid=99" in text
+    assert server.bridge.call.call_count == 4
+    call_args_list = server.bridge.call.call_args_list
+    assert call_args_list[0][0][0] == "dev_current_image"
+    assert call_args_list[1][0][0] == "dev_backtransform_point"
+    assert call_args_list[2][0][0] == "dev_backtransform_point"
+    assert call_args_list[3][0][0] == "dev_retouch_add_shape"
+    params = call_args_list[3][0][1]
+    # target 0.5,0.5 within region {x:0.4,y:0.2,w:0.2,h:0.2} -> display = 0.4+0.5*0.2=0.5, 0.2+0.5*0.2=0.3
+    # -> identity backtransform -> mask-frame == display-frame here.
+    assert params["target"]["x"] == pytest.approx(0.5)
+    assert params["target"]["y"] == pytest.approx(0.3)
+    # radius 0.1 (viewport_normalized) * region.w 0.2 = 0.02 (display), identity -> 0.02 (mask)
+    assert params["radius"] == pytest.approx(0.02)
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_in_viewport_uses_backtransformed_coords():
+    """Guards against silently regressing to the pre-fix (2026-07-25) bug:
+    a caller-supplied point must be converted through dev_backtransform_point
+    (pipe-input/mask frame), NOT written to retouch_add_shape using the raw
+    display-frame value. A non-identity mock (simulating a portrait-orientation
+    axis swap) proves the handler actually uses the backtransform's output."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"x": 0.9, "y": 0.1, "len1": 0.4},  # target: deliberately NOT equal to display-frame input
+        {"x": 0.8, "y": 0.2},               # source: deliberately NOT equal to display-frame input
+        {"ok": True, "formid": 7, "algorithm": "heal", "wavelet_scale": 0},
+    ]
+    await server._handle_retouch_add_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "algorithm": "heal",
+        "target": {"x": 0.5, "y": 0.5},
+        "source": {"x": 0.6, "y": 0.5},
+        "radius": 0.1,
+        "return_preview": False,
+    })
+    params = server.bridge.call.call_args_list[3][0][1]
+    assert params["target"] == {"x": 0.9, "y": 0.1}
+    assert params["source"] == {"x": 0.8, "y": 0.2}
+    assert params["radius"] == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_in_viewport_rejects_out_of_bounds():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    with pytest.raises(ViewportCoordinateError):
+        await server._handle_retouch_add_shape_in_viewport({
+            "snapshot_id": snapshot_id,
+            "algorithm": "heal",
+            "target": {"x": 1.5, "y": 0.5},
+            "source": {"x": 0.6, "y": 0.5},
+            "radius": 0.05,
+        })
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_in_viewport_rejects_unknown_snapshot():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    with pytest.raises(ViewportCoordinateError):
+        await server._handle_retouch_add_shape_in_viewport({
+            "snapshot_id": "vp_doesnotexist",
+            "algorithm": "heal",
+            "target": {"x": 0.5, "y": 0.5},
+            "source": {"x": 0.6, "y": 0.5},
+            "radius": 0.05,
+        })
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_update_shape_in_viewport_success():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"x": 0.5, "y": 0.5, "len1": 0.05},
+        {"x": 0.6, "y": 0.5},
+        {"ok": True, "algorithm": "heal", "wavelet_scale": 0, "opacity": 1.0},
+    ]
+    result = await server._handle_retouch_update_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "formid": 42,
+        "target": {"x": 0.5, "y": 0.5},
+        "source": {"x": 0.6, "y": 0.5},
+        "radius": 0.05,
+        "return_preview": False,
+    })
+    assert "formid=42" in result[0].text
+    assert server.bridge.call.call_count == 4
+    call_args_list = server.bridge.call.call_args_list
+    assert call_args_list[0][0][0] == "dev_current_image"
+    assert call_args_list[1][0][0] == "dev_backtransform_point"
+    assert call_args_list[2][0][0] == "dev_backtransform_point"
+    assert call_args_list[3] == call(
+        "dev_retouch_update_shape",
+        {
+            "op": "retouch",
+            "instance": 0,
+            "formid": 42,
+            "target": {"x": 0.5, "y": 0.5},
+            "source": {"x": 0.6, "y": 0.5},
+            "radius": 0.05,
+            "feather": 0.0,
+        },
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_delete_shapes_batch():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"ok": True},                       # delete formid 1 -> success
+        {"error": "not found"},             # delete formid 2 -> error
+        {"shapes": [{"formid": 2}]},        # re-check: formid 2 STILL listed -> genuinely failed
+        {"ok": True},                       # delete formid 3 -> success
+    ]
+    result = await server._handle_retouch_delete_shapes({"formids": [1, 2, 3]})
+    text = result[0].text
+    assert "deleted=[1, 3]" in text
+    assert "failed=1" in text
+    assert server.bridge.call.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_delete_shapes_batch_idempotent_after_group_teardown():
+    """Bugreport (2026-07-25): deleting the group's last remaining shape can
+    tear down the shared mask group (mask_id cleared), so a LATER formid in
+    the SAME batch errors "no shapes group" even though it's already gone
+    too. This must be reported as deleted (idempotent), not a real failure --
+    verified via a retouch_list_shapes re-check that confirms the formid is
+    genuinely absent."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"ok": True},                            # delete formid 1 -> success (tears down the group)
+        {"error": "module has no shapes group"},  # delete formid 2 -> error (group now gone)
+        {"shapes": []},                          # re-check: formid 2 NOT listed -> already gone
+    ]
+    result = await server._handle_retouch_delete_shapes({"formids": [1, 2]})
+    text = result[0].text
+    assert "deleted=[1, 2]" in text
+    assert "failed=0" in text
+    assert server.bridge.call.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_delete_shapes_requires_formids():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_retouch_delete_shapes({})
+    assert "formids" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
 COLLECTION_FIXTURE = [
     {"id": "1", "filename": "a.NEF", "path": "/photos/a.NEF", "rating": 0, "capture_time": "", "selected": False},
     {"id": "2", "filename": "b.NEF", "path": "/photos/b.NEF", "rating": 0, "capture_time": "", "selected": False},
@@ -577,3 +835,149 @@ async def test_navigate_photo_rejects_bad_direction():
     server = DarktableMCPServer()
     result = await server._handle_navigate_photo({"direction": "sideways"})
     assert "direction must be" in result[0].text
+
+
+# ---- 2026-07-26 bugreport: snapshot/darkroom image binding ------------------
+
+
+@pytest.mark.asyncio
+async def test_retouch_add_shape_in_viewport_refuses_on_image_mismatch():
+    """Core of the 2026-07-26 bugreport: every darkroom binding resolves
+    against darktable's GLOBAL current image, so a snapshot taken on one photo
+    would happily retouch whatever photo is open by the time the call lands.
+    The write must be refused, not translated onto the wrong image."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        {"has_image": True, "id": 99999, "filename": "other.ARW"},
+    ]
+    result = await server._handle_retouch_add_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "algorithm": "heal",
+        "target": {"x": 0.5, "y": 0.5},
+        "source": {"x": 0.6, "y": 0.5},
+        "radius": 0.1,
+        "return_preview": False,
+    })
+    text = result[0].text
+    assert "image mismatch" in text
+    assert "13406" in text and "99999" in text
+    # Only the identity probe ran -- nothing was written.
+    assert server.bridge.call.call_count == 1
+    assert server.bridge.call.call_args_list[0][0][0] == "dev_current_image"
+
+
+@pytest.mark.asyncio
+async def test_retouch_update_shape_in_viewport_refuses_when_darkroom_closed():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [{"has_image": False, "id": -1}]
+    result = await server._handle_retouch_update_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "formid": 42,
+        "target": {"x": 0.5, "y": 0.5},
+        "source": {"x": 0.6, "y": 0.5},
+        "radius": 0.05,
+        "return_preview": False,
+    })
+    assert "image mismatch" in result[0].text
+    assert server.bridge.call.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_viewport_aborts_when_image_changes_mid_capture():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": {"region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}}},
+        IMAGE_13406,
+        {"path": "/tmp/preview.png", "width": 100, "height": 100},
+        {"has_image": True, "id": 99999, "filename": "other.ARW"},
+    ]
+    result = await server._handle_capture_viewport({"return_image": False})
+    assert "changed while capturing" in result[0].text
+    assert not server._viewport_snapshots
+
+
+@pytest.mark.asyncio
+async def test_render_snapshot_preview_flags_wrong_image():
+    """The bugreport's most alarming symptom: a post-edit preview showing a
+    completely different photo. dev_preview carries no image identity, so the
+    server has to attach one and shout when it does not match."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"path": "/tmp/after.png", "width": 100, "height": 100},
+        {"has_image": True, "id": 99999, "filename": "other.ARW"},
+    ]
+    _, line = server._render_snapshot_preview({
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 100, "height": 100},
+        "image": IMAGE_13406,
+    })
+    assert "WARNING" in line
+    assert "99999" in line and "13406" in line
+
+
+@pytest.mark.asyncio
+async def test_snapshot_pixels_alias_matches_viewport_pixels():
+    """snapshot_pixels is the clearer name for the same grid (pixels of the
+    capture_viewport render); both spellings must convert identically."""
+    server = DarktableMCPServer()
+    written = []
+    for space in ("viewport_pixels", "snapshot_pixels"):
+        server.bridge = Mock()
+        snapshot_id = server._store_viewport_snapshot({
+            "viewport": "main",
+            "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            "render": {"path": "/tmp/snap.png", "width": 400, "height": 200},
+            "image": IMAGE_13406,
+        })
+        server.bridge.call.side_effect = [
+            IMAGE_13406,
+            {"x": 0.25, "y": 0.5, "len1": 0.05},
+            {"x": 0.5, "y": 0.5},
+            {"ok": True, "formid": 5, "algorithm": "heal", "wavelet_scale": 0},
+        ]
+        await server._handle_retouch_add_shape_in_viewport({
+            "snapshot_id": snapshot_id,
+            "algorithm": "heal",
+            "coordinate_space": space,
+            "target": {"x": 100, "y": 100},
+            "source": {"x": 200, "y": 100},
+            "radius": 20,
+            "return_preview": False,
+        })
+        # the display-frame point handed to the backtransform is what matters
+        written.append(server.bridge.call.call_args_list[1][0][1])
+    assert written[0] == written[1]
+
+
+@pytest.mark.asyncio
+async def test_retouch_delete_shape_error_reports_darkroom_state():
+    """"no darkroom image loaded" only says dev->iop was NULL at that instant.
+    Naming the image that IS open turns the bugreport's unexplained failure
+    into a diagnosis."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"error": "no darkroom image loaded"},
+        {"has_image": True, "id": 99999, "filename": "other.ARW"},
+    ]
+    result = await server._handle_retouch_delete_shape({"formid": 42})
+    text = result[0].text
+    assert "no darkroom image loaded" in text
+    assert "darkroom state right now" in text
+    assert "99999" in text

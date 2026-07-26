@@ -50,6 +50,10 @@ EXPECTED_TOOLS = {
     "enable_module",
     "add_instance",
     "get_viewport",
+    # Viewport-relative retouch (2026-07-25 design proposal): capture a
+    # snapshot of what the user sees in main/preview2, then place retouch
+    # points relative to that snapshot instead of the full image.
+    "capture_viewport",
     # T2.3: object masks (see PLAN.md §5 T2.2/T2.3).
     "add_path_mask",
     "mask_object",
@@ -58,7 +62,10 @@ EXPECTED_TOOLS = {
     # Retouch Phase 1: local heal/clone circle shapes (rt_forms + wavelet
     # scale), see PLAN.md's retouch section.
     "retouch_add_shape",
+    "retouch_add_shape_in_viewport",
+    "retouch_update_shape_in_viewport",
     "retouch_delete_shape",
+    "retouch_delete_shapes",
     "retouch_list_shapes",
 }
 

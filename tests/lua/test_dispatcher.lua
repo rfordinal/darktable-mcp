@@ -129,6 +129,10 @@ stub_dt.develop = {
     table.insert(develop_calls, {name = "retouch_add_shape", args = {...}})
     return {ok = true, formid = 42, algorithm = "heal", wavelet_scale = 2}
   end,
+  retouch_update_shape = function(...)
+    table.insert(develop_calls, {name = "retouch_update_shape", args = {...}})
+    return {ok = true, formid = 42, algorithm = "heal", wavelet_scale = 2, opacity = 1.0}
+  end,
   retouch_delete_shape = function(...)
     table.insert(develop_calls, {name = "retouch_delete_shape", args = {...}})
     return {ok = true}
@@ -136,6 +140,18 @@ stub_dt.develop = {
   retouch_list_shapes = function(...)
     table.insert(develop_calls, {name = "retouch_list_shapes", args = {...}})
     return {module = "retouch", instance = 0, shapes = {}}
+  end,
+  -- Identity stub (no orientation/crop/lens-correction simulated): real C
+  -- semantics are display-frame-normalized -> mask/pipe-input-frame
+  -- normalized (2026-07-25 bugreport fix) -- only the bridge-layer
+  -- arg-forwarding contract is under test here, not the transform math
+  -- itself (that can only be verified against a real darktable process).
+  backtransform_point = function(x, y, len1, len2)
+    table.insert(develop_calls, {name = "backtransform_point", args = {x, y, len1, len2}})
+    local out = {x = x, y = y}
+    if len1 ~= nil then out.len1 = len1 end
+    if len2 ~= nil then out.len2 = len2 end
+    return out
   end,
 }
 
@@ -348,6 +364,76 @@ do
   assertTrue(string.find(err or "", "circle") ~= nil, "error mentions circle")
 end
 
+-- ---- methods.dev_retouch_update_shape: bridge-layer arg validation/
+-- defaults/forwarding for in-place move/resize (2026-07-25 viewport-relative
+-- retouch design). algorithm/wavelet_scale/opacity are all optional (nil ->
+-- C keeps the shape's current value); target/source/radius/feather are
+-- always resent in full (a "move", not a partial field patch).
+do
+  develop_calls = {}
+  local result = internals.methods.dev_retouch_update_shape({
+    op = "retouch",
+    formid = 42,
+    target = {x = 0.5, y = 0.4},
+    source = {x = 0.45, y = 0.4},
+    radius = 0.03,
+  })
+  assertEq(result.formid, 42, "dev_retouch_update_shape forwards the C result")
+  assertEq(#develop_calls, 1, "dev_retouch_update_shape calls dt.develop.retouch_update_shape once")
+  local call = develop_calls[1]
+  assertEq(call.name, "retouch_update_shape", "correct C function called")
+  assertEq(call.args[1], "retouch", "op forwarded")
+  assertEq(call.args[2], 0, "instance defaults to 0")
+  assertEq(call.args[3], 42, "formid forwarded")
+  assertEq(call.args[4], 0.5, "target.x forwarded")
+  assertEq(call.args[5], 0.4, "target.y forwarded")
+  assertEq(call.args[6], 0.03, "radius forwarded")
+  assertEq(call.args[7], 0.0, "feather defaults to 0.0")
+  assertEq(call.args[8], 0.45, "source.x forwarded")
+  assertEq(call.args[9], 0.4, "source.y forwarded")
+  assertEq(call.args[10], nil, "algorithm omitted -> nil (C keeps current)")
+  assertEq(call.args[11], nil, "wavelet_scale omitted -> nil (C keeps current)")
+  assertEq(call.args[12], nil, "opacity omitted -> nil (C leaves it untouched)")
+end
+
+do
+  develop_calls = {}
+  internals.methods.dev_retouch_update_shape({
+    op = "retouch",
+    instance = 1,
+    formid = 7,
+    target = {x = 0.5, y = 0.5},
+    source = {x = 0.6, y = 0.6},
+    radius = 0.04,
+    feather = 0.05,
+    algorithm = "clone",
+    wavelet_scale = 2,
+    opacity = 0.7,
+  })
+  local call = develop_calls[1]
+  assertEq(call.args[2], 1, "instance forwarded when given")
+  assertEq(call.args[7], 0.05, "feather forwarded when given")
+  assertEq(call.args[10], "clone", "algorithm forwarded when given")
+  assertEq(call.args[11], 2, "wavelet_scale forwarded when given")
+  assertEq(call.args[12], 0.7, "opacity forwarded when given")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_retouch_update_shape, {
+    op = "retouch", formid = 42, target = {x = 0.4, y = 0.3}, radius = 0.02,
+  })
+  assertTrue(not ok, "dev_retouch_update_shape errors without a source point")
+  assertTrue(string.find(err or "", "source") ~= nil, "error mentions source")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_retouch_update_shape, {
+    op = "retouch", target = {x = 0.4, y = 0.3}, source = {x = 0.35, y = 0.3}, radius = 0.02,
+  })
+  assertTrue(not ok, "dev_retouch_update_shape errors without a formid")
+  assertTrue(string.find(err or "", "formid") ~= nil, "error mentions formid")
+end
+
 do
   develop_calls = {}
   local result = internals.methods.dev_retouch_delete_shape({op = "retouch", formid = 42})
@@ -367,6 +453,39 @@ do
   assertEq(call.name, "retouch_list_shapes", "correct C function called")
   assertEq(call.args[1], "retouch", "op forwarded")
   assertEq(call.args[2], 0, "instance defaults to 0")
+end
+
+-- ---- methods.dev_backtransform_point: bridge-layer arg forwarding for the
+-- display-frame -> mask-frame conversion (2026-07-25 coordinate-frame
+-- bugreport fix). len1/len2 optional -- nil when omitted, forwarded when given.
+do
+  develop_calls = {}
+  local result = internals.methods.dev_backtransform_point({x = 0.5, y = 0.3})
+  assertEq(result.x, 0.5, "dev_backtransform_point forwards x (identity stub)")
+  assertEq(result.y, 0.3, "dev_backtransform_point forwards y (identity stub)")
+  assertEq(result.len1, nil, "len1 omitted when not given")
+  local call = develop_calls[1]
+  assertEq(call.name, "backtransform_point", "correct C function called")
+  assertEq(call.args[1], 0.5, "x forwarded")
+  assertEq(call.args[2], 0.3, "y forwarded")
+  assertEq(call.args[3], nil, "len1 forwarded as nil when omitted")
+  assertEq(call.args[4], nil, "len2 forwarded as nil when omitted")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_backtransform_point({x = 0.5, y = 0.3, len1 = 0.02, len2 = 0.01})
+  assertEq(result.len1, 0.02, "len1 forwarded and returned")
+  assertEq(result.len2, 0.01, "len2 forwarded and returned")
+  local call = develop_calls[1]
+  assertEq(call.args[3], 0.02, "len1 forwarded when given")
+  assertEq(call.args[4], 0.01, "len2 forwarded when given")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_backtransform_point, {y = 0.3})
+  assertTrue(not ok, "dev_backtransform_point errors without x")
+  assertTrue(string.find(err or "", "x/y") ~= nil, "error mentions x/y")
 end
 
 -- ---- methods.tag_photo ------------------------------------------------------

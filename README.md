@@ -271,8 +271,36 @@ specific wavelet scale, so skin texture and base tones can be treated separately
 
 `retouch_list_shapes` gives back the real shapes plus the module's wavelet-scale state (rather than the
 raw 300-slot internal array), and `retouch_delete_shape` removes one by id — verified to restore the
-pixels exactly, so "no, try a different source" costs nothing. Circles with heal/clone only so far;
-ellipse/path/brush and blur/fill are a later phase.
+pixels exactly, so "no, try a different source" costs nothing. `retouch_delete_shapes` takes a list
+when a whole experiment needs undoing. Circles with heal/clone only so far; ellipse/path/brush and
+blur/fill are a later phase.
+
+Picking that target as a fraction of the whole frame is awkward when you are both looking at a 3:1
+zoom of one cheek. `capture_viewport` solves that: it snapshots the region you have on screen (the
+main window, or `preview2` on a second monitor) and renders it, and returns a `snapshot_id`.
+
+```json
+{"name": "capture_viewport", "arguments": {"viewport": "preview2"}}
+{"name": "retouch_add_shape_in_viewport", "arguments": {
+  "snapshot_id": "vp_...",
+  "algorithm": "heal",
+  "coordinate_space": "snapshot_pixels",
+  "target": {"x": 420, "y": 250},
+  "source": {"x": 250, "y": 190},
+  "radius": 10}}
+```
+
+Coordinates are then just pixels of the render you were shown, and the server does the rest of the
+maths. There is more of it than you would expect: the viewport crop, then darktable's own gap between
+the frame you see and the frame masks are stored in (they diverge as soon as orientation, crop, rotate
+or lens correction is active, which for a portrait-orientation raw is always). Both stages are
+reported back in the response, so a placement that lands wrong is debuggable instead of mysterious.
+
+Two rules keep a mis-aimed call from quietly editing the wrong thing. A point outside the captured
+region is rejected, never clamped to the nearest edge. And the snapshot is bound to the image that was
+open when you took it: if darktable has moved to another photo since, the write is refused by id,
+because a coordinate from one frame means nothing on another. `retouch_update_shape_in_viewport` moves
+or resizes an existing shape in place, same conventions, same formid.
 
 ![placeholder: 100% crop showing a dust spot before and after a chat-discussed heal, with the retouch circle visible in darktable](docs/screenshots/retouch-heal-spot.png)
 
@@ -476,7 +504,7 @@ the *client* runs, not the arrangement: darktable is still open in front of some
 
 ## Tool reference
 
-32 tools. Everything except the camera/preview-extraction group needs darktable running with the
+36 tools. Everything except the camera/preview-extraction group needs darktable running with the
 bridge loaded.
 
 **Darkroom editing** (needs the patched darktable; act on whichever image is open in darkroom)
@@ -495,6 +523,9 @@ bridge loaded.
   write. `region` renders a normalized sub-rectangle at full detail.
 - `get_viewport()` — the darkroom canvas zoom/pan state, including a ready-to-use `region` you can
   pass straight to `get_preview`, so the AI can look at what you are looking at.
+- `capture_viewport(viewport?, max_w?, max_h?, return_image?)` — snapshot region plus render of the
+  `main` or `preview2` window, bound to the image open at capture time. Returns a `snapshot_id` for
+  the `*_in_viewport` retouch tools. Snapshots expire after a few minutes.
 
 **Masks and local edits**
 
@@ -505,7 +536,16 @@ bridge loaded.
 - `add_path_mask(op, points, instance?, opacity?)` — low-level: attach a polygon you already have.
 - `retouch_add_shape(algorithm, target, source, radius, feather?, opacity?, wavelet_scale?, instance?)`
   — heal/clone circle on the retouch module.
-- `retouch_list_shapes(instance?)` / `retouch_delete_shape(formid, instance?)`.
+- `retouch_add_shape_in_viewport(snapshot_id, algorithm, target, source, radius, feather?,
+  coordinate_space?, radius_space?, opacity?, wavelet_scale?, instance?, return_preview?)` — the same
+  heal/clone circle, but placed in the coordinates of a `capture_viewport` render.
+  `coordinate_space` is `snapshot_normalized` (0..1 of the render) or `snapshot_pixels` (pixels of the
+  render, not of the darktable window); the older `viewport_*` spellings still work. Refuses to write
+  if darkroom has moved to a different image than the snapshot's.
+- `retouch_update_shape_in_viewport(snapshot_id, formid, target, source, radius, ...)` — move or
+  resize an existing shape in place, keeping its formid.
+- `retouch_list_shapes(instance?)` / `retouch_delete_shape(formid, instance?)` /
+  `retouch_delete_shapes(formids, instance?)`.
 
 **Library, culling, metadata**
 
@@ -556,6 +596,10 @@ bridge loaded.
 - **No direct database access, ever.** Only official darktable APIs: `darktable-cli` for export, the
   Lua API for everything else. Any contribution that reads or writes `library.db` directly will be
   rejected.
+- **Edits from a snapshot stay on that photo.** Every darkroom binding resolves against whichever
+  image darktable currently has open, so `capture_viewport` records the image id and the
+  `*_in_viewport` retouch tools refuse the write when it no longer matches. Post-edit previews report
+  which photo they are of, so a preview can never be silently mistaken for the wrong image.
 - **Failed local edits roll back.** `mask_object` and `mask_raster` clean up any module instance they
   created if a later step fails — no orphan instances left in your history.
 - **Working on a duplicate is still on you.** Live editing mutates the open image's real history stack.

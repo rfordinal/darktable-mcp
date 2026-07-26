@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -48,6 +49,13 @@ from .tools.contact_sheet_tools import (
 )
 from .tools.segmentation_tools import run_segmentation
 from .utils.errors import DarktableMCPError, MattingServiceError, SegmentationServiceError
+from .utils.viewport_coords import (
+    POINT_SPACES,
+    ViewportCoordinateError,
+    canonical_space,
+    viewport_point_to_image,
+    viewport_radius_to_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +290,17 @@ class DarktableMCPServer:
         # traverse to an arbitrary file. Capped + FIFO-evicted to bound memory.
         self._download_registry: "OrderedDict[str, str]" = OrderedDict()
         self._download_registry_cap = 1024
+        # Viewport snapshot registry (capture_viewport): random token ->
+        # {viewport, region, render{path,width,height}, created_at}. This is
+        # a BEST-EFFORT snapshot, not an atomic one -- region and render come
+        # from two sequential bridge calls, so it can only be wrong if the
+        # user pans/zoom mid-call, which the design review (2026-07-25 spec)
+        # accepted as out of scope for v1. TTL-expired so a stale snapshot
+        # (captured long before an add/update call) is rejected rather than
+        # silently retouching wherever the viewport happens to be now.
+        self._viewport_snapshots: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._viewport_snapshot_cap = 256
+        self._viewport_snapshot_ttl_s = 300.0
         self._handler_map: Dict[str, ToolHandler] = self._build_handlers()
         self._setup_tools()
 
@@ -494,7 +513,7 @@ class DarktableMCPServer:
             Tool(
                 name="set_photo_note",
                 description=(
-                    "Write an AI-generated assessment or note for a photo, stored "
+                    "Write a description or editorial note for a photo, stored "
                     "in the photo's Description metadata field (Xmp.dc.description "
                     "in the xmp sidecar). Overwrites any existing description on "
                     "that photo. Requires darktable to be running with the "
@@ -686,14 +705,15 @@ class DarktableMCPServer:
             Tool(
                 name="extract_previews",
                 description=(
-                    "Extract auto-rotated JPEG previews from a directory of "
-                    "raw files (NEF/CR2/ARW/DNG/etc) for vision-based rating. "
+                    "Extract auto-rotated JPEG previews and thumbnails from a "
+                    "directory of raw files (NEF/CR2/ARW/DNG/etc) for review, "
+                    "contact sheets, culling, or downstream image analysis. "
                     "Each preview is rotated upright via EXIF orientation and "
                     "resized to max_dim (default 1024). A smaller thumb_dim "
-                    "(default 384) is also written for token-efficient "
-                    "first-pass culling. Returns a list of items with preview "
-                    "paths plus an EXIF summary (ISO, shutter, focal, "
-                    "aperture, datetime) per file."
+                    "(default 384) is also written as a lightweight "
+                    "first-pass thumbnail. Returns a list of items with "
+                    "preview paths plus an EXIF summary (ISO, shutter, "
+                    "focal, aperture, datetime) per file."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1183,6 +1203,291 @@ class DarktableMCPServer:
                     },
                 },
             ),
+            Tool(
+                name="capture_viewport",
+                description=(
+                    "Snapshot the region + a full-detail render of what the "
+                    "user is CURRENTLY looking at in 'main' or 'preview2' "
+                    "(the external/second-monitor darkroom window), so you "
+                    "can pick retouch points directly off this render's own "
+                    "pixels or 0..1 frame instead of the full image. Returns "
+                    "a snapshot_id -- pass it to retouch_add_shape_in_viewport "
+                    "/ retouch_update_shape_in_viewport so the point you pick "
+                    "and the render you looked at are guaranteed to agree. "
+                    "The snapshot is BOUND to the image open in darkroom at "
+                    "capture time: a later add/update call refuses to write if "
+                    "darktable has moved to a different image, instead of "
+                    "retouching the wrong photo. Pixel coordinates you pass "
+                    "later are pixels of THIS render (the reported render WxH), "
+                    "not of the darktable window. "
+                    "The snapshot is BEST-EFFORT, not atomic (region and "
+                    "render come from two sequential reads): fine as long as "
+                    "the user isn't actively panning/zooming mid-call. "
+                    "Snapshots expire after a few minutes -- re-capture if a "
+                    "later add/update call reports snapshot_not_found_or_expired. "
+                    "Errors with viewport_not_active if 'preview2' is requested "
+                    "but the second window isn't open."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "viewport": {
+                            "type": "string",
+                            "enum": ["main", "preview2"],
+                            "default": "main",
+                            "description": "Which darkroom window to capture",
+                        },
+                        "max_w": {
+                            "type": "integer",
+                            "default": 1400,
+                            "minimum": 16,
+                            "description": "Maximum render width in pixels",
+                        },
+                        "max_h": {
+                            "type": "integer",
+                            "default": 1400,
+                            "minimum": 16,
+                            "description": "Maximum render height in pixels",
+                        },
+                        "return_image": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Return the render inline (downscaled JPEG) as well as its path",
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="retouch_add_shape_in_viewport",
+                description=(
+                    "Like retouch_add_shape, but target/source/radius/feather "
+                    "are given relative to a snapshot from capture_viewport "
+                    "instead of the full image -- the server converts them "
+                    "for you, so you never hand-compute the full-image "
+                    "fraction from a cropped/zoomed render. Rejects (does "
+                    "NOT clamp) target or source points that fall outside "
+                    "the captured viewport/render, and rejects an "
+                    "expired/unknown snapshot_id -- both come back as an "
+                    "explicit error so a stale or wrong point never silently "
+                    "retouches the wrong spot -- as does a snapshot whose "
+                    "image is no longer the one open in darkroom. Set "
+                    "return_preview to get a "
+                    "render of the SAME region back immediately so you can "
+                    "verify the result without a second capture_viewport call."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "snapshot_id": {
+                            "type": "string",
+                            "description": "snapshot_id from a prior capture_viewport call",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the retouch module instance",
+                        },
+                        "algorithm": {
+                            "type": "string",
+                            "enum": ["heal", "clone"],
+                            "description": "Retouch algorithm for this shape",
+                        },
+                        "coordinate_space": {
+                            "type": "string",
+                            "enum": list(POINT_SPACES),
+                            "default": "snapshot_normalized",
+                            "description": (
+                                "'snapshot_normalized' (alias 'viewport_normalized'): "
+                                "0..1 within the captured render. 'snapshot_pixels' "
+                                "(alias 'viewport_pixels'): pixel coordinates of the "
+                                "RENDER capture_viewport returned (its reported "
+                                "render WxH) -- NOT the darktable window's pixel "
+                                "size, which is usually larger."
+                            ),
+                        },
+                        "radius_space": {
+                            "type": "string",
+                            "enum": list(POINT_SPACES),
+                            "description": (
+                                "Space for 'radius'/'feather'. Defaults to "
+                                "coordinate_space. IMPORTANT: a snapshot_pixels "
+                                "radius is scaled by the render's WIDTH only "
+                                "(never height, never an average) so circle "
+                                "size doesn't depend on the window's aspect ratio."
+                            ),
+                        },
+                        "target": {
+                            "type": "object",
+                            "description": "Shape center, in coordinate_space units",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                            },
+                            "required": ["x", "y"],
+                        },
+                        "source": {
+                            "type": "object",
+                            "description": "Source point to sample from (absolute, not an offset), in coordinate_space units",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                            },
+                            "required": ["x", "y"],
+                        },
+                        "radius": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": "Circle radius, in radius_space units",
+                        },
+                        "feather": {
+                            "type": "number",
+                            "default": 0.0,
+                            "minimum": 0,
+                            "description": "Soft edge width, in radius_space units",
+                        },
+                        "opacity": {
+                            "type": "number",
+                            "default": 1.0,
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Shape opacity (1.0 = full effect)",
+                        },
+                        "wavelet_scale": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Wavelet scale to retouch on; defaults to the module's current scale",
+                        },
+                        "return_preview": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Render the same captured region again after the edit, for immediate visual verification",
+                        },
+                    },
+                    "required": ["snapshot_id", "algorithm", "target", "source", "radius"],
+                },
+            ),
+            Tool(
+                name="retouch_update_shape_in_viewport",
+                description=(
+                    "Move/resize an EXISTING retouch shape (by formid, from "
+                    "retouch_add_shape_in_viewport's response or "
+                    "retouch_list_shapes) in place -- same coordinate "
+                    "conversion and containment rejection as "
+                    "retouch_add_shape_in_viewport, but keeps the shape's "
+                    "identity instead of deleting and recreating it. "
+                    "target/source/radius/feather must be resent in full "
+                    "each call (this moves the whole shape, not a single field)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "snapshot_id": {
+                            "type": "string",
+                            "description": "snapshot_id from a prior capture_viewport call",
+                        },
+                        "formid": {
+                            "type": "integer",
+                            "description": "Shape form id to move/resize",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the retouch module instance",
+                        },
+                        "algorithm": {
+                            "type": "string",
+                            "enum": ["heal", "clone"],
+                            "description": "Optional: change the shape's algorithm; omit to keep it unchanged",
+                        },
+                        "coordinate_space": {
+                            "type": "string",
+                            "enum": list(POINT_SPACES),
+                            "default": "snapshot_normalized",
+                            "description": (
+                                "Same convention as retouch_add_shape_in_viewport: "
+                                "snapshot_pixels are pixels of the capture_viewport "
+                                "render, not of the darktable window"
+                            ),
+                        },
+                        "radius_space": {
+                            "type": "string",
+                            "enum": list(POINT_SPACES),
+                            "description": "Same convention as retouch_add_shape_in_viewport; defaults to coordinate_space",
+                        },
+                        "target": {
+                            "type": "object",
+                            "description": "New shape center, in coordinate_space units",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                            },
+                            "required": ["x", "y"],
+                        },
+                        "source": {
+                            "type": "object",
+                            "description": "New source point, in coordinate_space units",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                            },
+                            "required": ["x", "y"],
+                        },
+                        "radius": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": "New circle radius, in radius_space units",
+                        },
+                        "feather": {
+                            "type": "number",
+                            "default": 0.0,
+                            "minimum": 0,
+                            "description": "New soft edge width, in radius_space units",
+                        },
+                        "opacity": {
+                            "type": "number",
+                            "description": "Optional: change the shape's opacity; omit to leave it unchanged",
+                        },
+                        "wavelet_scale": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional: change the wavelet scale; omit to keep it unchanged",
+                        },
+                        "return_preview": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Render the same captured region again after the edit, for immediate visual verification",
+                        },
+                    },
+                    "required": ["snapshot_id", "formid", "target", "source", "radius"],
+                },
+            ),
+            Tool(
+                name="retouch_delete_shapes",
+                description=(
+                    "Delete multiple retouch shapes by formid in one call -- "
+                    "batch version of retouch_delete_shape, so cleaning up "
+                    "several wrong points doesn't need one approval per "
+                    "shape. NOT atomic: each formid is deleted independently, "
+                    "so check the 'failed' list in the response."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the retouch module instance",
+                        },
+                        "formids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "minItems": 1,
+                            "description": "Shape form ids to remove",
+                        },
+                    },
+                    "required": ["formids"],
+                },
+            ),
             # ---- Phase 2 (T2.3): object masks -------------------------------
             Tool(
                 name="add_path_mask",
@@ -1261,10 +1566,11 @@ class DarktableMCPServer:
                     "Create a local HEAL or CLONE circle shape on the retouch "
                     "module — the module's actual local-editing surface, "
                     "distinct from add_path_mask's generic 'restrict this "
-                    "module's blend to a region'. Fixes dust/blemishes/small "
-                    "distractions by sampling a source region onto a target "
-                    "region, optionally on a specific wavelet scale (skin "
-                    "texture vs base tones vs residual detail). Only "
+                    "module's blend to a region'. Fixes sensor dust, small "
+                    "surface marks, or localized image artifacts by sampling "
+                    "a source region onto a target region, optionally on a "
+                    "specific wavelet scale (fine detail vs base tones vs "
+                    "residual). Only "
                     "'circle' shapes and 'heal'/'clone' algorithms are "
                     "supported so far — ellipse/path/brush and blur/fill are "
                     "a later phase. Requires a retouch module instance to "
@@ -1398,8 +1704,9 @@ class DarktableMCPServer:
                 name="mask_object",
                 description=(
                     "Apply a local edit to ONE object/region of the open "
-                    "image, picked visually — e.g. 'brighten her face', "
-                    "'darken the sky'. YOU (the vision model) look at a "
+                    "image, picked visually — e.g. brighten a foreground "
+                    "object, darken the sky, adjust a garment. YOU (the "
+                    "vision model) look at a "
                     "get_preview image, pick point(s) and/or a box on the "
                     "subject, and pass them here together with the desired "
                     "adjustment. This tool then: (1) re-renders the full "
@@ -1491,8 +1798,10 @@ class DarktableMCPServer:
                         "label": {
                             "type": "string",
                             "description": (
-                                "Free-text hint (e.g. 'face'), best-effort "
-                                "only — SAM2 has no text grounding, so this "
+                                "Free-text hint describing the selected "
+                                "region (e.g. 'foreground object', 'sky'), "
+                                "best-effort only — SAM2 has no text "
+                                "grounding, so this "
                                 "does nothing useful unless points/box are "
                                 "also given. Always prefer picking points/"
                                 "box yourself from the preview image."
@@ -1525,15 +1834,17 @@ class DarktableMCPServer:
                 name="mask_raster",
                 description=(
                     "Apply a local edit gated by a SOFT-EDGED alpha matte "
-                    "(hair, fur, fine wispy detail) instead of a hard drawn "
-                    "polygon -- use this instead of mask_object whenever the "
-                    "subject has fine edges a path mask would jag up (a "
-                    "hairline, flyaway strands, fur, motion blur, glass, "
-                    "smoke). It acts on whichever image is currently open in "
-                    "darkroom (call open_image_in_darkroom first) with NO "
-                    "point/box picking needed -- unlike mask_object, the "
-                    "MODNet matting model is a dense, whole-image, "
-                    "unprompted portrait matte, so there is nothing to pick. "
+                    "for subjects with fine or semi-transparent edges "
+                    "(hair, fur, fabric fibers, motion blur, glass, smoke) "
+                    "instead of a hard drawn polygon -- use this instead of "
+                    "mask_object whenever the subject has fine edges a path "
+                    "mask would jag up. It acts on whichever image is "
+                    "currently open in darkroom (call "
+                    "open_image_in_darkroom first) with NO point/box "
+                    "picking needed -- unlike mask_object, the MODNet "
+                    "matting model generates a dense, whole-image, "
+                    "unprompted foreground matte, so there is nothing to "
+                    "pick. "
                     "Flow: (1) run the image (or, for RAW files the matting "
                     "model can't read directly, a full-resolution darkroom "
                     "preview export) through the MODNet matting sidecar to "
@@ -1630,9 +1941,13 @@ class DarktableMCPServer:
             "enable_module": self._handle_enable_module,
             "add_instance": self._handle_add_instance,
             "get_viewport": self._handle_get_viewport,
+            "capture_viewport": self._handle_capture_viewport,
             "add_path_mask": self._handle_add_path_mask,
             "retouch_add_shape": self._handle_retouch_add_shape,
+            "retouch_add_shape_in_viewport": self._handle_retouch_add_shape_in_viewport,
+            "retouch_update_shape_in_viewport": self._handle_retouch_update_shape_in_viewport,
             "retouch_delete_shape": self._handle_retouch_delete_shape,
+            "retouch_delete_shapes": self._handle_retouch_delete_shapes,
             "retouch_list_shapes": self._handle_retouch_list_shapes,
             "mask_object": self._handle_mask_object,
             "mask_raster": self._handle_mask_raster,
@@ -2510,6 +2825,222 @@ class DarktableMCPServer:
             return None
         return f"{base.rstrip('/')}/mcp/files/{token}"
 
+    def _store_viewport_snapshot(self, record: Dict[str, Any]) -> str:
+        """Store a capture_viewport result and return its snapshot_id.
+        FIFO-evicts on cap, same pattern as _register_download."""
+        snapshot_id = "vp_" + uuid.uuid4().hex
+        record["created_at"] = time.monotonic()
+        self._viewport_snapshots[snapshot_id] = record
+        while len(self._viewport_snapshots) > self._viewport_snapshot_cap:
+            self._viewport_snapshots.popitem(last=False)
+        return snapshot_id
+
+    def _get_viewport_snapshot(self, snapshot_id: str) -> Dict[str, Any]:
+        """Look up a snapshot by id, raising ViewportCoordinateError if it's
+        missing or past its TTL -- never silently falls back to "wherever
+        the viewport happens to be now"."""
+        record = self._viewport_snapshots.get(snapshot_id) if snapshot_id else None
+        if record is None:
+            raise ViewportCoordinateError(
+                f"snapshot_id {snapshot_id!r} not found (never captured, or "
+                "server restarted since) -- call capture_viewport again"
+            )
+        age = time.monotonic() - record["created_at"]
+        if age > self._viewport_snapshot_ttl_s:
+            del self._viewport_snapshots[snapshot_id]
+            raise ViewportCoordinateError(
+                f"snapshot_id {snapshot_id!r} expired ({age:.0f}s old, "
+                f"limit {self._viewport_snapshot_ttl_s:.0f}s) -- the viewport "
+                "may have moved since; call capture_viewport again"
+            )
+        return record
+
+    def _darkroom_image(self) -> Dict[str, Any]:
+        """Identity of the image currently open in darkroom:
+        {"has_image": True, "id": int, "filename": str, "path": str}, or
+        {"has_image": False, "error": "..."} when nothing is loaded / the
+        bridge call itself failed.
+
+        EVERY darkroom binding resolves against darktable's GLOBAL state
+        (darktable.develop) -- there is no per-call image handle anywhere in
+        the C API -- so a snapshot and the edit made from it stay on the same
+        photo only if we read this identity and compare it ourselves. Without
+        that check a view switch between two consecutive tool calls silently
+        retouches whatever image happens to be open (2026-07-26 bugreport)."""
+        try:
+            result = self.bridge.call("dev_current_image", {}, timeout=10.0)
+        except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+            return {"has_image": False, "error": str(e)}
+        if not isinstance(result, dict):
+            return {"has_image": False, "error": f"unexpected reply: {result!r}"}
+        if result.get("error"):
+            return {"has_image": False, "error": str(result["error"])}
+        if not result.get("has_image"):
+            result.setdefault("error", "no darkroom image loaded")
+        return result
+
+    @staticmethod
+    def _image_label(img: Dict[str, Any]) -> str:
+        if not img or not img.get("has_image"):
+            return f"none ({(img or {}).get('error', 'no darkroom image loaded')})"
+        return f"id={img.get('id')} filename={img.get('filename')}"
+
+    def _snapshot_image_guard(self, snapshot: Dict[str, Any], tool: str):
+        """Refuse to mutate when the darkroom no longer holds the image the
+        snapshot was captured from. Returns an error response list, or None
+        when it is safe to proceed."""
+        expected = snapshot.get("image") or {}
+        current = self._darkroom_image()
+        if not current.get("has_image"):
+            return [TextContent(type="text", text=(
+                f"{tool}: darkroom image mismatch -- snapshot was captured on "
+                f"{self._image_label(expected)}, but darktable has no image open "
+                f"now ({current.get('error')}). Nothing was written. Reopen that "
+                "image in darkroom and call capture_viewport again."
+            ))]
+        if expected.get("id") is not None and current.get("id") != expected.get("id"):
+            return [TextContent(type="text", text=(
+                f"{tool}: darkroom image mismatch -- snapshot image_id="
+                f"{expected.get('id')} ({expected.get('filename')}), active "
+                f"image_id={current.get('id')} ({current.get('filename')}). "
+                "Nothing was written -- the coordinates in the snapshot mean "
+                "nothing on a different photo. Reopen the snapshot's image, or "
+                "call capture_viewport again for the active one."
+            ))]
+        return None
+
+    def _explain_darkroom_error(self, message: str) -> str:
+        """Append the live darkroom state to an error that reports the
+        darkroom as gone. The C bindings say "no darkroom image loaded"
+        whenever dev->iop is NULL at that instant -- i.e. darktable had left
+        darkroom, or was mid-switch to another image. Naming the image that IS
+        open turns an unexplained failure into a diagnosis (2026-07-26
+        bugreport: a delete failed this way one call after a successful
+        add)."""
+        text = str(message)
+        if "no darkroom image loaded" not in text and "not in darkroom" not in text:
+            return text
+        return (
+            f"{text} -- darkroom state right now: "
+            f"{self._image_label(self._darkroom_image())}. darktable left "
+            "darkroom or switched image between calls; the shape itself may "
+            "still exist on the image it was added to."
+        )
+
+    def _render_snapshot_preview(self, snapshot: Dict[str, Any]):
+        """Re-render the exact region+size of a captured snapshot, for a
+        before/after comparison after an in-viewport retouch edit. Returns
+        (ImageContent|None, text_line) -- failures degrade to a text-only
+        line rather than failing the whole tool call, since the edit itself
+        already succeeded by the time this runs."""
+        render = snapshot["render"]
+        params = {
+            "max_w": render.get("width") or 1400,
+            "max_h": render.get("height") or 1400,
+            "region": snapshot["region"],
+        }
+        try:
+            result = self.bridge.call("dev_preview", params, timeout=20.0)
+        except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+            return None, f"  post-edit preview unavailable: {e}"
+        if result.get("error"):
+            return None, f"  post-edit preview unavailable: {result['error']}"
+        path = result.get("path") or result.get("stale_preview")
+        if not path:
+            return None, "  post-edit preview unavailable: no path in result"
+        host_path = _remap_bridge_path(path)
+
+        # dev_preview renders whatever image darkroom holds RIGHT NOW; it
+        # carries no image identity of its own. Re-read the identity and say
+        # which photo the returned frame is of, so a preview from a different
+        # image can never be mistaken for "the edit I just made" (the
+        # 2026-07-26 bugreport: a snapshot of a b&w portrait came back with a
+        # post-edit preview of an unrelated colour photo).
+        expected = snapshot.get("image") or {}
+        current = self._darkroom_image()
+        line = f"  post-edit preview: {host_path}"
+        if current.get("has_image"):
+            line += f" (preview_image_id={current.get('id')} {current.get('filename')})"
+        if expected.get("id") is not None and current.get("id") != expected.get("id"):
+            line = (
+                f"  WARNING: post-edit preview is NOT the snapshot's image -- "
+                f"snapshot image_id={expected.get('id')} "
+                f"({expected.get('filename')}), preview image "
+                f"{self._image_label(current)}. The darkroom image changed "
+                f"during this call; ignore this preview.\n" + line
+            )
+        return _inline_image_content(host_path), line
+
+    def _backtransform_to_mask_space(
+        self,
+        display_target: Dict[str, float],
+        display_source: Dict[str, float],
+        display_radius: float,
+        display_feather: float,
+    ):
+        """Second stage of the viewport-relative retouch pipeline: convert
+        PROCESSED/DISPLAY-frame-normalized coordinates (viewport_coords.py's
+        output -- the frame get_viewport()/get_preview() use) into the
+        PIPE-INPUT/mask-frame-normalized coordinates retouch_add_shape/
+        retouch_update_shape actually store (see dt.develop.backtransform_point's
+        doc comment, src-dt/src/lua/develop.c, for why these frames differ).
+
+        Returns (mask_dict, error_response) -- exactly one is None. mask_dict
+        has target/source ({x,y}) and radius/feather (floats)."""
+        target_params: Dict[str, Any] = {
+            "x": display_target["x"], "y": display_target["y"], "len1": display_radius,
+        }
+        if display_feather > 0:
+            target_params["len2"] = display_feather
+        try:
+            target_result = self.bridge.call("dev_backtransform_point", target_params, timeout=15.0)
+        except BridgePluginNotInstalledError:
+            return None, [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return None, [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return None, [TextContent(type="text", text=f"Plugin error: {e}")]
+        if target_result.get("error"):
+            return None, [TextContent(
+                type="text", text=f"backtransform_point(target): {target_result['error']}"
+            )]
+
+        try:
+            source_result = self.bridge.call(
+                "dev_backtransform_point",
+                {"x": display_source["x"], "y": display_source["y"]},
+                timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return None, [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return None, [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return None, [TextContent(type="text", text=f"Plugin error: {e}")]
+        if source_result.get("error"):
+            return None, [TextContent(
+                type="text", text=f"backtransform_point(source): {source_result['error']}"
+            )]
+
+        return {
+            "target": {"x": target_result["x"], "y": target_result["y"]},
+            "source": {"x": source_result["x"], "y": source_result["y"]},
+            "radius": target_result.get("len1", display_radius),
+            "feather": target_result.get("len2", 0.0) if display_feather > 0 else 0.0,
+        }, None
+
     async def _handle_get_preview(self, arguments: Dict[str, Any]) -> List[Any]:
         max_w = int(arguments.get("max_w", 1024))
         max_h = int(arguments.get("max_h", 1024))
@@ -2549,8 +3080,28 @@ class DarktableMCPServer:
             return [TextContent(type="text", text=f"get_preview: no path in result: {result}")]
         host_path = _remap_bridge_path(path)
         lines = [f"status: {status}", f"path: {host_path}"]
+        # Which photo this frame is of, plus WHY its size is what it is: the
+        # render is a crop of the processed frame (frame_width/height), capped
+        # at max_w/max_h and never upscaled past the crop's own resolution --
+        # so a small region legitimately returns a small image. Reported
+        # because bare, varying dimensions read as a bug (2026-07-26 report).
+        img = self._darkroom_image()
+        lines.append(f"image: {self._image_label(img)}")
         if result.get("width") and result.get("height"):
             lines.append(f"size: {result['width']}x{result['height']}")
+        if result.get("frame_width") and result.get("frame_height"):
+            lines.append(
+                f"processed frame: {result['frame_width']}x{result['frame_height']}"
+            )
+        rendered_region = result.get("region")
+        if isinstance(rendered_region, dict):
+            lines.append(f"rendered region: {json.dumps(rendered_region)}")
+        else:
+            lines.append("rendered region: full frame (no region requested)")
+        lines.append(
+            f"size rule: crop of the processed frame, capped at "
+            f"max_w={max_w}/max_h={max_h}, never upscaled past the crop"
+        )
         if status == "processing":
             lines.append("(pipe was still processing; this is the last good frame)")
         # Full-res download URL for a remote client that would rather stream the
@@ -2665,6 +3216,133 @@ class DarktableMCPServer:
             return [TextContent(type="text", text=f"get_viewport: {result['error']}")]
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
+    async def _handle_capture_viewport(self, arguments: Dict[str, Any]) -> List[Any]:
+        viewport = arguments.get("viewport", "main")
+        if viewport not in ("main", "preview2"):
+            return [TextContent(type="text", text="viewport must be 'main' or 'preview2'")]
+        max_w = int(arguments.get("max_w", 1400))
+        max_h = int(arguments.get("max_h", 1400))
+        return_image = bool(arguments.get("return_image", True))
+
+        try:
+            vp_result = self.bridge.call("dev_get_viewport", {}, timeout=15.0)
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if vp_result.get("error"):
+            return [TextContent(type="text", text=f"capture_viewport: {vp_result['error']}")]
+
+        vp = vp_result.get(viewport)
+        if not isinstance(vp, dict) or vp.get("active") is False:
+            return [TextContent(
+                type="text",
+                text=f"capture_viewport: viewport_not_active ({viewport})",
+            )]
+        region = vp.get("region")
+        if not isinstance(region, dict) or not all(k in region for k in ("x", "y", "w", "h")):
+            return [TextContent(
+                type="text",
+                text=(
+                    f"capture_viewport: no region available for '{viewport}' "
+                    "(no processed pipe yet)"
+                ),
+            )]
+        region = {k: float(region[k]) for k in ("x", "y", "w", "h")}
+
+        # Bind the snapshot to the image it is a picture OF, and re-read the
+        # identity after the render (below) so a mid-capture image switch is
+        # caught instead of being baked into the snapshot.
+        image = self._darkroom_image()
+        if not image.get("has_image"):
+            return [TextContent(type="text", text=(
+                f"capture_viewport: no darkroom image loaded ({image.get('error')}) "
+                "-- open an image in darkroom first"
+            ))]
+
+        try:
+            preview_result = self.bridge.call(
+                "dev_preview",
+                {"max_w": max_w, "max_h": max_h, "region": region},
+                timeout=20.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if preview_result.get("error"):
+            return [TextContent(
+                type="text",
+                text=f"capture_viewport: get_preview failed: {preview_result['error']}",
+            )]
+        path = preview_result.get("path") or preview_result.get("stale_preview")
+        if not path:
+            return [TextContent(
+                type="text",
+                text=f"capture_viewport: no path in preview result: {preview_result}",
+            )]
+        host_path = _remap_bridge_path(path)
+        render_w = int(preview_result.get("width") or 0)
+        render_h = int(preview_result.get("height") or 0)
+
+        # The render is only trustworthy if darkroom still holds the same image
+        # it did a moment ago -- dev_preview has no image identity of its own.
+        image_after = self._darkroom_image()
+        if image_after.get("id") != image.get("id"):
+            return [TextContent(type="text", text=(
+                f"capture_viewport: the darkroom image changed while capturing "
+                f"(started on {self._image_label(image)}, ended on "
+                f"{self._image_label(image_after)}) -- no snapshot stored, "
+                "try again once the view settles"
+            ))]
+
+        snapshot_id = self._store_viewport_snapshot({
+            "viewport": viewport,
+            "region": region,
+            "render": {"path": host_path, "width": render_w, "height": render_h},
+            "image": image,
+        })
+
+        lines = [
+            f"capture_viewport('{viewport}'): snapshot_id={snapshot_id}",
+            f"  image: id={image.get('id')} filename={image.get('filename')}",
+            f"  region: {json.dumps({k: round(region[k], 6) for k in ('x', 'y', 'w', 'h')})}",
+            f"  render: {render_w}x{render_h} path={host_path}",
+            f"  snapshot_pixels for this snapshot means 0..{render_w} x "
+            f"0..{render_h} (the render above), NOT the darktable window size",
+            f"  expires in ~{int(self._viewport_snapshot_ttl_s)}s",
+        ]
+        dl = self._download_url(host_path)
+        if dl:
+            lines.append(f"  url: {dl} (no auth header needed, token in URL is the credential)")
+
+        out: List[Any] = []
+        if return_image:
+            img = _inline_image_content(host_path)
+            if img is not None:
+                out.append(img)
+                lines.append("  (inline image: JPEG, downscaled; full-res PNG at path/url above)")
+        out.append(TextContent(type="text", text="\n".join(lines)))
+        return out
+
     # ---- Phase 2 (T2.3): object masks --------------------------------------
 
     async def _handle_add_path_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
@@ -2770,7 +3448,10 @@ class DarktableMCPServer:
         if result.get("error"):
             return [TextContent(
                 type="text",
-                text=f"retouch_add_shape(instance={instance}): {result['error']}",
+                text=(
+                    f"retouch_add_shape(instance={instance}): "
+                    f"{self._explain_darkroom_error(result['error'])}"
+                ),
             )]
 
         lines = [
@@ -2781,6 +3462,239 @@ class DarktableMCPServer:
             "Call get_preview() to see the retouched result.",
         ]
         return [TextContent(type="text", text="\n".join(lines))]
+
+    async def _handle_retouch_add_shape_in_viewport(self, arguments: Dict[str, Any]) -> List[Any]:
+        snapshot = self._get_viewport_snapshot(arguments.get("snapshot_id"))
+        region = snapshot["region"]
+        render = snapshot["render"]
+
+        algorithm = arguments.get("algorithm")
+        if not algorithm:
+            return [TextContent(type="text", text="algorithm is required")]
+        target = arguments.get("target")
+        source = arguments.get("source")
+        radius = arguments.get("radius")
+        if radius is None:
+            return [TextContent(type="text", text="radius is required")]
+
+        coordinate_space = canonical_space(
+            arguments.get("coordinate_space", "snapshot_normalized")
+        )
+        radius_space = canonical_space(arguments.get("radius_space", coordinate_space))
+
+        # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized
+        # (same frame get_viewport()/get_preview() use).
+        display_target = viewport_point_to_image(
+            region, target, coordinate_space, render["width"], render["height"], label="target"
+        )
+        display_source = viewport_point_to_image(
+            region, source, coordinate_space, render["width"], render["height"], label="source"
+        )
+        display_radius = viewport_radius_to_image(region, float(radius), radius_space, render["width"])
+        feather_local = float(arguments.get("feather", 0.0))
+        display_feather = (
+            viewport_radius_to_image(region, feather_local, radius_space, render["width"])
+            if feather_local > 0
+            else 0.0
+        )
+
+        # Same-image guard: the snapshot's coordinates only mean something on
+        # the image it was captured from, so refuse before touching darktable
+        # if darkroom has moved on. Runs after the (free, local) stage-1
+        # transform so malformed input still fails without a bridge call.
+        guard = self._snapshot_image_guard(snapshot, "retouch_add_shape_in_viewport")
+        if guard is not None:
+            return guard
+
+        # Stage 2: display-frame -> PIPE-INPUT/mask-frame normalized (the
+        # frame retouch_add_shape actually stores coordinates in -- these two
+        # frames differ whenever orientation/crop/rotate/lens-correction is
+        # active; see _backtransform_to_mask_space's doc comment).
+        mask, err = self._backtransform_to_mask_space(
+            display_target, display_source, display_radius, display_feather
+        )
+        if err is not None:
+            return err
+        full_target = mask["target"]
+        full_source = mask["source"]
+        full_radius = mask["radius"]
+        full_feather = mask["feather"]
+
+        instance = int(arguments.get("instance", 0))
+        params: Dict[str, Any] = {
+            "op": "retouch",
+            "instance": instance,
+            "algorithm": algorithm,
+            "target": full_target,
+            "source": full_source,
+            "radius": full_radius,
+            "feather": full_feather,
+            "opacity": float(arguments.get("opacity", 1.0)),
+        }
+        if arguments.get("wavelet_scale") is not None:
+            params["wavelet_scale"] = int(arguments["wavelet_scale"])
+
+        try:
+            result = self.bridge.call("dev_retouch_add_shape", params, timeout=15.0)
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(
+                type="text",
+                text=(
+                    f"retouch_add_shape_in_viewport(instance={instance}): "
+                    f"{self._explain_darkroom_error(result['error'])}"
+                ),
+            )]
+
+        snap_image = snapshot.get("image") or {}
+        lines = [
+            f"retouch_add_shape_in_viewport(instance={instance}): ok=True "
+            f"formid={result.get('formid')} algorithm={result.get('algorithm')} "
+            f"wavelet_scale={result.get('wavelet_scale')}",
+            f"  image: id={snap_image.get('id')} filename={snap_image.get('filename')} "
+            f"(snapshot_id={arguments.get('snapshot_id')})",
+            f"  input ({coordinate_space}): target={target} source={source} radius={radius}",
+            f"  display-frame: target={display_target} source={display_source} "
+            f"radius={display_radius} feather={display_feather}",
+            f"  mask-frame (actual write): target={full_target} source={full_source} "
+            f"radius={full_radius} feather={full_feather}",
+        ]
+
+        out: List[Any] = []
+        if bool(arguments.get("return_preview", True)):
+            preview_img, preview_line = self._render_snapshot_preview(snapshot)
+            if preview_img is not None:
+                out.append(preview_img)
+            lines.append(preview_line)
+        out.append(TextContent(type="text", text="\n".join(lines)))
+        return out
+
+    async def _handle_retouch_update_shape_in_viewport(self, arguments: Dict[str, Any]) -> List[Any]:
+        snapshot = self._get_viewport_snapshot(arguments.get("snapshot_id"))
+        region = snapshot["region"]
+        render = snapshot["render"]
+
+        formid = arguments.get("formid")
+        if formid is None:
+            return [TextContent(type="text", text="formid is required")]
+        target = arguments.get("target")
+        source = arguments.get("source")
+        radius = arguments.get("radius")
+        if radius is None:
+            return [TextContent(type="text", text="radius is required")]
+
+        coordinate_space = canonical_space(
+            arguments.get("coordinate_space", "snapshot_normalized")
+        )
+        radius_space = canonical_space(arguments.get("radius_space", coordinate_space))
+
+        # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized.
+        display_target = viewport_point_to_image(
+            region, target, coordinate_space, render["width"], render["height"], label="target"
+        )
+        display_source = viewport_point_to_image(
+            region, source, coordinate_space, render["width"], render["height"], label="source"
+        )
+        display_radius = viewport_radius_to_image(region, float(radius), radius_space, render["width"])
+        feather_local = float(arguments.get("feather", 0.0))
+        display_feather = (
+            viewport_radius_to_image(region, feather_local, radius_space, render["width"])
+            if feather_local > 0
+            else 0.0
+        )
+
+        # Same-image guard (see _snapshot_image_guard).
+        guard = self._snapshot_image_guard(snapshot, "retouch_update_shape_in_viewport")
+        if guard is not None:
+            return guard
+
+        # Stage 2: display-frame -> PIPE-INPUT/mask-frame normalized (see
+        # _backtransform_to_mask_space's doc comment).
+        mask, err = self._backtransform_to_mask_space(
+            display_target, display_source, display_radius, display_feather
+        )
+        if err is not None:
+            return err
+        full_target = mask["target"]
+        full_source = mask["source"]
+        full_radius = mask["radius"]
+        full_feather = mask["feather"]
+
+        instance = int(arguments.get("instance", 0))
+        params: Dict[str, Any] = {
+            "op": "retouch",
+            "instance": instance,
+            "formid": int(formid),
+            "target": full_target,
+            "source": full_source,
+            "radius": full_radius,
+            "feather": full_feather,
+        }
+        if arguments.get("algorithm"):
+            params["algorithm"] = arguments["algorithm"]
+        if arguments.get("wavelet_scale") is not None:
+            params["wavelet_scale"] = int(arguments["wavelet_scale"])
+        if arguments.get("opacity") is not None:
+            params["opacity"] = float(arguments["opacity"])
+
+        try:
+            result = self.bridge.call("dev_retouch_update_shape", params, timeout=15.0)
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(
+                type="text",
+                text=(
+                    f"retouch_update_shape_in_viewport(formid={formid}): "
+                    f"{self._explain_darkroom_error(result['error'])}"
+                ),
+            )]
+
+        snap_image = snapshot.get("image") or {}
+        lines = [
+            f"retouch_update_shape_in_viewport(formid={formid}, instance={instance}): ok=True "
+            f"algorithm={result.get('algorithm')} wavelet_scale={result.get('wavelet_scale')} "
+            f"opacity={result.get('opacity')}",
+            f"  image: id={snap_image.get('id')} filename={snap_image.get('filename')} "
+            f"(snapshot_id={arguments.get('snapshot_id')})",
+            f"  input ({coordinate_space}): target={target} source={source} radius={radius}",
+            f"  display-frame: target={display_target} source={display_source} "
+            f"radius={display_radius} feather={display_feather}",
+            f"  mask-frame (actual write): target={full_target} source={full_source} "
+            f"radius={full_radius} feather={full_feather}",
+        ]
+
+        out: List[Any] = []
+        if bool(arguments.get("return_preview", True)):
+            preview_img, preview_line = self._render_snapshot_preview(snapshot)
+            if preview_img is not None:
+                out.append(preview_img)
+            lines.append(preview_line)
+        out.append(TextContent(type="text", text="\n".join(lines)))
+        return out
 
     async def _handle_retouch_delete_shape(self, arguments: Dict[str, Any]) -> List[TextContent]:
         formid = arguments.get("formid")
@@ -2807,9 +3721,74 @@ class DarktableMCPServer:
         if result.get("error"):
             return [TextContent(
                 type="text",
-                text=f"retouch_delete_shape(formid={formid}): {result['error']}",
+                text=(
+                    f"retouch_delete_shape(formid={formid}): "
+                    f"{self._explain_darkroom_error(result['error'])}"
+                ),
             )]
         return [TextContent(type="text", text=f"Deleted retouch shape {formid}")]
+
+    async def _handle_retouch_delete_shapes(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        formids = arguments.get("formids")
+        if not isinstance(formids, list) or not formids:
+            return [TextContent(type="text", text="formids must be a non-empty array of integers")]
+        instance = int(arguments.get("instance", 0))
+
+        deleted: List[int] = []
+        failed: List[Dict[str, Any]] = []
+        for raw_formid in formids:
+            try:
+                formid = int(raw_formid)
+            except (TypeError, ValueError):
+                failed.append({"formid": raw_formid, "error": "not an integer"})
+                continue
+            params = {"op": "retouch", "instance": instance, "formid": formid}
+            try:
+                result = self.bridge.call("dev_retouch_delete_shape", params, timeout=15.0)
+            except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+                failed.append({"formid": formid, "error": str(e)})
+                continue
+            if result.get("error"):
+                # A delete earlier in this SAME batch can tear down the
+                # shared mask group (module->blend_params->mask_id cleared)
+                # if it removed the group's last remaining shape -- every
+                # subsequent formid in the batch then errors "no shapes
+                # group" even though it was already removed along with the
+                # group (bugreport 2026-07-25). Verify against
+                # retouch_list_shapes before trusting the error: if the
+                # formid is genuinely gone, this is an already-deleted
+                # no-op, not a real failure.
+                if self._retouch_shape_still_exists(instance, formid):
+                    failed.append({
+                        "formid": formid,
+                        "error": self._explain_darkroom_error(result["error"]),
+                    })
+                else:
+                    deleted.append(formid)
+            else:
+                deleted.append(formid)
+
+        lines = [f"retouch_delete_shapes(instance={instance}): deleted={deleted} failed={len(failed)}"]
+        for f in failed:
+            lines.append(f"  failed formid={f['formid']}: {f['error']}")
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    def _retouch_shape_still_exists(self, instance: int, formid: int) -> bool:
+        """Best-effort re-check used by retouch_delete_shapes when a delete
+        call errors -- True only if retouch_list_shapes confirms the formid
+        is genuinely still present. Any bridge failure here defaults to True
+        (assume still present) so a re-check outage never silently reports a
+        real failure as success."""
+        try:
+            result = self.bridge.call(
+                "dev_retouch_list_shapes", {"op": "retouch", "instance": instance}, timeout=15.0
+            )
+        except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError):
+            return True
+        if result.get("error"):
+            return True
+        shapes = result.get("shapes") or []
+        return any(s.get("formid") == formid for s in shapes)
 
     async def _handle_retouch_list_shapes(self, arguments: Dict[str, Any]) -> List[TextContent]:
         instance = int(arguments.get("instance", 0))
@@ -2833,7 +3812,10 @@ class DarktableMCPServer:
         if result.get("error"):
             return [TextContent(
                 type="text",
-                text=f"retouch_list_shapes(instance={instance}): {result['error']}",
+                text=(
+                    f"retouch_list_shapes(instance={instance}): "
+                    f"{self._explain_darkroom_error(result['error'])}"
+                ),
             )]
 
         shapes = result.get("shapes", [])

@@ -785,6 +785,37 @@ methods.dev_retouch_add_shape = function(p)
     tonumber(source.x), tonumber(source.y), scale, opacity)
 end
 
+-- Move/resize an existing shape in place (same formid) -- see
+-- dt.develop.retouch_update_shape's doc comment in src/lua/develop.c for why
+-- this is a masks-history commit, distinct from retouch_add_shape's
+-- iop-params-history one. algorithm/wavelet_scale/opacity are all optional:
+-- omit to keep the shape's current value.
+methods.dev_retouch_update_shape = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_retouch_update_shape: op required") end
+  local instance = tonumber(p.instance) or 0
+  local formid = tonumber(p.formid)
+  if formid == nil then error("dev_retouch_update_shape: formid required") end
+  local target = p.target
+  if type(target) ~= "table" or tonumber(target.x) == nil or tonumber(target.y) == nil then
+    error("dev_retouch_update_shape: target {x,y} required")
+  end
+  local source = p.source
+  if type(source) ~= "table" or tonumber(source.x) == nil or tonumber(source.y) == nil then
+    error("dev_retouch_update_shape: source {x,y} required")
+  end
+  local radius = tonumber(p.radius)
+  if radius == nil then error("dev_retouch_update_shape: radius required") end
+  local feather = tonumber(p.feather) or 0.0
+  local algorithm = p.algorithm -- nil -> C keeps the shape's current algorithm
+  local scale = tonumber(p.wavelet_scale) -- nil -> C keeps the shape's current scale
+  local opacity = tonumber(p.opacity) -- nil -> C leaves opacity untouched
+  return dt.develop.retouch_update_shape(op, instance, formid,
+    tonumber(target.x), tonumber(target.y), radius, feather,
+    tonumber(source.x), tonumber(source.y), algorithm, scale, opacity)
+end
+
 methods.dev_retouch_delete_shape = function(p)
   p = p or {}
   local op = p.op
@@ -865,6 +896,26 @@ end
 -- drop-in region.
 methods.dev_get_viewport = function(p)
   return dt.develop.get_viewport()
+end
+
+-- Bugreport (2026-07-25): a caller deriving a normalized point from
+-- get_viewport()/get_preview() (the PROCESSED/display frame) and handing it
+-- STRAIGHT to dev_retouch_add_shape/dev_add_path_mask (which store points in
+-- the PIPE-INPUT/mask frame -- see dt.develop.backtransform_point's doc
+-- comment in src/lua/develop.c) places the shape on the wrong part of the
+-- image whenever orientation/crop/rotate/lens-correction is active -- these
+-- two frames are NOT the same, confirmed via a real portrait photo where a
+-- neck target landed on the chest even with a full, uncropped region. This
+-- wrapper is the missing conversion step; len1/len2 are optional lengths
+-- (e.g. radius/feather) converted alongside x/y in the same call.
+methods.dev_backtransform_point = function(p)
+  p = p or {}
+  local x = tonumber(p.x)
+  local y = tonumber(p.y)
+  if x == nil or y == nil then error("dev_backtransform_point: x/y required") end
+  local len1 = tonumber(p.len1)
+  local len2 = tonumber(p.len2)
+  return dt.develop.backtransform_point(x, y, len1, len2)
 end
 
 -- T3.3 (promoted from darktable-mcp/spike/spike_methods.lua once the T3.1
