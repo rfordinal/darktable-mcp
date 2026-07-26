@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from collections import OrderedDict
@@ -47,6 +48,7 @@ from .tools.contact_sheet_tools import (
     validate_offset,
     write_sheet,
 )
+from .tools import retouch_overlay as overlay
 from .tools.segmentation_tools import run_segmentation
 from .utils.errors import DarktableMCPError, MattingServiceError, SegmentationServiceError
 from .utils.viewport_coords import (
@@ -1488,6 +1490,71 @@ class DarktableMCPServer:
                     "required": ["formids"],
                 },
             ),
+            Tool(
+                name="retouch_render_overlay",
+                description=(
+                    "Draw the retouch shapes on top of a capture_viewport "
+                    "snapshot so you can SEE where they landed: target circle, "
+                    "feather ring, source circle and the source->target link, "
+                    "labelled by formid. This is how you verify a heal point "
+                    "actually covers the mark, is not oversized, its feather "
+                    "does not spill onto an edge, and its source sits on clean "
+                    "texture -- checks that plain numbers cannot answer. "
+                    "The overlay is drawn by this server from the shape "
+                    "geometry, NOT captured from darktable's own on-screen "
+                    "overlay (that one is painted on the GUI widget and is "
+                    "absent from every render we can read), so it needs no "
+                    "focus, changes no darktable state, and additionally "
+                    "reports overlapping shapes. modes: all_shapes (every "
+                    "shape; highlight_formid optionally dims the rest), "
+                    "selected_shape (one shape prominent, others dimmed for "
+                    "context), source_and_target (only the chosen shape, "
+                    "nothing else), mask_only (the actual mask alpha as a "
+                    "greyscale image, same falloff darktable applies -- use it "
+                    "to judge coverage, not composition). Read-only: refuses "
+                    "if darkroom has moved to another image, since the "
+                    "geometry would then belong to a different photo."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "snapshot_id": {
+                            "type": "string",
+                            "description": "Snapshot id from capture_viewport (the render to draw on)",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": list(overlay.MODES),
+                            "default": overlay.MODE_ALL_SHAPES,
+                            "description": "What to draw (see the tool description)",
+                        },
+                        "highlight_formid": {
+                            "type": "integer",
+                            "description": (
+                                "Shape to emphasise. Required by selected_shape "
+                                "and source_and_target unless the module has "
+                                "exactly one shape; optional for all_shapes"
+                            ),
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the retouch module instance",
+                        },
+                        "label_shapes": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Print each shape's formid next to its circle",
+                        },
+                        "return_image": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Return the overlay inline (downscaled JPEG) as well as its path",
+                        },
+                    },
+                    "required": ["snapshot_id"],
+                },
+            ),
             # ---- Phase 2 (T2.3): object masks -------------------------------
             Tool(
                 name="add_path_mask",
@@ -1949,6 +2016,7 @@ class DarktableMCPServer:
             "retouch_delete_shape": self._handle_retouch_delete_shape,
             "retouch_delete_shapes": self._handle_retouch_delete_shapes,
             "retouch_list_shapes": self._handle_retouch_list_shapes,
+            "retouch_render_overlay": self._handle_retouch_render_overlay,
             "mask_object": self._handle_mask_object,
             "mask_raster": self._handle_mask_raster,
         }
@@ -3570,6 +3638,9 @@ class DarktableMCPServer:
             f"radius={display_radius} feather={display_feather}",
             f"  mask-frame (actual write): target={full_target} source={full_source} "
             f"radius={full_radius} feather={full_feather}",
+            f"  check placement: retouch_render_overlay(snapshot_id="
+            f"'{arguments.get('snapshot_id')}', mode='source_and_target', "
+            f"highlight_formid={result.get('formid')})",
         ]
 
         out: List[Any] = []
@@ -3685,6 +3756,9 @@ class DarktableMCPServer:
             f"radius={display_radius} feather={display_feather}",
             f"  mask-frame (actual write): target={full_target} source={full_source} "
             f"radius={full_radius} feather={full_feather}",
+            f"  check placement: retouch_render_overlay(snapshot_id="
+            f"'{arguments.get('snapshot_id')}', mode='source_and_target', "
+            f"highlight_formid={formid})",
         ]
 
         out: List[Any] = []
@@ -3790,33 +3864,40 @@ class DarktableMCPServer:
         shapes = result.get("shapes") or []
         return any(s.get("formid") == formid for s in shapes)
 
-    async def _handle_retouch_list_shapes(self, arguments: Dict[str, Any]) -> List[TextContent]:
-        instance = int(arguments.get("instance", 0))
+    def _list_retouch_shapes(self, instance: int):
+        """Shared read of a retouch instance's shapes. Returns
+        (result_dict, error_response) -- exactly one is None."""
         params = {"op": "retouch", "instance": instance}
-
         try:
             result = self.bridge.call("dev_retouch_list_shapes", params, timeout=15.0)
         except BridgePluginNotInstalledError:
-            return [TextContent(
+            return None, [TextContent(
                 type="text",
                 text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
             )]
         except BridgeTimeoutError:
-            return [TextContent(
+            return None, [TextContent(
                 type="text",
                 text="darktable not running, or plugin not loaded. Open darktable and try again.",
             )]
         except BridgeError as e:
-            return [TextContent(type="text", text=f"Plugin error: {e}")]
+            return None, [TextContent(type="text", text=f"Plugin error: {e}")]
 
         if result.get("error"):
-            return [TextContent(
+            return None, [TextContent(
                 type="text",
                 text=(
                     f"retouch_list_shapes(instance={instance}): "
                     f"{self._explain_darkroom_error(result['error'])}"
                 ),
             )]
+        return result, None
+
+    async def _handle_retouch_list_shapes(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        instance = int(arguments.get("instance", 0))
+        result, err = self._list_retouch_shapes(instance)
+        if err:
+            return err
 
         shapes = result.get("shapes", [])
         lines = [
@@ -3833,9 +3914,176 @@ class DarktableMCPServer:
                 f"target=({target.get('x')},{target.get('y')}) "
                 f"source=({source.get('x')},{source.get('y')}) "
                 f"radius={s.get('radius')} feather={s.get('feather')} "
+                f"opacity={s.get('opacity')} "
                 f"wavelet_scale={s.get('wavelet_scale')}"
             )
+            # Display-frame values (dt.develop.transform_point): the SAME frame
+            # capture_viewport/get_preview render in. The mask-frame numbers
+            # above are what retouch_add_shape/retouch_update_shape take back,
+            # so both are reported -- picking the wrong one silently means
+            # comparing a shape against a differently-framed picture of it.
+            td = s.get("target_display")
+            if isinstance(td, dict):
+                sd = s.get("source_display") or {}
+                lines.append(
+                    f"    display frame: target=({td.get('x')},{td.get('y')}) "
+                    f"source=({sd.get('x')},{sd.get('y')}) "
+                    f"radius={s.get('radius_display')} "
+                    f"feather={s.get('feather_display')}"
+                )
+        if shapes:
+            lines.append(
+                "  target/source/radius/feather = mask storage frame (pass these "
+                "back to retouch_add_shape/retouch_update_shape). 'display frame' "
+                "= the frame get_preview/capture_viewport render in; radius there "
+                "is normalized against display WIDTH."
+            )
+            if not result.get("has_display_frame"):
+                lines.append(
+                    "  display-frame values unavailable (no processed pipe yet) -- "
+                    "call get_preview once and list again"
+                )
+            lines.append(
+                "  Use retouch_render_overlay to SEE these shapes drawn on a "
+                "capture_viewport render."
+            )
         return [TextContent(type="text", text="\n".join(lines))]
+
+    async def _handle_retouch_render_overlay(self, arguments: Dict[str, Any]) -> List[Any]:
+        try:
+            snapshot = self._get_viewport_snapshot(arguments.get("snapshot_id"))
+        except ViewportCoordinateError as e:
+            return [TextContent(type="text", text=f"retouch_render_overlay: {e}")]
+
+        mode = arguments.get("mode", overlay.MODE_ALL_SHAPES)
+        instance = int(arguments.get("instance", 0))
+        label_shapes = bool(arguments.get("label_shapes", True))
+        return_image = bool(arguments.get("return_image", True))
+        highlight_formid = arguments.get("highlight_formid")
+        if highlight_formid is not None:
+            highlight_formid = int(highlight_formid)
+
+        # Read-only, but the geometry is only meaningful for the photo the
+        # snapshot is of -- drawing another image's shapes on this render would
+        # be a convincing lie, so refuse the same way the write path does.
+        expected = snapshot.get("image") or {}
+        current = self._darkroom_image()
+        if not current.get("has_image"):
+            return [TextContent(type="text", text=(
+                f"retouch_render_overlay: darkroom has no image open now "
+                f"({current.get('error')}); the snapshot is of "
+                f"{self._image_label(expected)}. Reopen that image in darkroom."
+            ))]
+        if expected.get("id") is not None and current.get("id") != expected.get("id"):
+            return [TextContent(type="text", text=(
+                f"retouch_render_overlay: darkroom image mismatch -- snapshot "
+                f"image_id={expected.get('id')} ({expected.get('filename')}), "
+                f"active image_id={current.get('id')} ({current.get('filename')}). "
+                "The shapes read now belong to the active image, so they must "
+                "not be drawn on this snapshot. Reopen the snapshot's image, or "
+                "call capture_viewport again for the active one."
+            ))]
+
+        result, err = self._list_retouch_shapes(instance)
+        if err:
+            return err
+        shapes = result.get("shapes", [])
+        if not shapes:
+            return [TextContent(type="text", text=(
+                f"retouch_render_overlay: retouch instance {instance} has no "
+                "shapes to draw"
+            ))]
+
+        render = snapshot["render"]
+        render_path = render.get("path")
+        out_dir = os.path.dirname(render_path) or tempfile.gettempdir()
+        if not os.access(out_dir, os.W_OK):
+            out_dir = tempfile.gettempdir()
+        out_path = os.path.join(out_dir, f"overlay-{mode}-{uuid.uuid4().hex[:8]}.png")
+
+        try:
+            summary = overlay.render_overlay(
+                render_path=render_path,
+                out_path=out_path,
+                shapes=shapes,
+                region=snapshot["region"],
+                render_width=int(render.get("width") or 0),
+                render_height=int(render.get("height") or 0),
+                mode=mode,
+                highlight_formid=highlight_formid,
+                label_shapes=label_shapes,
+            )
+        except (overlay.OverlayRenderError, ViewportCoordinateError) as e:
+            return [TextContent(type="text", text=f"retouch_render_overlay: {e}")]
+        except OSError as e:
+            return [TextContent(
+                type="text", text=f"retouch_render_overlay: could not write overlay: {e}"
+            )]
+
+        lines = [
+            f"retouch_render_overlay(mode={summary['mode']}, instance={instance}): "
+            f"{summary['path']}",
+            f"  image: {self._image_label(current)}",
+            f"  drawn on snapshot render {summary['render']['width']}x"
+            f"{summary['render']['height']} (region "
+            f"{json.dumps({k: round(snapshot['region'][k], 6) for k in ('x', 'y', 'w', 'h')})})",
+        ]
+        if mode == overlay.MODE_MASK_ONLY:
+            lines.append(
+                "  greyscale = actual mask alpha (white = fully masked), same "
+                "quadratic feather falloff darktable applies"
+            )
+        else:
+            lines.append(
+                "  red circle+crosshair = target, dashed red = feather edge, "
+                "blue = source, yellow line = source->target"
+            )
+        for g in summary["geometry"]:
+            if highlight_formid is not None and g["formid"] != highlight_formid \
+                    and mode == overlay.MODE_SOURCE_AND_TARGET:
+                continue
+            lines.append(
+                f"  formid={g['formid']} algorithm={g['algorithm']} "
+                f"target_px={g['target_px']} source_px={g['source_px']} "
+                f"radius_px={g['radius_px']} feather_px={g['feather_px']} "
+                f"opacity={g['opacity']} "
+                f"source_target_distance_px={g['source_target_distance_px']}"
+            )
+        if summary["offscreen"]:
+            lines.append(
+                f"  partly/fully outside this snapshot: {summary['offscreen']} "
+                "(drawn where they fall, but the render does not cover them -- "
+                "capture a wider viewport to inspect these)"
+            )
+        if summary["skipped_no_geometry"]:
+            lines.append(
+                f"  not drawable: {summary['skipped_no_geometry']} (no "
+                "display-frame geometry -- non-circle GUI shape, or no "
+                "processed pipe when listed)"
+            )
+        overlaps = overlay.find_overlaps(summary["geometry"])
+        if overlaps:
+            lines.append(
+                "  OVERLAPPING shapes (a later heal samples the earlier one's "
+                "already-healed output): "
+                + "; ".join(
+                    f"{o['formids']} {o['distance_px']}px apart, reach "
+                    f"{o['combined_reach_px']}px"
+                    for o in overlaps
+                )
+            )
+        dl = self._download_url(summary["path"])
+        if dl:
+            lines.append(f"  url: {dl} (no auth header needed, token in URL is the credential)")
+
+        out: List[Any] = []
+        if return_image:
+            img = _inline_image_content(summary["path"])
+            if img is not None:
+                out.append(img)
+                lines.append("  (inline image: JPEG, downscaled; full-res PNG at path/url above)")
+        out.append(TextContent(type="text", text="\n".join(lines)))
+        return out
 
     def _rollback_orphan_instance(self, op: str, instance: int) -> str:
         """Best-effort removal of a module instance created by add_instance

@@ -153,6 +153,16 @@ stub_dt.develop = {
     if len2 ~= nil then out.len2 = len2 end
     return out
   end,
+  -- Identity stub for the opposite direction (mask/pipe-input frame ->
+  -- processed/display frame), used when reading shapes back for verification
+  -- or overlay drawing. Same caveat as above: only arg forwarding is tested.
+  transform_point = function(x, y, len1, len2)
+    table.insert(develop_calls, {name = "transform_point", args = {x, y, len1, len2}})
+    local out = {x = x, y = y}
+    if len1 ~= nil then out.len1 = len1 end
+    if len2 ~= nil then out.len2 = len2 end
+    return out
+  end,
 }
 
 -- Make `require("darktable")` return our stub by pre-populating package.loaded.
@@ -485,6 +495,30 @@ end
 do
   local ok, err = pcall(internals.methods.dev_backtransform_point, {y = 0.3})
   assertTrue(not ok, "dev_backtransform_point errors without x")
+  assertTrue(string.find(err or "", "x/y") ~= nil, "error mentions x/y")
+end
+
+-- ---- methods.dev_transform_point: the mask-frame -> display-frame direction,
+-- needed to verify or DRAW an existing shape against a captured render
+-- (retouch_render_overlay, 2026-07-26). Must call the C `transform_point`, not
+-- the backtransform -- mixing the two silently mirrors every coordinate.
+do
+  develop_calls = {}
+  local result = internals.methods.dev_transform_point({x = 0.4, y = 0.6, len1 = 0.02})
+  assertEq(result.x, 0.4, "dev_transform_point forwards x (identity stub)")
+  assertEq(result.y, 0.6, "dev_transform_point forwards y (identity stub)")
+  assertEq(result.len1, 0.02, "len1 forwarded and returned")
+  assertEq(result.len2, nil, "len2 omitted when not given")
+  local call = develop_calls[1]
+  assertEq(call.name, "transform_point", "correct C function called (not backtransform)")
+  assertEq(call.args[1], 0.4, "x forwarded")
+  assertEq(call.args[3], 0.02, "len1 forwarded")
+  assertEq(call.args[4], nil, "len2 forwarded as nil when omitted")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_transform_point, {x = 0.4})
+  assertTrue(not ok, "dev_transform_point errors without y")
   assertTrue(string.find(err or "", "x/y") ~= nil, "error mentions x/y")
 end
 

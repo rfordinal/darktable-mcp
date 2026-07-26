@@ -918,6 +918,23 @@ methods.dev_backtransform_point = function(p)
   return dt.develop.backtransform_point(x, y, len1, len2)
 end
 
+-- The INVERSE of dev_backtransform_point: mask-frame normalized point (what
+-- dev_retouch_list_shapes/dev_get_mask report as stored geometry) -> processed/
+-- display-frame normalized point (what get_preview/capture_viewport render).
+-- Needed to plot an EXISTING shape on top of a captured render, or to check
+-- that a written shape landed where it was aimed. len1/len2 are optional
+-- lengths (radius/feather) in dt_masks' mindim-normalized convention, returned
+-- normalized against the display frame WIDTH.
+methods.dev_transform_point = function(p)
+  p = p or {}
+  local x = tonumber(p.x)
+  local y = tonumber(p.y)
+  if x == nil or y == nil then error("dev_transform_point: x/y required") end
+  local len1 = tonumber(p.len1)
+  local len2 = tonumber(p.len2)
+  return dt.develop.transform_point(x, y, len1, len2)
+end
+
 -- T3.3 (promoted from darktable-mcp/spike/spike_methods.lua once the T3.1
 -- go/no-go spike proved the underlying C binding, src/lua/develop.c
 -- set_raster_source_cb): wire a downstream (consumer) module's blend to

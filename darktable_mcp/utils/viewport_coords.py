@@ -182,3 +182,67 @@ def viewport_radius_to_image(
             f"coordinate_space must be one of {POINT_SPACES}, got: {space!r}"
         )
     return local_r * r["w"]
+
+
+# ---- The other direction: display frame -> snapshot render pixels -----------
+#
+# Used by retouch_render_overlay to PLOT existing shapes on top of a captured
+# render. Unlike the write path above, these functions do NOT reject
+# out-of-region input: a shape legitimately sits outside the captured viewport
+# (it was placed while the view was elsewhere), and the honest answer is
+# "off-render", not an error that hides the other shapes. Callers get an
+# `inside` flag and decide.
+
+
+def image_point_to_snapshot_pixels(
+    region: Dict[str, Any],
+    point: Dict[str, Any],
+    render_width: int,
+    render_height: int,
+    label: str = "point",
+) -> Dict[str, Any]:
+    """Display-frame-normalized point -> pixel coordinates within the captured
+    render. Returns {"x": px, "y": px, "inside": bool}; `inside` is False when
+    the point falls outside the captured region (the pixel values are then the
+    honest extrapolation, not a clamp)."""
+    r = _require_region(region)
+    if not isinstance(point, dict) or "x" not in point or "y" not in point:
+        raise ViewportCoordinateError(f"{label} {{x,y}} is required")
+    try:
+        x = float(point["x"])
+        y = float(point["y"])
+    except (TypeError, ValueError) as e:
+        raise ViewportCoordinateError(f"{label} values must be numeric: {e}")
+    if not render_width or not render_height:
+        raise ViewportCoordinateError(
+            "image_point_to_snapshot_pixels requires the render width/height"
+        )
+
+    local_x = (x - r["x"]) / r["w"]
+    local_y = (y - r["y"]) / r["h"]
+    return {
+        "x": local_x * render_width,
+        "y": local_y * render_height,
+        "inside": 0.0 <= local_x <= 1.0 and 0.0 <= local_y <= 1.0,
+    }
+
+
+def image_radius_to_snapshot_pixels(
+    region: Dict[str, Any],
+    radius: float,
+    render_width: int,
+) -> float:
+    """Display-frame-normalized LENGTH (normalized against the display frame's
+    width) -> pixels within the captured render. Inverse of
+    viewport_radius_to_image: divide by region.w, scale by render width --
+    width only, never height, never an average."""
+    r = _require_region(region)
+    try:
+        radius = float(radius)
+    except (TypeError, ValueError) as e:
+        raise ViewportCoordinateError(f"radius must be numeric: {e}")
+    if not render_width:
+        raise ViewportCoordinateError(
+            "image_radius_to_snapshot_pixels requires the render width"
+        )
+    return (radius / r["w"]) * render_width

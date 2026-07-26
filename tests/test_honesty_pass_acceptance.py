@@ -67,6 +67,10 @@ EXPECTED_TOOLS = {
     "retouch_delete_shape",
     "retouch_delete_shapes",
     "retouch_list_shapes",
+    # Overlay render: shape geometry drawn on a capture_viewport snapshot,
+    # because darktable's own mask overlay is painted on the GUI widget and is
+    # absent from every buffer we can capture (see retouch_overlay.py).
+    "retouch_render_overlay",
 }
 
 

@@ -1,5 +1,6 @@
 """Tests for the main MCP server."""
 
+import os
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock, call, patch
 
@@ -63,6 +64,7 @@ class TestDarktableMCPServer:
             "retouch_delete_shape",
             "retouch_delete_shapes",
             "retouch_list_shapes",
+            "retouch_render_overlay",
             "mask_object",
             "mask_raster",
         }
@@ -981,3 +983,172 @@ async def test_retouch_delete_shape_error_reports_darkroom_state():
     assert "no darkroom image loaded" in text
     assert "darkroom state right now" in text
     assert "99999" in text
+
+
+# ---- retouch_render_overlay (2026-07-26) -----------------------------------
+#
+# The overlay exists because darktable's own mask overlay is cairo-painted onto
+# the darkroom GUI widget (masks.c's dt_masks_events_post_expose), so it is
+# absent from the pixelpipe backbuf capture_viewport encodes. These tests pin
+# the two things that can silently lie: the display-frame -> render-pixel
+# placement math, and the refusal to draw one image's shapes on another's
+# snapshot.
+
+SHAPE_42 = {
+    "formid": 42, "algorithm": "heal", "shape_type": "circle",
+    "target": {"x": 0.4, "y": 0.3}, "source": {"x": 0.35, "y": 0.3},
+    "radius": 0.02, "feather": 0.01, "opacity": 1.0, "wavelet_scale": 0,
+    # display-frame values (dt.develop.transform_point); deliberately DIFFERENT
+    # from the mask-frame ones above so a handler that plots the wrong field is
+    # caught by the pixel assertions below.
+    "target_display": {"x": 0.5, "y": 0.5},
+    "source_display": {"x": 0.6, "y": 0.5},
+    "radius_display": 0.05, "feather_display": 0.025,
+}
+
+
+def _write_test_render(path, width=400, height=200):
+    from PIL import Image
+
+    Image.new("RGB", (width, height), (30, 30, 30)).save(path, "PNG")
+    return str(path)
+
+
+def _overlay_server(tmp_path, shapes, region=None, width=400, height=200):
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    render_path = _write_test_render(tmp_path / "snap.png", width, height)
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": region or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": render_path, "width": width, "height": height},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"module": "retouch", "instance": 0, "has_display_frame": True, "shapes": shapes},
+    ]
+    return server, snapshot_id
+
+
+@pytest.mark.asyncio
+async def test_retouch_render_overlay_places_shapes_from_display_frame(tmp_path):
+    server, snapshot_id = _overlay_server(tmp_path, [SHAPE_42])
+    result = await server._handle_retouch_render_overlay({
+        "snapshot_id": snapshot_id, "return_image": False,
+    })
+    text = result[-1].text
+    assert "formid=42" in text
+    # full-frame region, 400x200 render: display 0.5,0.5 -> 200,100 px;
+    # radius 0.05 normalized against display WIDTH -> 0.05*400 = 20px.
+    assert "target_px=[200.0, 100.0]" in text
+    assert "source_px=[240.0, 100.0]" in text
+    assert "radius_px=20.0" in text
+    assert "feather_px=10.0" in text
+    assert "source_target_distance_px=40.0" in text
+    out = text.split("\n")[0].split(": ")[-1]
+    assert os.path.isfile(out)
+
+
+@pytest.mark.asyncio
+async def test_retouch_render_overlay_honours_region_offset(tmp_path):
+    """A zoomed viewport (region 0.4..0.6) must place a shape at display 0.5 in
+    the MIDDLE of the render, not at 0.5 of it -- the same region math the
+    write path uses, inverted."""
+    server, snapshot_id = _overlay_server(
+        tmp_path, [SHAPE_42], region={"x": 0.4, "y": 0.4, "w": 0.2, "h": 0.2}
+    )
+    result = await server._handle_retouch_render_overlay({
+        "snapshot_id": snapshot_id, "return_image": False,
+    })
+    text = result[-1].text
+    # local = (0.5-0.4)/0.2 = 0.5 -> 200,100 px; radius 0.05/0.2 * 400 = 100px
+    assert "target_px=[200.0, 100.0]" in text
+    assert "radius_px=100.0" in text
+
+
+@pytest.mark.asyncio
+async def test_retouch_render_overlay_refuses_on_image_mismatch(tmp_path):
+    server, snapshot_id = _overlay_server(tmp_path, [SHAPE_42])
+    server.bridge.call.side_effect = [
+        {"has_image": True, "id": 99999, "filename": "other.ARW"},
+    ]
+    result = await server._handle_retouch_render_overlay({"snapshot_id": snapshot_id})
+    text = result[0].text
+    assert "image mismatch" in text
+    assert "13406" in text and "99999" in text
+    # never reached the shape read -- nothing was drawn
+    assert server.bridge.call.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_retouch_render_overlay_selected_mode_needs_formid(tmp_path):
+    second = dict(SHAPE_42, formid=43, target_display={"x": 0.2, "y": 0.2})
+    server, snapshot_id = _overlay_server(tmp_path, [SHAPE_42, second])
+    result = await server._handle_retouch_render_overlay({
+        "snapshot_id": snapshot_id, "mode": "selected_shape", "return_image": False,
+    })
+    assert "needs highlight_formid" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_retouch_render_overlay_reports_overlaps(tmp_path):
+    """Two heal circles reaching into each other is a real retouch mistake (the
+    second heal samples the first one's output), and far easier to report than
+    to spot in the render."""
+    near = dict(SHAPE_42, formid=43, target_display={"x": 0.55, "y": 0.5})
+    server, snapshot_id = _overlay_server(tmp_path, [SHAPE_42, near])
+    result = await server._handle_retouch_render_overlay({
+        "snapshot_id": snapshot_id, "return_image": False,
+    })
+    text = result[-1].text
+    assert "OVERLAPPING" in text
+    assert "[42, 43]" in text
+
+
+@pytest.mark.asyncio
+async def test_retouch_render_overlay_mask_only_is_greyscale_alpha(tmp_path):
+    from PIL import Image
+
+    server, snapshot_id = _overlay_server(tmp_path, [SHAPE_42])
+    result = await server._handle_retouch_render_overlay({
+        "snapshot_id": snapshot_id, "mode": "mask_only", "return_image": False,
+    })
+    text = result[-1].text
+    out = text.split("\n")[0].split(": ")[-1]
+    img = Image.open(out)
+    assert img.mode == "L"
+    # inside the radius: fully masked; well outside radius+feather: nothing.
+    assert img.getpixel((200, 100)) == 255
+    assert img.getpixel((399, 199)) == 0
+
+
+@pytest.mark.asyncio
+async def test_retouch_render_overlay_skips_shapes_without_display_geometry(tmp_path):
+    """A shape listed before any processed pipe existed (no *_display fields)
+    must be reported as not drawable instead of being plotted from mask-frame
+    numbers, which would put it in the wrong place."""
+    bare = {"formid": 44, "algorithm": "clone", "shape_type": "circle",
+            "target": {"x": 0.4, "y": 0.3}, "radius": 0.02}
+    server, snapshot_id = _overlay_server(tmp_path, [SHAPE_42, bare])
+    result = await server._handle_retouch_render_overlay({
+        "snapshot_id": snapshot_id, "return_image": False,
+    })
+    text = result[-1].text
+    assert "not drawable: [44]" in text
+    assert "formid=42" in text
+
+
+@pytest.mark.asyncio
+async def test_retouch_list_shapes_reports_both_frames():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "module": "retouch", "instance": 0, "num_scales": 4, "curr_scale": 1,
+        "merge_from_scale": 0, "has_display_frame": True, "shapes": [SHAPE_42],
+    }
+    result = await server._handle_retouch_list_shapes({})
+    text = result[0].text
+    assert "opacity=1.0" in text
+    assert "display frame: target=(0.5,0.5)" in text
+    assert "retouch_render_overlay" in text

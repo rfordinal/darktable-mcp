@@ -77,6 +77,39 @@ entry the AI added is right there, named, in order, and removable.
 
 ---
 
+## The tools are designed for a model, not for a person
+
+Every tool here is shaped around how an AI reads a situation, not around how a human would want an API
+to look. That distinction shows up everywhere once you start noticing it:
+
+- Tool descriptions carry the *decision* the model has to make, not just the parameter list — when to
+  reach for this tool instead of a neighbouring one, what the call will not do, what to check
+  afterwards. They are prompt surface, so they are written like prompt surface.
+- Responses are verbose on purpose. A call reports the coordinate frames it converted through, which
+  image it acted on, and what to call next, because a model has no screen to glance at and no memory
+  of the frame it was looking at two calls ago.
+- Failures are diagnoses rather than status codes. "no darkroom image loaded" becomes "…and here is
+  the image that IS open right now", because the terse version sends a model into guessing.
+- Anything ambiguous gets renamed rather than documented. `viewport_pixels` became
+  `snapshot_pixels` after exactly one reader took it to mean the darktable window instead of the
+  returned render — a wrong reading that silently retouches the wrong spot is a design bug, not a
+  reading-comprehension failure.
+- Wrong input is refused, never quietly clamped or best-guessed, and refusals say what would have to
+  change. A model will happily act on a plausible answer; the tool has to be the thing that does not.
+
+That shape was not designed up front. It comes from running the tools against real models, watching
+where they misread the result or lost the thread, and iterating on the wording, the reported fields and
+the guard rails until the failures stopped. Several entries in this project's own bug log are exactly
+that: not broken code, but a description or a response a model could reasonably misunderstand.
+
+It also means the target keeps moving. What a strong model infers on its own, a weaker one needs
+spelled out in the response; what one model treats as an obvious next step, another needs told. The
+tools are tuned toward the level of capability and context handling they are actually used with, and
+they get re-tuned as that changes. If you are reading a description and thinking it is over-explained
+for a human, that is the intent — you are not the reader it was written for.
+
+---
+
 ## What a session actually looks like
 
 ```
@@ -302,6 +335,28 @@ open when you took it: if darktable has moved to another photo since, the write 
 because a coordinate from one frame means nothing on another. `retouch_update_shape_in_viewport` moves
 or resizes an existing shape in place, same conventions, same formid.
 
+Numbers alone cannot tell you whether a heal circle actually covers the mark, whether its feather
+spills onto a lip or an edge, or whether its source sits on clean texture instead of a second blemish.
+`retouch_render_overlay` draws the shapes on the snapshot you already captured: target circle, feather
+ring, source circle, the source-to-target link, labelled by formid — plus a report of any shapes that
+overlap, which is a real mistake (the second heal then samples the first one's output).
+
+```json
+{"name": "retouch_render_overlay", "arguments": {
+  "snapshot_id": "vp_...",
+  "mode": "selected_shape",
+  "highlight_formid": 1785057157}}
+```
+
+`mode` is `all_shapes`, `selected_shape`, `source_and_target`, or `mask_only` — the last one renders the
+mask alpha itself, with darktable's own quadratic feather falloff, for judging coverage rather than
+composition. The overlay is drawn by the server from the shape geometry, not screen-grabbed: darktable
+paints its own overlay onto the GUI widget, so it exists in no buffer any tool can read. Drawing it
+ourselves also means no focus juggling, no toggles left switched on for you to notice later, and
+formid labels the GUI does not show. `retouch_list_shapes` reports each shape twice for the same
+reason — once in darktable's mask storage frame (feed that straight back to an update call) and once
+in the frame renders are actually in.
+
 ![placeholder: 100% crop showing a dust spot before and after a chat-discussed heal, with the retouch circle visible in darktable](docs/screenshots/retouch-heal-spot.png)
 
 ### 9. A second pair of eyes on a cull
@@ -504,8 +559,9 @@ the *client* runs, not the arrangement: darktable is still open in front of some
 
 ## Tool reference
 
-36 tools. Everything except the camera/preview-extraction group needs darktable running with the
-bridge loaded.
+37 tools. Everything except the camera/preview-extraction group needs darktable running with the
+bridge loaded. The signatures below are a map for a human reader; the descriptions the model actually
+receives are longer and written for it (see "The tools are designed for a model, not for a person").
 
 **Darkroom editing** (needs the patched darktable; act on whichever image is open in darkroom)
 
@@ -545,7 +601,12 @@ bridge loaded.
 - `retouch_update_shape_in_viewport(snapshot_id, formid, target, source, radius, ...)` — move or
   resize an existing shape in place, keeping its formid.
 - `retouch_list_shapes(instance?)` / `retouch_delete_shape(formid, instance?)` /
-  `retouch_delete_shapes(formids, instance?)`.
+  `retouch_delete_shapes(formids, instance?)`. `retouch_list_shapes` reports every shape in both
+  coordinate frames (mask storage, and the frame previews render in) plus its opacity.
+- `retouch_render_overlay(snapshot_id, mode?, highlight_formid?, instance?, label_shapes?,
+  return_image?)` — draw the shapes on a `capture_viewport` snapshot for visual verification.
+  `mode` is `all_shapes`, `selected_shape`, `source_and_target` or `mask_only`. Read-only; refuses if
+  darkroom has moved to a different image than the snapshot's.
 
 **Library, culling, metadata**
 
