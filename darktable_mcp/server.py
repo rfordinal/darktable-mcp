@@ -2413,15 +2413,34 @@ class DarktableMCPServer:
                             "minimum": 10,
                             "maximum": 200,
                             "description": (
-                                "Cap on the simplified polygon's node count "
-                                "(default 48). Raise this (e.g. 80-120) for "
-                                "a complex/non-convex silhouette (a body in "
-                                "an unusual pose, an object with several "
-                                "limbs/protrusions) that looks like it's "
-                                "losing real shape detail at the default cap "
-                                "-- more nodes track the true contour more "
-                                "closely, at the cost of a slightly heavier "
-                                "path for darktable to render."
+                                "The simplifier converges the polygon's "
+                                "node count TOWARD this value (not just a "
+                                "ceiling it rarely reaches -- fixed "
+                                "2026-07-27, previously raising this had "
+                                "no real effect). Raise it (e.g. 80-140) "
+                                "for a complex/non-convex silhouette (a "
+                                "body in an unusual pose, an object with "
+                                "several limbs/protrusions) that's losing "
+                                "real shape detail at the default -- more "
+                                "nodes track the true contour more "
+                                "closely and reduce Bezier overshoot on "
+                                "sharp concave corners, at the cost of a "
+                                "slightly heavier path for darktable to "
+                                "render."
+                            ),
+                        },
+                        "min_nodes": {
+                            "type": "integer",
+                            "default": 10,
+                            "minimum": 3,
+                            "maximum": 200,
+                            "description": (
+                                "Floor on the simplified polygon's node "
+                                "count -- rarely needs changing (max_nodes "
+                                "is the knob that actually controls "
+                                "detail level); only matters if you also "
+                                "want to force a MINIMUM density on an "
+                                "otherwise very simple/convex shape."
                             ),
                         },
                     },
@@ -5472,6 +5491,8 @@ class DarktableMCPServer:
         smooth = bool(arguments.get("smooth", True))
         max_nodes = arguments.get("max_nodes")
         max_nodes = int(max_nodes) if max_nodes is not None else None
+        min_nodes = arguments.get("min_nodes")
+        min_nodes = int(min_nodes) if min_nodes is not None else None
 
         # (a) full-frame preview -- the sidecar segments THIS render, so its
         # polygon comes back normalized in the same DISPLAY/PROCESSED frame
@@ -5513,7 +5534,7 @@ class DarktableMCPServer:
         try:
             seg = run_segmentation(
                 host_preview_path, points=points, box=box, label=label,
-                max_nodes=max_nodes,
+                max_nodes=max_nodes, min_nodes=min_nodes,
             )
         except SegmentationServiceError as e:
             return [TextContent(type="text", text=f"mask_object: {e}")]

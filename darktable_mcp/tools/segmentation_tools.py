@@ -128,6 +128,7 @@ def run_segmentation(
     allow_grabcut_fallback: bool = True,
     min_nodes: Optional[int] = None,
     max_nodes: Optional[int] = None,
+    target_nodes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Segment `image_path` for the given prompt, preferring the SAM2
     sidecar and falling back to the in-process GrabCut segmenter (see
@@ -152,7 +153,10 @@ def run_segmentation(
     target node count (both backends default to 10..48 -- see
     sidecar/segment.py and local_segment.py's DEFAULT_TARGET_MIN/MAX).
     Raise max_nodes for a complex/non-convex silhouette that's losing real
-    shape detail at the default cap.
+    shape detail at the default cap. `target_nodes` (defaults to max_nodes)
+    is what the simplifier actually converges toward -- see
+    simplify_polygon's docstring for the 2026-07-27 bugreport this fixes
+    (raising max_nodes alone used to have no effect on the result).
     """
     if not points and not box and not label:
         raise SegmentationServiceError(
@@ -176,6 +180,7 @@ def run_segmentation(
             timeout=timeout,
             min_nodes=min_nodes,
             max_nodes=max_nodes,
+            target_nodes=target_nodes,
         )
     except LabelNotFoundInImageError:
         # Grounding DINO gave a real, confident "not in this image" answer
@@ -198,6 +203,8 @@ def run_segmentation(
         grabcut_kwargs["target_min"] = min_nodes
     if max_nodes is not None:
         grabcut_kwargs["target_max"] = max_nodes
+    if target_nodes is not None:
+        grabcut_kwargs["target_nodes"] = target_nodes
     try:
         return local_segment.segment_grabcut(
             image_path, points=points, box=box, label=label, **grabcut_kwargs
@@ -250,6 +257,7 @@ def _run_sidecar(
     timeout: float = DEFAULT_TIMEOUT,
     min_nodes: Optional[int] = None,
     max_nodes: Optional[int] = None,
+    target_nodes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Invoke `sidecar/segment.py` as a subprocess in its own venv.
 
@@ -298,6 +306,8 @@ def _run_sidecar(
         cmd += ["--min-nodes", str(min_nodes)]
     if max_nodes is not None:
         cmd += ["--max-nodes", str(max_nodes)]
+    if target_nodes is not None:
+        cmd += ["--target-nodes", str(target_nodes)]
 
     cmd += ["--backend", backend]
     if backend == "sam2":

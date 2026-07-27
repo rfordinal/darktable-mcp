@@ -125,6 +125,46 @@ def test_simplify_reduces_point_count_and_preserves_area():
     print(f"circle contour: {n_raw} raw points -> {n_simplified} simplified points, IoU={iou:.4f}")
 
 
+def test_simplify_actually_uses_the_full_max_nodes_budget():
+    """Regression guard for the 2026-07-27 bugreport: raising max_nodes had
+    NO effect on the actual output (always ~11-12 nodes regardless of a
+    180 cap) because the old algorithm returned as soon as the node count
+    landed ANYWHERE inside [target_min, target_max] -- with target_min
+    fixed at 10, the very first (coarse) binary-search guess almost always
+    qualified and returned immediately. Raising max_nodes must now actually
+    raise the result's node count, converging close to it (target_nodes
+    defaults to target_max)."""
+    h = w = 500
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (250, 250), 180, 1, thickness=-1)
+    raw = largest_external_contour(mask.astype(bool))
+
+    n_12 = len(simplify_polygon(raw, target_min=10, target_max=12))
+    n_48 = len(simplify_polygon(raw, target_min=10, target_max=48))
+    n_180 = len(simplify_polygon(raw, target_min=10, target_max=180))
+
+    print(f"max_nodes=12 -> {n_12}, max_nodes=48 -> {n_48}, max_nodes=180 -> {n_180}")
+    # Must land close to each requested cap, not collapse to the same
+    # small number regardless of the cap (the actual pre-fix behavior).
+    assert n_12 <= 12
+    assert n_48 >= 40  # was returning ~11-12 here before the fix
+    assert n_180 >= 150  # was returning ~11-12 here before the fix
+    assert n_12 < n_48 < n_180
+
+
+def test_simplify_target_nodes_overrides_target_max():
+    """target_nodes lets a caller aim BELOW the max_nodes ceiling
+    explicitly, independent of the max_nodes-defaults-to-target_nodes
+    convenience default mask_object relies on."""
+    h = w = 500
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (250, 250), 180, 1, thickness=-1)
+    raw = largest_external_contour(mask.astype(bool))
+
+    result = simplify_polygon(raw, target_min=10, target_max=180, target_nodes=20)
+    assert 15 <= len(result) <= 25
+
+
 def test_polygon_is_closed_ring_in_order():
     """cv2.findContours returns points already ordered around the boundary
     (a closed ring, first point not repeated at the end). Confirm that

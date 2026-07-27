@@ -416,39 +416,61 @@ def simplify_polygon(
     contour: np.ndarray,
     target_min: int = 10,
     target_max: int = 48,
+    target_nodes: Optional[int] = None,
     max_iter: int = 25,
 ) -> np.ndarray:
     """Douglas-Peucker simplification (cv2.approxPolyDP) with the epsilon
-    binary-searched so the resulting node count lands in [target_min,
-    target_max] whenever the raw contour has at least target_min points to
-    begin with. Returns an (M, 2) int32 array, M in [target_min, target_max]
-    (or the raw contour unchanged if it already has <= target_max points, or
-    the best achieved M if target_min can't be hit -- e.g. a near-perfect
-    ellipse simplifies fast and can't be forced back up to target_min without
-    reintroducing raw jaggies)."""
+    binary-searched to converge the resulting node count on `target_nodes`
+    (defaults to target_max -- see the 2026-07-27 bugreport below for why
+    that's the right default). Returns an (M, 2) int32 array, M as close to
+    target_nodes as achievable (or the raw contour unchanged if it already
+    has <= target_max points -- nothing to simplify).
+
+    Bugreport 2026-07-27: raising max_nodes (e.g. to 180, for a complex
+    human-body silhouette) had NO effect -- the polygon still came back
+    with only 11-12 nodes. Root cause: the PREVIOUS version of this
+    function returned as soon as the node count landed ANYWHERE inside
+    [target_min, target_max], and with target_min fixed at 10 and a wide
+    range, the very FIRST binary-search midpoint (roughly the middle of
+    the whole epsilon search space, i.e. a fairly aggressive epsilon)
+    already collapsed a dense raw contour (hundreds-thousands of points)
+    down to ~10-15 points, which satisfied "somewhere in [10, 180]" and
+    returned immediately -- never exploring toward a SMALLER epsilon that
+    would have kept more real detail. Fix: bisect epsilon to converge on
+    target_nodes specifically (larger epsilon when the current approx has
+    MORE points than target_nodes, smaller when it has FEWER), running the
+    full max_iter budget and keeping whichever candidate seen came closest
+    to target_nodes (preferring one inside [target_min, target_max] over
+    one outside it) -- not stopping at the first "good enough" hit."""
+    if target_nodes is None:
+        target_nodes = target_max
+
     contour = contour.reshape(-1, 1, 2).astype(np.int32)
     n = len(contour)
     if n <= target_max:
         return contour.reshape(-1, 2)
 
+    def _rank(m: int) -> tuple:
+        in_range = target_min <= m <= target_max
+        return (0 if in_range else 1, abs(m - target_nodes))
+
     perimeter = cv2.arcLength(contour, True)
     lo, hi = 0.0001 * perimeter, 0.2 * perimeter
     best = contour.reshape(-1, 2)
+    best_rank = _rank(n)
     for _ in range(max_iter):
         mid = (lo + hi) / 2.0
         approx = cv2.approxPolyDP(contour, mid, True).reshape(-1, 2)
         m = len(approx)
-        if target_min <= m <= target_max:
+        rank = _rank(m)
+        if rank < best_rank:
+            best, best_rank = approx, rank
+        if m == target_nodes:
             return approx
-        if m > target_max:
-            lo = mid  # too many points -> increase epsilon
+        if m > target_nodes:
+            lo = mid  # too many points relative to target -> increase epsilon
         else:
-            hi = mid  # too few points -> decrease epsilon
-        # keep the closest-to-range candidate seen so far as a fallback
-        if abs(m - target_max) < abs(len(best) - target_max) or (
-            target_min <= m and len(best) < target_min
-        ):
-            best = approx
+            hi = mid  # too few points relative to target -> decrease epsilon
     return best
 
 
@@ -486,6 +508,7 @@ def segment(
     backend: str = "sam2",
     target_min: int = 10,
     target_max: int = 48,
+    target_nodes: Optional[int] = None,
     use_grounding_dino: bool = True,
     grounding_dino_threshold: float = 0.5,
     **backend_kwargs,
@@ -509,6 +532,12 @@ def segment(
     model:  pass a pre-loaded SegmentationModel to reuse across calls
             (skips reloading weights); otherwise one is built via
             load_model(backend, **backend_kwargs) for this call only.
+    target_nodes: the node count simplify_polygon actually converges
+            toward (see its docstring for the 2026-07-27 bugreport this
+            fixes -- max_nodes alone was NOT enough to get more detail).
+            Defaults to target_max when not given -- "as much detail as
+            useful, up to the cap" is what a caller raising max_nodes
+            almost always actually wants.
     grounding_dino_threshold: detection confidence floor (0..1) for the
             label->box resolution above; only used when it actually runs.
 
@@ -570,7 +599,9 @@ def segment(
     result = model.predict(image_rgb, points=pts, box=bx, label=label)
 
     raw_contour = largest_external_contour(result.mask)
-    simplified = simplify_polygon(raw_contour, target_min=target_min, target_max=target_max)
+    simplified = simplify_polygon(
+        raw_contour, target_min=target_min, target_max=target_max, target_nodes=target_nodes
+    )
     polygon_norm = normalize_polygon(simplified, width, height)
     bbox_norm = polygon_bbox(polygon_norm)
 
@@ -630,6 +661,12 @@ def main() -> None:
     ap.add_argument("--min-nodes", type=int, default=10)
     ap.add_argument("--max-nodes", type=int, default=48)
     ap.add_argument(
+        "--target-nodes",
+        type=int,
+        default=None,
+        help="node count to converge toward (default: --max-nodes -- see simplify_polygon's docstring)",
+    )
+    ap.add_argument(
         "--no-grounding-dino",
         action="store_true",
         help="disable label->box resolution; --label alone becomes inert again (old behavior)",
@@ -657,6 +694,7 @@ def main() -> None:
             device=args.device,
             target_min=args.min_nodes,
             target_max=args.max_nodes,
+            target_nodes=args.target_nodes,
             use_grounding_dino=not args.no_grounding_dino,
             grounding_dino_threshold=args.grounding_dino_threshold,
         )

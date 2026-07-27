@@ -88,34 +88,46 @@ def simplify_polygon(
     contour: np.ndarray,
     target_min: int = DEFAULT_TARGET_MIN,
     target_max: int = DEFAULT_TARGET_MAX,
+    target_nodes: Optional[int] = None,
     max_iter: int = 25,
 ) -> np.ndarray:
     """Douglas-Peucker simplification (cv2.approxPolyDP), epsilon binary-
-    searched so the node count lands in [target_min, target_max] when
-    possible. See sidecar/segment.py's version of this function for the
-    full rationale -- logic here is intentionally identical."""
+    searched to converge the node count on `target_nodes` (defaults to
+    target_max). See sidecar/segment.py's version of this function for the
+    full rationale (2026-07-27 bugreport: the old "return at first hit
+    anywhere in [target_min, target_max]" logic meant raising target_max
+    had no effect -- the search stopped at the first, usually coarse,
+    epsilon that happened to land in-range) -- logic here is intentionally
+    identical."""
+    if target_nodes is None:
+        target_nodes = target_max
+
     contour = contour.reshape(-1, 1, 2).astype(np.int32)
     n = len(contour)
     if n <= target_max:
         return contour.reshape(-1, 2)
 
+    def _rank(m: int) -> tuple:
+        in_range = target_min <= m <= target_max
+        return (0 if in_range else 1, abs(m - target_nodes))
+
     perimeter = cv2.arcLength(contour, True)
     lo, hi = 0.0001 * perimeter, 0.2 * perimeter
     best = contour.reshape(-1, 2)
+    best_rank = _rank(n)
     for _ in range(max_iter):
         mid = (lo + hi) / 2.0
         approx = cv2.approxPolyDP(contour, mid, True).reshape(-1, 2)
         m = len(approx)
-        if target_min <= m <= target_max:
+        rank = _rank(m)
+        if rank < best_rank:
+            best, best_rank = approx, rank
+        if m == target_nodes:
             return approx
-        if m > target_max:
+        if m > target_nodes:
             lo = mid
         else:
             hi = mid
-        if abs(m - target_max) < abs(len(best) - target_max) or (
-            target_min <= m and len(best) < target_min
-        ):
-            best = approx
     return best
 
 
@@ -205,6 +217,7 @@ def segment_grabcut(
     label: Optional[str] = None,
     target_min: int = DEFAULT_TARGET_MIN,
     target_max: int = DEFAULT_TARGET_MAX,
+    target_nodes: Optional[int] = None,
     iter_count: int = DEFAULT_ITER_COUNT,
 ) -> Dict[str, Any]:
     """Same contract/inputs as sidecar/segment.py's segment(), computed
@@ -261,7 +274,9 @@ def segment_grabcut(
         raise ValueError("grabcut produced an empty mask for this prompt")
 
     raw_contour = largest_external_contour(fg)
-    simplified = simplify_polygon(raw_contour, target_min=target_min, target_max=target_max)
+    simplified = simplify_polygon(
+        raw_contour, target_min=target_min, target_max=target_max, target_nodes=target_nodes
+    )
     polygon_norm = normalize_polygon(simplified, width, height)
     bbox_norm = polygon_bbox(polygon_norm)
 
