@@ -559,7 +559,7 @@ the *client* runs, not the arrangement: darktable is still open in front of some
 
 ## Tool reference
 
-37 tools. Everything except the camera/preview-extraction group needs darktable running with the
+47 tools. Everything except the camera/preview-extraction group needs darktable running with the
 bridge loaded. The signatures below are a map for a human reader; the descriptions the model actually
 receives are longer and written for it (see "The tools are designed for a model, not for a person").
 
@@ -574,7 +574,10 @@ receives are longer and written for it (see "The tools are designed for a model,
 - `set_params(op, fields, instance?)` — write fields, commit to history, reprocess. Always clamps and
   reports it. Accepts an `enabled` convenience field.
 - `enable_module(op, enabled, instance?)` — toggle a module (many ship off by default).
-- `add_instance(op)` — new masked/parametric instance, returns its index.
+- `add_instance(op, fields?)` — new masked/parametric instance, returns its index. `fields` sets
+  initial params (e.g. `compensate_exposure_bias`/`compensate_hilite_pres`: false for a local
+  exposure dodge/burn) in the SAME history entry as the creation, instead of a separate later
+  `set_params` call inheriting instance 0's values first.
 - `get_preview(max_w?, max_h?, region?, return_image?, inline_max_dim?)` — render the live edit. No DB
   write. `region` renders a normalized sub-rectangle at full detail.
 - `get_viewport()` — the darkroom canvas zoom/pan state, including a ready-to-use `region` you can
@@ -607,6 +610,22 @@ receives are longer and written for it (see "The tools are designed for a model,
   return_image?)` — draw the shapes on a `capture_viewport` snapshot for visual verification.
   `mode` is `all_shapes`, `selected_shape`, `source_and_target` or `mask_only`. Read-only; refuses if
   darkroom has moved to a different image than the snapshot's.
+- `list_masks()` — every drawn shape in the image (any type, any module), each with `used_by`
+  (`{op, instance}` pairs already referencing it). Find a shape drawn by hand, or by another tool
+  earlier in the session, before wiring it into a new instance.
+- `get_module_mask(op, instance?)` — one module's full mask state: group opacity/mask_mode/
+  blend_mode/invert plus each attached shape's boolean-combine operation and per-shape invert.
+- `attach_mask(op, instance?, formid, operation?)` — wire an EXISTING shape (from `list_masks` or
+  any mask-creating tool's return value) into a module's blend group WITHOUT copying it; the same
+  shape can back several modules at once. `operation` is `union` (default), `intersection`,
+  `difference`, or `exclusion`. Also turns the module's drawn-mask blend bit on (same effect as
+  clicking the mask pencil icon) and verifies it stuck with a separate `get_blend_params` read.
+- `detach_mask(op, instance?, formid)` — unwire a shape without deleting it; it stays available for
+  `attach_mask` (this module or another). Detaching the last shape clears the module's mask
+  entirely, mirroring the GUI's "no masks" action.
+- `set_module_mask(op, instance?, shapes, opacity?, invert?)` — replace a module's ENTIRE shape list
+  in one call (`shapes` is `[{formid, operation?}]`); diffs against what is currently attached,
+  detaching/attaching/re-attaching only what changed. Optionally also sets overall opacity/invert.
 
 **Library, culling, metadata**
 
