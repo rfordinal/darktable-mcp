@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darktable-mcp"
-version = "1.0.25"
+version = "1.0.26"
 description = "MCP server bridging an AI assistant into a live darktable session for collaborative RAW editing, masking, and library management"
 authors = [{name = "w1ne", email = "14119286+w1ne@users.noreply.github.com"}]
 maintainers = [{name = "Roman Fordinal", email = "roman.fordinal@comsultia.com"}]

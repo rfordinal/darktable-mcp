@@ -26,10 +26,12 @@ from PIL import Image
 from segment import (
     Box,
     Point,
+    _box_area_ok,
     largest_external_contour,
     load_model,
     normalize_polygon,
     polygon_bbox,
+    resolve_label_to_box,
     segment,
     simplify_polygon,
 )
@@ -37,7 +39,15 @@ from segment import (
 HERE = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT = os.path.join(HERE, "checkpoints", "sam2.1_hiera_tiny.pt")
 MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
+SMALL_CHECKPOINT = os.path.join(HERE, "checkpoints", "sam2.1_hiera_small.pt")
+SMALL_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_s.yaml"
 PORTRAIT = os.path.join(HERE, "fixtures", "portrait.jpg")
+
+try:
+    import transformers  # noqa: F401
+    _TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    _TRANSFORMERS_AVAILABLE = False
 
 
 def _make_synthetic_image(tmp_path, w=400, h=300):
@@ -166,6 +176,32 @@ def test_segment_requires_at_least_one_prompt(tmp_path):
         segment(path, backend="stub")
 
 
+def test_label_only_stub_backend_without_grounding_dino_is_inert(tmp_path):
+    """use_grounding_dino=False preserves the pre-2026-07-27 behavior: a
+    label-only prompt with no points/box just goes straight to the model
+    with box=None (StubEllipseModel's own whole-image-ish fallback), no
+    Grounding DINO call at all -- no network/weights needed for this path."""
+    path, w, h = _make_synthetic_image(tmp_path)
+    out = segment(path, label="anything", backend="stub", use_grounding_dino=False)
+    assert "resolved_box" not in out
+
+
+def test_box_area_ok_rejects_near_whole_frame_box():
+    """Guards the max_area_frac safety net (resolve_label_to_box's
+    docstring): a box covering ~98% of the frame -- the exact failure
+    pattern found querying an absent object ("a car") on the portrait
+    fixture -- must be rejected regardless of confidence score."""
+    img_w, img_h = 960, 1431
+    assert _box_area_ok(4.9, 6.5, 956.2, 1424.3, img_w, img_h, max_area_frac=0.85) is False
+
+
+def test_box_area_ok_accepts_reasonably_scoped_box():
+    """A normal single-object box (the real 'a face' detection from the
+    portrait fixture, ~5% of frame area) must NOT be rejected."""
+    img_w, img_h = 960, 1431
+    assert _box_area_ok(337.8, 199.7, 564.9, 519.8, img_w, img_h, max_area_frac=0.85) is True
+
+
 # --------------------------------------------------------------------------
 # 2. Real SAM2 integration test (skipped if checkpoint not downloaded)
 # --------------------------------------------------------------------------
@@ -200,6 +236,64 @@ def test_real_sam2_face_segmentation_on_portrait():
     print(f"real SAM2: score={out['score']:.3f} raw={out['num_points_raw']} "
           f"simplified={out['num_points_simplified']} bbox_iou_vs_prompt={iou:.3f}")
     assert iou > 0.4  # face mask bbox should substantially overlap the prompted box
+
+
+# --------------------------------------------------------------------------
+# 3. Real Grounded-SAM integration tests (2026-07-27, skipped if transformers/
+#    weights aren't present -- same auto-skip philosophy as the SAM2 test
+#    above, not a hard CI requirement)
+# --------------------------------------------------------------------------
+
+_GROUNDED_SAM_SKIP = (
+    not _TRANSFORMERS_AVAILABLE
+    or not os.path.exists(SMALL_CHECKPOINT)
+    or not os.path.exists(PORTRAIT)
+)
+_GROUNDED_SAM_SKIP_REASON = (
+    "transformers not installed, or SAM2 small checkpoint/portrait fixture "
+    "not present locally; see README/requirements.txt to fetch both"
+)
+
+
+@pytest.mark.skipif(_GROUNDED_SAM_SKIP, reason=_GROUNDED_SAM_SKIP_REASON)
+def test_real_grounding_dino_resolves_face_label_on_portrait():
+    """label-only ('a face', no points/box) must resolve to a real box via
+    Grounding DINO, then segment through SAM2 -- not just pass label
+    through inert. Checks the resolved_box lands on the actual face."""
+    model = load_model("sam2", checkpoint=SMALL_CHECKPOINT, model_cfg=SMALL_MODEL_CFG, device="cpu")
+    out = segment(PORTRAIT, label="a face", backend="sam2", model=model, target_min=10, target_max=48)
+
+    assert out["backend"] == "sam2"
+    assert "resolved_box" in out
+    assert out["resolved_box"]["label"] == "a face"
+    assert out["resolved_box"]["score"] > 0.5
+
+    # Same rough face bracket as test_real_sam2_face_segmentation_on_portrait
+    # -- the resolved box should substantially overlap it.
+    prompt_bb = (0.344, 0.105, 0.344 + 0.271, 0.105 + 0.217)
+    w, h = out["image_size"]["w"], out["image_size"]["h"]
+    rb = out["resolved_box"]
+    pred_bb = (rb["x0"] / w, rb["y0"] / h, rb["x1"] / w, rb["y1"] / h)
+    ix0, iy0 = max(prompt_bb[0], pred_bb[0]), max(prompt_bb[1], pred_bb[1])
+    ix1, iy1 = min(prompt_bb[2], pred_bb[2]), min(prompt_bb[3], pred_bb[3])
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    area_prompt = (prompt_bb[2] - prompt_bb[0]) * (prompt_bb[3] - prompt_bb[1])
+    area_pred = (pred_bb[2] - pred_bb[0]) * (pred_bb[3] - pred_bb[1])
+    iou = inter / (area_prompt + area_pred - inter)
+    print(f"grounding dino: score={rb['score']:.3f} iou_vs_known_face_box={iou:.3f}")
+    assert iou > 0.4
+
+
+@pytest.mark.skipif(_GROUNDED_SAM_SKIP, reason=_GROUNDED_SAM_SKIP_REASON)
+def test_real_grounding_dino_rejects_absent_object_label():
+    """An object that genuinely isn't in the image ('a helicopter' on a
+    portrait) must raise, not silently produce a meaningless whole-image
+    mask -- the exact regression this integration was built to avoid (see
+    resolve_label_to_box's docstring for the score/area-fraction data this
+    default is tuned against)."""
+    model = load_model("sam2", checkpoint=SMALL_CHECKPOINT, model_cfg=SMALL_MODEL_CFG, device="cpu")
+    with pytest.raises(ValueError, match="not found in image"):
+        segment(PORTRAIT, label="a helicopter", backend="sam2", model=model)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ inside the `darktable-mcp` .deb's bundled venv) so `darktable-mcp
 install-sidecar` (see `darktable_mcp/cli/install_sidecar.py`) can lay down a
 working SAM2 + MODNet sidecar checkout WITHOUT the user needing a separate
 git clone/copy step -- only the venv build (`uv venv` + the pinned pip
-installs) and the two checkpoint downloads (SAM2 ~149MB, MODNet ~24.7MB)
+installs) and the two checkpoint downloads (SAM2 ~176MB, MODNet ~24.7MB)
 need network access, all handled by `install-sidecar` itself.
 
 `requirements.txt` pins BOTH sam2 (needs the torch step first) and

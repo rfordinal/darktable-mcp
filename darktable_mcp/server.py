@@ -2324,10 +2324,18 @@ class DarktableMCPServer:
                                 "required": ["x", "y"],
                             },
                             "description": (
-                                "One or more prompt points on the subject, "
-                                "normalized 0..1 against the full frame. "
-                                "Usually one point on the object center is "
-                                "enough for SAM2."
+                                "One or more prompt points, normalized 0..1 "
+                                "against the full frame. Usually one "
+                                "label:1 point on the object center is "
+                                "enough for SAM2. If the segmented mask "
+                                "bleeds into a nearby distractor (e.g. "
+                                "branches behind a subject, a shadow next "
+                                "to it), add one or more label:0 points ON "
+                                "the distractor to explicitly exclude it -- "
+                                "mixing several label:1 (include) and "
+                                "label:0 (exclude) points in one call is "
+                                "the single cheapest way to fix a wrong-"
+                                "shaped mask without changing anything else."
                             ),
                         },
                         "box": {
@@ -2347,13 +2355,22 @@ class DarktableMCPServer:
                         "label": {
                             "type": "string",
                             "description": (
-                                "Free-text hint describing the selected "
-                                "region (e.g. 'foreground object', 'sky'), "
-                                "best-effort only — SAM2 has no text "
-                                "grounding, so this "
-                                "does nothing useful unless points/box are "
-                                "also given. Always prefer picking points/"
-                                "box yourself from the preview image."
+                                "Free-text description of the subject "
+                                "(e.g. 'the dog', 'a face', 'the red car'). "
+                                "If given ALONE (no points/box), this is "
+                                "resolved into a real box via Grounding "
+                                "DINO (a text-grounded detector) BEFORE "
+                                "segmentation runs -- SAM2 itself has no "
+                                "text grounding, but this resolution step "
+                                "gives label-only prompts real localization "
+                                "instead of doing nothing. If the described "
+                                "subject isn't found with enough confidence "
+                                "the call fails outright (no guess, no "
+                                "silent whole-image mask) -- pick points/box "
+                                "yourself instead in that case. If points/"
+                                "box are ALSO given, they take priority and "
+                                "this becomes best-effort/inert again (old "
+                                "behavior, unchanged)."
                             ),
                         },
                         "opacity": {
@@ -2372,6 +2389,39 @@ class DarktableMCPServer:
                                 "edit untouched. False: mask+edit instance 0 "
                                 "directly (rare — usually wrong for a "
                                 "'global' module already in use)."
+                            ),
+                        },
+                        "smooth": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": (
+                                "True (default): Bezier-smooth the path "
+                                "between polygon nodes, same as darktable's "
+                                "own drawn-path default. False: sharp corner "
+                                "nodes, no curve interpolation between them "
+                                "-- try this if a segmented mask has visible "
+                                "overshoot loops or bulges on a shape with "
+                                "many sharp concave corners (Bezier smoothing "
+                                "between sparse nodes can overshoot there; "
+                                "corner nodes track the polygon exactly, at "
+                                "the cost of a slightly more angular edge)."
+                            ),
+                        },
+                        "max_nodes": {
+                            "type": "integer",
+                            "default": 48,
+                            "minimum": 10,
+                            "maximum": 200,
+                            "description": (
+                                "Cap on the simplified polygon's node count "
+                                "(default 48). Raise this (e.g. 80-120) for "
+                                "a complex/non-convex silhouette (a body in "
+                                "an unusual pose, an object with several "
+                                "limbs/protrusions) that looks like it's "
+                                "losing real shape detail at the default cap "
+                                "-- more nodes track the true contour more "
+                                "closely, at the cost of a slightly heavier "
+                                "path for darktable to render."
                             ),
                         },
                     },
@@ -5419,6 +5469,9 @@ class DarktableMCPServer:
 
         opacity = float(arguments.get("opacity", 1.0))
         new_instance = bool(arguments.get("new_instance", True))
+        smooth = bool(arguments.get("smooth", True))
+        max_nodes = arguments.get("max_nodes")
+        max_nodes = int(max_nodes) if max_nodes is not None else None
 
         # (a) full-frame preview -- the sidecar segments THIS render, so its
         # polygon comes back normalized in the same DISPLAY/PROCESSED frame
@@ -5459,7 +5512,8 @@ class DarktableMCPServer:
         # yet, so any failure here is automatically "no partial edit".
         try:
             seg = run_segmentation(
-                host_preview_path, points=points, box=box, label=label
+                host_preview_path, points=points, box=box, label=label,
+                max_nodes=max_nodes,
             )
         except SegmentationServiceError as e:
             return [TextContent(type="text", text=f"mask_object: {e}")]
@@ -5505,7 +5559,10 @@ class DarktableMCPServer:
         try:
             mask_result = self.bridge.call(
                 "dev_add_path_mask",
-                {"op": op, "instance": instance, "points": mask_polygon, "opacity": opacity},
+                {
+                    "op": op, "instance": instance, "points": mask_polygon,
+                    "opacity": opacity, "smooth": smooth,
+                },
                 timeout=15.0,
             )
             mask_err = mask_result.get("error")
@@ -5554,6 +5611,13 @@ class DarktableMCPServer:
             f"  mask_id={mask_result.get('mask_id')} opacity={mask_result.get('opacity')}",
             f"  applied: {json.dumps(set_result.get('applied') or {})}",
         ]
+        resolved_box = seg.get("resolved_box")
+        if resolved_box is not None:
+            lines.insert(
+                3,
+                f"  label->box (Grounding DINO): {json.dumps(resolved_box)} "
+                "-- verify this is actually the intended subject before trusting the mask",
+            )
         clamped = set_result.get("clamped") or []
         for c in clamped:
             lines.append(

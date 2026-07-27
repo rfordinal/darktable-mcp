@@ -1767,6 +1767,42 @@ async def test_handle_mask_object_backtransforms_polygon_before_add_path_mask():
 
 
 @pytest.mark.asyncio
+async def test_handle_mask_object_forwards_smooth_and_max_nodes():
+    """smooth (default True) must reach dev_add_path_mask, and an explicit
+    max_nodes must reach run_segmentation -- both were silently dropped
+    before this (mask_object never forwarded either)."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    sidecar_polygon = [{"x": 0.1, "y": 0.2}, {"x": 0.3, "y": 0.2}, {"x": 0.2, "y": 0.4}]
+    server.bridge.call.side_effect = _mask_object_bridge_router(
+        len(sidecar_polygon), {"x": 0.9, "y": 0.05}
+    )
+
+    with patch(
+        "darktable_mcp.server.run_segmentation",
+        return_value={
+            "polygon": sidecar_polygon,
+            "bbox": {"x": 0.1, "y": 0.2, "w": 0.2, "h": 0.2},
+            "score": 0.86,
+            "backend": "sam2",
+        },
+    ) as mock_run_seg:
+        await server._handle_mask_object({
+            "op": "exposure",
+            "adjustment": {"exposure": 0.2},
+            "box": {"x": 0.2, "y": 0.3, "w": 0.2, "h": 0.4},
+            "smooth": False,
+            "max_nodes": 96,
+        })
+
+    assert mock_run_seg.call_args.kwargs["max_nodes"] == 96
+
+    calls = server.bridge.call.call_args_list
+    add_path_mask_call = next(c for c in calls if c.args[0] == "dev_add_path_mask")
+    assert add_path_mask_call.args[1]["smooth"] is False
+
+
+@pytest.mark.asyncio
 async def test_handle_mask_object_reports_both_frame_bboxes():
     """Output must clearly label which bbox is display-frame (what the
     sidecar segmented) vs mask-frame (what actually got written) -- the

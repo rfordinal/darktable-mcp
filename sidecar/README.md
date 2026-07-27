@@ -70,8 +70,8 @@ until T2.3 exists, not as a working text-to-mask path.
   --image fixtures/portrait.jpg \
   --box 0.344,0.105,0.271,0.217 \
   --backend sam2 \
-  --checkpoint checkpoints/sam2.1_hiera_tiny.pt \
-  --model-cfg configs/sam2.1/sam2.1_hiera_t.yaml
+  --checkpoint checkpoints/sam2.1_hiera_small.pt \
+  --model-cfg configs/sam2.1/sam2.1_hiera_s.yaml
 # prints the JSON contract above to stdout
 ```
 
@@ -100,14 +100,23 @@ not stubbed -- the environment turned out to have what it needed (see
 below), so both the pipeline *and* the model are real and tested.
 
 - Model: `facebookresearch/sam2`, PyPI package `sam2==1.1.0`.
-- Checkpoint: **SAM 2.1 Hiera-tiny** (smallest official checkpoint, ~149MB),
-  `checkpoints/sam2.1_hiera_tiny.pt`, fetched from
-  `https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt`.
-- Config: `configs/sam2.1/sam2.1_hiera_t.yaml` (bundled inside the `sam2`
+- Checkpoint: **SAM 2.1 Hiera-small** (one step up from the smallest
+  official checkpoint, ~176MB), `checkpoints/sam2.1_hiera_small.pt`,
+  fetched from
+  `https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt`.
+  Bumped from tiny 2026-07-27 (see `segmentation_tools.py`'s
+  `DEFAULT_CHECKPOINT` comment for the honest caveat: this was NOT proven
+  to improve quality on this repo's own portrait fixture -- SAM2's score is
+  a per-checkpoint self-confidence, not an absolute cross-size metric --
+  it's a bet on Meta's general benchmarks for harder/more ambiguous scenes).
+  `checkpoints/sam2.1_hiera_tiny.pt` (~149MB) is also still present in this
+  checkout if you want to compare or revert.
+- Config: `configs/sam2.1/sam2.1_hiera_s.yaml` (bundled inside the `sam2`
   package, resolved via hydra).
 - Torch: `2.5.1+cpu` / `torchvision 0.20.1+cpu` (CPU-only wheels, no CUDA).
 - Runtime: model load + one image inference on the portrait fixture (below)
-  takes **~6s** on an 8-core CPU box. Fine for an interactive/agentic loop.
+  takes **~6-10s** on an 8-core CPU box (comparable to tiny in local
+  testing). Fine for an interactive/agentic loop.
 
 ### Why this needed its own Python, and how it was solved
 
@@ -154,25 +163,27 @@ uv pip install --python .venv/bin/python3.12 \
 # 3. sam2 + opencv + numpy + pillow + pytest, from the default index
 uv pip install --python .venv/bin/python3.12 -r requirements.txt
 
-# 4. the tiny checkpoint (~149MB)
+# 4. the small checkpoint (~176MB)
 mkdir -p checkpoints
-curl -sL -o checkpoints/sam2.1_hiera_tiny.pt \
-  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
+curl -sL -o checkpoints/sam2.1_hiera_small.pt \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
 
 # 5. run it
 .venv/bin/python3.12 segment.py --image fixtures/portrait.jpg \
   --box 0.344,0.105,0.271,0.217 \
-  --checkpoint checkpoints/sam2.1_hiera_tiny.pt \
-  --model-cfg configs/sam2.1/sam2.1_hiera_t.yaml
+  --checkpoint checkpoints/sam2.1_hiera_small.pt \
+  --model-cfg configs/sam2.1/sam2.1_hiera_s.yaml
 ```
 
-Larger/more accurate checkpoints (small/base+/large) are at the same
+Larger/more accurate checkpoints (base+/large) are at the same
 `dl.fbaipublicfiles.com/segment_anything_2/092824/` path under
-`sam2.1_hiera_{small,base_plus,large}.pt`, paired with
-`configs/sam2.1/sam2.1_hiera_{s,b+,l}.yaml`. Tiny was chosen deliberately
-(smallest download, CPU-fast, sufficient quality for a face/object box
-prompt) -- swap `--checkpoint`/`--model-cfg` for a bigger one if quality
-matters more than latency for a given use case.
+`sam2.1_hiera_{base_plus,large}.pt`, paired with
+`configs/sam2.1/sam2.1_hiera_{b+,l}.yaml`; the smallest, tiny, is at
+`sam2.1_hiera_tiny.pt`/`sam2.1_hiera_t.yaml`. Small is the current default
+(one step up from tiny -- see "Status" above for the honest caveat on
+whether that actually helps) -- swap `--checkpoint`/`--model-cfg` for a
+bigger or smaller one depending on whether quality or latency matters more
+for a given use case.
 
 If plain `pip` instead of `uv` is preferred: same two-step install (`pip
 install --index-url https://download.pytorch.org/whl/cpu -r
@@ -257,7 +268,11 @@ checkpoint `checkpoints/sam2.1_hiera_tiny.pt` (149MB,
 `configs/sam2.1/sam2.1_hiera_t.yaml`, CPU inference (`torch==2.5.1+cpu`).
 Real result on the portrait fixture: **score 0.756**, 1228 raw contour
 points, 11 after simplification, bbox IoU vs the prompted face box 0.729
-(all quoted above). Since real weights were used, the "if stubbed" fallback
+(all quoted above). This section documents the ORIGINAL tiny-checkpoint
+integration test (`test_segment.py`'s dedicated tiny-checkpoint test, still
+present and still passing); the server's own default checkpoint has since
+moved to small (2026-07-27, see "Status" above) -- the two are independent,
+tiny is still fully supported and tested here. Since real weights were used, the "if stubbed" fallback
 steps aren't needed here, but are documented above ("Enabling / re-enabling
 real SAM2 from scratch") since this exact setup can go stale or be
 unavailable in a different environment -- the `backend="stub"` path

@@ -54,6 +54,27 @@ class SegmentationServiceError(DarktableMCPError):
     pass
 
 
+class LabelNotFoundInImageError(SegmentationServiceError):
+    """Raised specifically when Grounding DINO (2026-07-27, Grounded-SAM
+    label->box resolution in sidecar/segment.py) ran successfully but found
+    nothing matching the caller's `label` above its confidence/area-fraction
+    thresholds -- a genuine, confident "not in this image" answer, NOT an
+    infrastructure failure.
+
+    Deliberately a DIFFERENT case from the rest of SegmentationServiceError:
+    run_segmentation() must NOT fall back to GrabCut for this one (GrabCut
+    has no text grounding at all -- see local_segment._label_only_rect_px --
+    so "falling back" would silently swap a correct, confident rejection for
+    a low-quality generic-centered-rect guess, exactly the kind of silent
+    wrongness this whole integration was built to avoid). Still a
+    SegmentationServiceError subclass so every EXISTING catch site
+    (mask_object's `except SegmentationServiceError`) keeps working
+    unchanged -- only run_segmentation's fallback decision treats this
+    differently."""
+
+    pass
+
+
 class MattingServiceError(DarktableMCPError):
     """Raised when the MODNet matting sidecar (T3.2) can't produce an alpha
     matte: its venv is missing, the ONNX checkpoint is absent, the

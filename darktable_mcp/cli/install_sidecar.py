@@ -12,13 +12,16 @@ Steps:
        darktable_mcp/sidecar_assets/ -- see that directory's README.md -- so
        no separate git clone/copy is needed),
     2. create a `uv venv --python 3.12` at <target>/.venv,
-    3. install pinned CPU-only torch, THEN sam2 (two separate steps -- see
-       requirements.txt's own comment for why these must not be merged),
+    3. install pinned CPU-only torch, THEN sam2 + transformers (Grounding
+       DINO, 2026-07-27 -- gives mask_object's label-only prompts real text
+       grounding instead of doing nothing; two separate steps -- see
+       requirements.txt's own comment for why torch must not be merged with
+       the rest),
     4. install onnxruntime (MODNet's only inference dependency -- no torch
        needed for it; checked/installed independently of step 3 so this
        still completes even on an older sidecar venv that already has
        sam2/torch but predates the onnxruntime pin),
-    5. download the sam2.1_hiera_tiny checkpoint (~149MB),
+    5. download the sam2.1_hiera_small checkpoint (~176MB),
     6. download the MODNet ONNX checkpoint (~24.7MB, from the HF mirror
        documented in sidecar/README.md "Enabling real MODNet"),
     7. print (and write to a config file) the exact env-var export lines
@@ -55,15 +58,15 @@ from pathlib import Path
 from typing import Optional
 
 CHECKPOINT_URL = (
-    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt"
+    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt"
 )
-CHECKPOINT_NAME = "sam2.1_hiera_tiny.pt"
-MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
+CHECKPOINT_NAME = "sam2.1_hiera_small.pt"
+MODEL_CFG = "configs/sam2.1/sam2.1_hiera_s.yaml"
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cpu"
 # Below this, a partially-downloaded/truncated checkpoint is treated as
 # incomplete and re-downloaded even without --force (the real file is
-# ~149MB; anything under ~100MB is clearly a broken/partial fetch).
-MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024
+# ~176MB; anything under ~140MB is clearly a broken/partial fetch).
+MIN_CHECKPOINT_BYTES = 140 * 1024 * 1024
 
 # MODNet (T3.2, mask_raster) -- official checkpoint, ONNX export, re-hosted
 # on the HF mirror documented in sidecar/README.md "Enabling real MODNet
@@ -315,7 +318,7 @@ def step_install_onnxruntime(target_dir: Path, force: bool) -> bool:
 
 
 def step_download_checkpoint(target_dir: Path, force: bool) -> bool:
-    print("[5/7] SAM2.1 Hiera-tiny checkpoint (~149MB)")
+    print("[5/7] SAM2.1 Hiera-small checkpoint (~176MB)")
     ckpt = _checkpoint_path(target_dir)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     if ckpt.is_file() and ckpt.stat().st_size >= MIN_CHECKPOINT_BYTES and not force:
@@ -559,7 +562,7 @@ def install_sidecar_main(argv=None) -> int:
         ok = step_install_onnxruntime(target_dir, args.force) and ok
 
     if args.skip_checkpoint:
-        print("[5/7] SAM2.1 Hiera-tiny checkpoint: SKIPPED (--skip-checkpoint)")
+        print("[5/7] SAM2.1 Hiera-small checkpoint: SKIPPED (--skip-checkpoint)")
         sam2_ckpt_ok = False
     else:
         sam2_ckpt_ok = step_download_checkpoint(target_dir, args.force)

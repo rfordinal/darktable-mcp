@@ -1,19 +1,23 @@
 """segment.py -- darktable-mcp segmentation sidecar (PLAN.md T2.1).
 
-Turns a point/box (and optionally free-text label, best-effort) prompt into a
-normalized polygon contour ready to hand to ``darktable.develop.add_path_mask``
-(T2.2). This module is a standalone service: it does not import or touch any
-darktable C code, and has no dependency on the rest of ``darktable_mcp``.
+Turns a point/box/label prompt into a normalized polygon contour ready to
+hand to ``darktable.develop.add_path_mask`` (T2.2). This module is a
+standalone service: it does not import or touch any darktable C code, and
+has no dependency on the rest of ``darktable_mcp``.
 
 Pipeline
 --------
     prompt (points / box / label)
+        -> resolve_label_to_box()        label-ONLY prompt -> real box via
+                                          Grounding DINO (2026-07-27,
+                                          Grounded-SAM); skipped entirely if
+                                          points/box were also given
         -> SegmentationModel.predict()   binary mask, HxW bool, plus a score
         -> largest external contour      cv2.findContours
         -> polygon simplification        cv2.approxPolyDP (Douglas-Peucker),
-                                          binary-searched to ~10-30 nodes
+                                          binary-searched to ~10-48 nodes
         -> normalization                 pixel coords -> 0..1 by image size
-        -> {polygon, bbox, score, ...}
+        -> {polygon, bbox, score, resolved_box?, ...}
 
 Multi-part / holes
 -------------------
@@ -45,6 +49,21 @@ from PIL import Image
 # --------------------------------------------------------------------------
 # Prompt / result data model
 # --------------------------------------------------------------------------
+
+
+class LabelNotFoundError(ValueError):
+    """Grounding DINO ran successfully but found nothing matching `label`
+    above its confidence/area-fraction thresholds (see resolve_label_to_box)
+    -- a genuine, confident "not in this image" answer, not an
+    infrastructure failure. A distinct type (not plain ValueError) so
+    `main()` can recognize it and report it via the JSON contract's
+    "error_type" field instead of an uncaught-exception traceback + nonzero
+    exit -- the caller-side bridge (darktable_mcp's segmentation_tools.py)
+    uses that marker to skip the GrabCut fallback for this specific case
+    (see darktable_mcp/utils/errors.py's LabelNotFoundInImageError for why).
+    """
+
+    pass
 
 
 @dataclass
@@ -112,9 +131,13 @@ class SegmentationModel(ABC):
 class SAM2Model(SegmentationModel):
     """Real backend: Meta's Segment Anything 2, image predictor, point/box
     prompts. Text prompts are NOT natively supported by SAM2 (it has no
-    language tower) -- `label` is accepted for interface symmetry with the
-    future orchestrator (T2.3, which will have already turned "face" into
-    points/box via Claude vision before calling here) but is otherwise inert.
+    language tower) -- the `label` argument THIS CLASS receives is always
+    inert, by design (SAM2 itself has nothing to do with it). That's not
+    the whole story anymore, though: `segment()` (below) may have already
+    turned a label-only prompt into a real `box` via Grounding DINO
+    (`resolve_label_to_box`, 2026-07-27) before ever calling this class's
+    `predict()` -- so a label DOES end up mattering end-to-end, just never
+    inside this class.
 
     Lazy-imports torch/sam2 so the rest of this module (contour/simplify/
     normalize + the stub backend) works even where SAM2 is not installed.
@@ -244,6 +267,132 @@ def load_model(backend: str = "sam2", **kwargs) -> SegmentationModel:
 
 
 # --------------------------------------------------------------------------
+# Grounded-SAM: text label -> box, via Grounding DINO (2026-07-27)
+# --------------------------------------------------------------------------
+#
+# SAM2 has no language tower (see SAM2Model's docstring) -- `label` reaching
+# it directly does nothing. This resolves `label` into a `Box` BEFORE
+# SAM2Model.predict() ever runs, using Grounding DINO (a real text-grounded
+# open-vocabulary detector) -- so a caller giving ONLY a text label (no
+# points/box) gets an actual, real detection-driven prompt instead of a
+# silently-ignored hint. Only used when the caller gave a label and nothing
+# else (see segment()) -- an explicit points/box always takes priority and
+# skips this entirely, so existing callers are unaffected.
+
+_grounding_dino_cache: dict = {}
+
+
+def _load_grounding_dino(model_id: str, device: str = "cpu"):
+    """Lazy-load + cache (processor, model) for one model_id/device pair --
+    loading is ~1-2s, not worth repeating per segment() call when a caller
+    reuses this process (mirrors SAM2Model's own lazy torch/sam2 import)."""
+    key = (model_id, device)
+    if key not in _grounding_dino_cache:
+        import torch  # noqa: F401  (import guarded here on purpose)
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
+        model.eval()
+        model.to(device)
+        _grounding_dino_cache[key] = (processor, model)
+    return _grounding_dino_cache[key]
+
+
+DEFAULT_GROUNDING_DINO_MODEL = "IDEA-Research/grounding-dino-tiny"
+
+
+def resolve_label_to_box(
+    image_rgb: np.ndarray,
+    label: str,
+    model_id: str = DEFAULT_GROUNDING_DINO_MODEL,
+    threshold: float = 0.5,
+    text_threshold: float = 0.25,
+    max_area_frac: float = 0.85,
+    device: str = "cpu",
+) -> Optional[dict]:
+    """Ground free-text `label` in `image_rgb` (HxWx3 uint8) via Grounding
+    DINO. Returns the highest-scoring detection as a pixel-space box dict
+    {"x0","y0","x1","y1","score"}, or None if nothing scored above
+    `threshold` (or the best box was rejected by `max_area_frac`, see
+    below). Caller decides what "nothing found" means (segment() raises
+    rather than silently falling back to a meaningless whole-image mask --
+    a wrong-but-confident box is more useful than no signal at all, but NO
+    box is a real "not in this image" answer worth surfacing, not something
+    to paper over).
+
+    `threshold` tuned empirically on the portrait fixture: querying for
+    objects NOT in the image scored anywhere from 0.31 ("a helicopter", "a
+    mountain") up to 0.46-0.48 ("a dog", "a car") -- no single value below
+    ~0.5 cleanly separated every absent-object query from the true positive
+    ("a face" scored 0.76; "a person"/"hair" scored 0.72-0.79). 0.5 gave a
+    clean separation on this one fixture but is NOT guaranteed to generalize
+    -- this is a known characteristic of open-vocabulary detectors queried
+    for something that isn't present, not a bug specific to this
+    integration. `resolved_box` is always surfaced in segment()'s output
+    specifically so a caller can sanity-check what actually got grounded
+    before trusting the resulting mask, which matters more than any single
+    threshold value.
+
+    `max_area_frac` is a SECOND, independent safety net found during that
+    same sweep: every false-positive box (the "absent object" queries above
+    that scored close to threshold) covered 85-98% of the frame -- the
+    detector's "I don't know, so I'll point at everything" tell. A real
+    single object worth an isolated local-edit mask is essentially never
+    ~the whole frame, so a box this large is rejected regardless of its
+    score -- this catches a marginal false positive a confidence threshold
+    alone might let through, and is a structurally different (not just a
+    stricter version of the same) signal from the score.
+
+    Grounding DINO's own convention wants the query phrase lowercased and
+    period-terminated (e.g. "a person." not "a person" or "A person") --
+    handled here so callers can pass a plain label like mask_object's.
+    """
+    import torch
+
+    processor, model = _load_grounding_dino(model_id, device=device)
+    image = Image.fromarray(image_rgb)
+    query = label.strip().lower()
+    if not query.endswith("."):
+        query += "."
+
+    inputs = processor(images=image, text=query, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        threshold=threshold,
+        text_threshold=text_threshold,
+        target_sizes=[image.size[::-1]],
+    )[0]
+
+    scores = results["scores"]
+    if len(scores) == 0:
+        return None
+    best = int(scores.argmax())
+    x0, y0, x1, y1 = [float(v) for v in results["boxes"][best].tolist()]
+
+    img_h, img_w = image_rgb.shape[:2]
+    if not _box_area_ok(x0, y0, x1, y1, img_w, img_h, max_area_frac):
+        return None
+
+    return {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "score": float(scores[best])}
+
+
+def _box_area_ok(
+    x0: float, y0: float, x1: float, y1: float,
+    img_w: int, img_h: int, max_area_frac: float,
+) -> bool:
+    """The max_area_frac guard from resolve_label_to_box's docstring, split
+    out as a pure function so it's unit-testable without loading Grounding
+    DINO weights (see test_segment.py)."""
+    area_frac = ((x1 - x0) * (y1 - y0)) / (img_w * img_h)
+    return area_frac <= max_area_frac
+
+
+# --------------------------------------------------------------------------
 # Mask -> contour -> simplify -> normalize pipeline (real, backend-agnostic)
 # --------------------------------------------------------------------------
 
@@ -266,7 +415,7 @@ def largest_external_contour(mask: np.ndarray) -> np.ndarray:
 def simplify_polygon(
     contour: np.ndarray,
     target_min: int = 10,
-    target_max: int = 30,
+    target_max: int = 48,
     max_iter: int = 25,
 ) -> np.ndarray:
     """Douglas-Peucker simplification (cv2.approxPolyDP) with the epsilon
@@ -336,7 +485,9 @@ def segment(
     model: Optional[SegmentationModel] = None,
     backend: str = "sam2",
     target_min: int = 10,
-    target_max: int = 30,
+    target_max: int = 48,
+    use_grounding_dino: bool = True,
+    grounding_dino_threshold: float = 0.5,
     **backend_kwargs,
 ) -> dict:
     """Main entrypoint T2.3 (or anything else) calls.
@@ -344,12 +495,22 @@ def segment(
     points: list of {"x":.., "y":.., "label": 1|0}  (normalized 0..1; label
             optional, defaults to 1 = foreground click)
     box:    {"x":.., "y":.., "w":.., "h":..}         (normalized 0..1)
-    label:  free-text hint, best-effort (see SAM2Model docstring -- SAM2 has
-            no text grounding; the real translation "face" -> points/box is
-            T2.3's job using Claude vision, upstream of this call)
+    label:  free-text hint (e.g. "the red car", "a face"). SAM2 itself has
+            no text grounding (see SAM2Model docstring), so if points/box
+            are ALSO given, label is passed through inert, best-effort
+            only. If label is the ONLY prompt given (no points, no box),
+            it is resolved into a real box via Grounding DINO
+            (`resolve_label_to_box`, 2026-07-27) BEFORE the segmentation
+            model ever runs -- an actual text-grounded detection, not a
+            best-effort hint. Set use_grounding_dino=False to disable this
+            (falls back to the old inert-label behavior; useful for a
+            caller that already always supplies points/box, or to force
+            the pre-Grounded-SAM code path).
     model:  pass a pre-loaded SegmentationModel to reuse across calls
             (skips reloading weights); otherwise one is built via
             load_model(backend, **backend_kwargs) for this call only.
+    grounding_dino_threshold: detection confidence floor (0..1) for the
+            label->box resolution above; only used when it actually runs.
 
     Returns:
         {
@@ -360,7 +521,20 @@ def segment(
           "num_points_simplified": int,
           "backend": str,
           "image_size": {"w": int, "h": int},
+          "resolved_box": {"x0","y0","x1","y1","score","label"} | absent,
+                           # only present when label->box resolution ran --
+                           # the pixel-space box Grounding DINO found,
+                           # BEFORE it became the box the segmentation
+                           # model actually used (surfaced so a caller can
+                           # tell "wrong text grounding" apart from "right
+                           # box, wrong segmentation" -- same transparency
+                           # principle as mask_object's bbox_display_frame/
+                           # bbox_mask_frame).
         }
+
+    Raises ValueError if label->box resolution runs and finds nothing above
+    grounding_dino_threshold -- a real "not in this image" answer, not
+    silently swallowed into a meaningless whole-image mask.
     """
     if not points and not box and not label:
         raise ValueError("segment() needs at least one of points, box, label")
@@ -372,6 +546,24 @@ def segment(
     pts = [Point(**p) for p in (points or [])]
     bx = Box(**box) if box else None
 
+    resolved_box: Optional[dict] = None
+    if label and not pts and bx is None and use_grounding_dino:
+        box_px = resolve_label_to_box(image_rgb, label, threshold=grounding_dino_threshold)
+        if box_px is None:
+            raise LabelNotFoundError(
+                f"label {label!r} not found in image by Grounding DINO "
+                f"(score below {grounding_dino_threshold}) -- provide "
+                "points/box manually instead, or lower "
+                "grounding_dino_threshold if you're confident it's there"
+            )
+        bx = Box(
+            x=box_px["x0"] / width,
+            y=box_px["y0"] / height,
+            w=(box_px["x1"] - box_px["x0"]) / width,
+            h=(box_px["y1"] - box_px["y0"]) / height,
+        )
+        resolved_box = {**box_px, "label": label}
+
     if model is None:
         model = load_model(backend=backend, **backend_kwargs)
 
@@ -382,7 +574,7 @@ def segment(
     polygon_norm = normalize_polygon(simplified, width, height)
     bbox_norm = polygon_bbox(polygon_norm)
 
-    return {
+    out = {
         "polygon": polygon_norm,
         "bbox": bbox_norm,
         "score": result.score,
@@ -391,6 +583,9 @@ def segment(
         "backend": result.raw.get("backend", backend),
         "image_size": {"w": int(width), "h": int(height)},
     }
+    if resolved_box is not None:
+        out["resolved_box"] = resolved_box
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -420,30 +615,58 @@ def main() -> None:
         help="normalized prompt point 'x,y[,label]' (label 1=fg default, 0=bg); repeatable",
     )
     ap.add_argument("--box", help="normalized prompt box 'x,y,w,h'")
-    ap.add_argument("--label", help="free-text hint, best-effort (see README)")
+    ap.add_argument(
+        "--label",
+        help=(
+            "free-text hint (e.g. 'a face'). If given alone (no --point/"
+            "--box), resolved into a real box via Grounding DINO before "
+            "segmentation runs -- see --no-grounding-dino to disable that."
+        ),
+    )
     ap.add_argument("--backend", default="sam2", choices=["sam2", "stub"])
     ap.add_argument("--checkpoint", help="SAM2 checkpoint path (sam2 backend)")
     ap.add_argument("--model-cfg", help="SAM2 model config name/path (sam2 backend)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--min-nodes", type=int, default=10)
-    ap.add_argument("--max-nodes", type=int, default=30)
+    ap.add_argument("--max-nodes", type=int, default=48)
+    ap.add_argument(
+        "--no-grounding-dino",
+        action="store_true",
+        help="disable label->box resolution; --label alone becomes inert again (old behavior)",
+    )
+    ap.add_argument(
+        "--grounding-dino-threshold",
+        type=float,
+        default=0.5,
+        help="detection confidence floor (0..1) for label->box resolution",
+    )
     args = ap.parse_args()
 
     points = [_parse_point(p) for p in args.point]
     box = _parse_box(args.box) if args.box else None
 
-    out = segment(
-        args.image,
-        points=points,
-        box=box,
-        label=args.label,
-        backend=args.backend,
-        checkpoint=args.checkpoint,
-        model_cfg=args.model_cfg,
-        device=args.device,
-        target_min=args.min_nodes,
-        target_max=args.max_nodes,
-    )
+    try:
+        out = segment(
+            args.image,
+            points=points,
+            box=box,
+            label=args.label,
+            backend=args.backend,
+            checkpoint=args.checkpoint,
+            model_cfg=args.model_cfg,
+            device=args.device,
+            target_min=args.min_nodes,
+            target_max=args.max_nodes,
+            use_grounding_dino=not args.no_grounding_dino,
+            grounding_dino_threshold=args.grounding_dino_threshold,
+        )
+    except LabelNotFoundError as exc:
+        # Exit 0 (not a crash/infra failure) with a JSON error contract the
+        # caller-side bridge (darktable_mcp/tools/segmentation_tools.py)
+        # recognizes via error_type to skip its GrabCut fallback -- see
+        # LabelNotFoundError's docstring.
+        print(json.dumps({"error": str(exc), "error_type": "label_not_found"}, indent=2))
+        return
     print(json.dumps(out, indent=2))
 
 

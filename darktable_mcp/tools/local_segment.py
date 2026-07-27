@@ -51,7 +51,11 @@ import cv2
 import numpy as np
 
 DEFAULT_TARGET_MIN = 10
-DEFAULT_TARGET_MAX = 30
+# Raised from 30 -- a complex/non-convex silhouette (e.g. a human body in an
+# unusual pose) loses real detail at 30 nodes; 48 gives Douglas-Peucker more
+# room before it has to start cutting concave detail to hit the cap. Still
+# overridable per-call (mask_object's optional max_nodes argument).
+DEFAULT_TARGET_MAX = 48
 DEFAULT_ITER_COUNT = 5
 # Radius (as a fraction of min(width,height)) for the disc dropped around a
 # points-only prompt's centroid when no box is given -- mirrors the sidecar

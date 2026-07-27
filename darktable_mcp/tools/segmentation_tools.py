@@ -44,7 +44,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..utils.errors import SegmentationServiceError
+from ..utils.errors import LabelNotFoundInImageError, SegmentationServiceError
 from . import local_segment
 
 logger = logging.getLogger(__name__)
@@ -71,10 +71,26 @@ SIDECAR_SCRIPT = SIDECAR_DIR / "segment.py"
 ENV_SIDECAR_PYTHON = "DARKTABLE_MCP_SIDECAR_PYTHON"
 ENV_SIDECAR_SEGMENT = "DARKTABLE_MCP_SIDECAR_SEGMENT"
 DEFAULT_SIDECAR_PYTHON = SIDECAR_DIR / ".venv" / "bin" / "python3.12"
-DEFAULT_CHECKPOINT = SIDECAR_DIR / "checkpoints" / "sam2.1_hiera_tiny.pt"
+# Bumped from tiny -> small (2026-07-27): one step up on Meta's own
+# tiny/small/base_plus/large quality-vs-speed curve. NOT locally proven to
+# help -- a single local test on the bundled portrait fixture actually
+# reported a LOWER self-confidence score for small (0.60) than tiny (0.76)
+# on that one easy, well-lit, front-facing image. That's not a reliable
+# quality signal either way: SAM2's score is a self-calibrated per-checkpoint
+# confidence, not an absolute metric comparable across model sizes, and one
+# easy fixture has no headroom to show a harder-scene improvement. The
+# rationale for bumping anyway is Meta's published benchmarks (small/base+/
+# large generally outperform tiny on complex/ambiguous scenes) and that the
+# bugreport motivating this change was exactly that kind of hard scene
+# (unusual body pose against a branchy background) -- not something this
+# one fixture tests. Revert to hiera_tiny.pt/sam2.1_hiera_t.yaml (both here
+# and in the literal fallback below) if small doesn't actually help in
+# practice; runtime cost was comparable in the one local timing check (~6-10s
+# either way on an 8-core CPU box, within measurement noise).
+DEFAULT_CHECKPOINT = SIDECAR_DIR / "checkpoints" / "sam2.1_hiera_small.pt"
 # Hydra config identifier bundled inside the installed `sam2` package (NOT a
 # filesystem path relative to cwd) -- see sidecar/README.md CLI example.
-DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
+DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
 DEFAULT_TIMEOUT = 60.0
 
@@ -110,6 +126,8 @@ def run_segmentation(
     sidecar_script: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT,
     allow_grabcut_fallback: bool = True,
+    min_nodes: Optional[int] = None,
+    max_nodes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Segment `image_path` for the given prompt, preferring the SAM2
     sidecar and falling back to the in-process GrabCut segmenter (see
@@ -129,6 +147,12 @@ def run_segmentation(
     `allow_grabcut_fallback=False` disables the fallback (e.g. a caller
     that specifically wants to test/force sidecar-only behavior); the
     default is True so mask_object always gets *something* zero-install.
+
+    `min_nodes`/`max_nodes` override the Douglas-Peucker simplification
+    target node count (both backends default to 10..48 -- see
+    sidecar/segment.py and local_segment.py's DEFAULT_TARGET_MIN/MAX).
+    Raise max_nodes for a complex/non-convex silhouette that's losing real
+    shape detail at the default cap.
     """
     if not points and not box and not label:
         raise SegmentationServiceError(
@@ -150,7 +174,16 @@ def run_segmentation(
             sidecar_python=sidecar_python,
             sidecar_script=sidecar_script,
             timeout=timeout,
+            min_nodes=min_nodes,
+            max_nodes=max_nodes,
         )
+    except LabelNotFoundInImageError:
+        # Grounding DINO gave a real, confident "not in this image" answer
+        # -- GrabCut has no text grounding either (see local_segment's
+        # _label_only_rect_px), so falling back would silently swap this
+        # correct rejection for a low-quality generic-rect guess. Propagate
+        # as-is, never fall back, regardless of allow_grabcut_fallback.
+        raise
     except SegmentationServiceError as exc:
         sidecar_error = exc
         if not allow_grabcut_fallback:
@@ -160,8 +193,15 @@ def run_segmentation(
         "SAM2 sidecar unavailable (%s); falling back to in-process GrabCut",
         sidecar_error,
     )
+    grabcut_kwargs: Dict[str, Any] = {}
+    if min_nodes is not None:
+        grabcut_kwargs["target_min"] = min_nodes
+    if max_nodes is not None:
+        grabcut_kwargs["target_max"] = max_nodes
     try:
-        return local_segment.segment_grabcut(image_path, points=points, box=box, label=label)
+        return local_segment.segment_grabcut(
+            image_path, points=points, box=box, label=label, **grabcut_kwargs
+        )
     except Exception as grabcut_error:  # noqa: BLE001 - report both failures verbatim
         raise SegmentationServiceError(
             "segmentation unavailable: SAM2 sidecar failed "
@@ -182,6 +222,8 @@ def _run_sidecar(
     sidecar_python: Optional[str] = None,
     sidecar_script: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT,
+    min_nodes: Optional[int] = None,
+    max_nodes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Invoke `sidecar/segment.py` as a subprocess in its own venv.
 
@@ -226,6 +268,10 @@ def _run_sidecar(
         cmd += ["--box", f"{box['x']},{box['y']},{box['w']},{box['h']}"]
     if label:
         cmd += ["--label", label]
+    if min_nodes is not None:
+        cmd += ["--min-nodes", str(min_nodes)]
+    if max_nodes is not None:
+        cmd += ["--max-nodes", str(max_nodes)]
 
     cmd += ["--backend", backend]
     if backend == "sam2":
@@ -239,7 +285,7 @@ def _run_sidecar(
         # always fell through to "sidecar failed", which is straightforward
         # to miss because the GrabCut fallback (see run_segmentation) masks
         # it with a working-but-lower-quality result instead of a loud error.
-        cmd += ["--checkpoint", checkpoint or str(script.parent / "checkpoints" / "sam2.1_hiera_tiny.pt")]
+        cmd += ["--checkpoint", checkpoint or str(script.parent / "checkpoints" / "sam2.1_hiera_small.pt")]
         cmd += ["--model-cfg", model_cfg or DEFAULT_MODEL_CFG]
 
     logger.debug("segmentation sidecar cmd: %s", cmd)
@@ -274,6 +320,15 @@ def _run_sidecar(
             f"segmentation service returned invalid JSON: {exc}; "
             f"stdout={proc.stdout[:500]!r}"
         ) from exc
+
+    # Grounding DINO ran fine but found nothing matching `label` -- a real,
+    # confident answer (see sidecar/segment.py's LabelNotFoundError), NOT a
+    # sidecar/infra failure. A distinct exception type so run_segmentation
+    # skips its GrabCut fallback for this one case specifically (GrabCut has
+    # no text grounding either -- falling back would silently swap a
+    # correct rejection for a low-quality generic-rect guess).
+    if isinstance(result, dict) and result.get("error_type") == "label_not_found":
+        raise LabelNotFoundInImageError(result.get("error") or "label not found in image")
 
     if not isinstance(result, dict) or "polygon" not in result:
         raise SegmentationServiceError(
