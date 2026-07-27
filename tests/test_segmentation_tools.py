@@ -25,6 +25,43 @@ def _completed_process(returncode=0, stdout="", stderr=""):
     return proc
 
 
+class TestResolveDefaultCheckpoint:
+    """Regression guard for the 2026-07-27 checkpoint-bump-broke-existing-
+    installs incident: bumping the *default* checkpoint filename (tiny ->
+    small) pointed every pre-existing install-sidecar checkout (which only
+    ever downloaded tiny) at a file that doesn't exist there, silently
+    downgrading them to the GrabCut fallback with no error surfaced."""
+
+    def test_prefers_small_when_present(self, tmp_path):
+        (tmp_path / "checkpoints").mkdir()
+        (tmp_path / "checkpoints" / "sam2.1_hiera_small.pt").write_text("fake")
+        ckpt, cfg = segmentation_tools._resolve_default_checkpoint(tmp_path)
+        assert ckpt.name == "sam2.1_hiera_small.pt"
+        assert cfg == "configs/sam2.1/sam2.1_hiera_s.yaml"
+
+    def test_falls_back_to_tiny_when_only_tiny_present(self, tmp_path):
+        (tmp_path / "checkpoints").mkdir()
+        (tmp_path / "checkpoints" / "sam2.1_hiera_tiny.pt").write_text("fake")
+        ckpt, cfg = segmentation_tools._resolve_default_checkpoint(tmp_path)
+        assert ckpt.name == "sam2.1_hiera_tiny.pt"
+        assert cfg == "configs/sam2.1/sam2.1_hiera_t.yaml"
+
+    def test_prefers_small_over_tiny_when_both_present(self, tmp_path):
+        (tmp_path / "checkpoints").mkdir()
+        (tmp_path / "checkpoints" / "sam2.1_hiera_small.pt").write_text("fake")
+        (tmp_path / "checkpoints" / "sam2.1_hiera_tiny.pt").write_text("fake")
+        ckpt, _cfg = segmentation_tools._resolve_default_checkpoint(tmp_path)
+        assert ckpt.name == "sam2.1_hiera_small.pt"
+
+    def test_defaults_to_small_when_neither_present(self, tmp_path):
+        """Fresh install, nothing downloaded yet -- error message should
+        still point at the modern (small) filename, not silently pick a
+        nonexistent tiny path either."""
+        ckpt, cfg = segmentation_tools._resolve_default_checkpoint(tmp_path)
+        assert ckpt.name == "sam2.1_hiera_small.pt"
+        assert cfg == "configs/sam2.1/sam2.1_hiera_s.yaml"
+
+
 class TestRunSidecarLabelNotFound:
     @patch("darktable_mcp.tools.segmentation_tools.subprocess.run")
     @patch("darktable_mcp.tools.segmentation_tools._sidecar_script")

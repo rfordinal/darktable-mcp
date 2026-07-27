@@ -210,6 +210,32 @@ def run_segmentation(
         ) from grabcut_error
 
 
+def _resolve_default_checkpoint(script_parent: Path) -> tuple:
+    """Pick the checkpoint/model_cfg pair to default to, next to the
+    ACTUAL configured segment.py (script_parent) -- same reasoning as the
+    existing script.parent-relative FIX below.
+
+    2026-07-27 regression this exists to prevent: bumping the *default*
+    checkpoint filename (tiny -> small) silently broke every EXISTING
+    install-sidecar checkout, which only ever downloaded tiny -- the new
+    default pointed at a file that plain doesn't exist there, so every
+    call fell through to "sidecar failed" and silently downgraded to the
+    GrabCut fallback (no error surfaced -- the exact silent-quality-loss
+    failure mode this codebase otherwise goes out of its way to avoid).
+    Fix: prefer small if it's actually on disk, else fall back to tiny if
+    THAT is on disk (covers every pre-2026-07-27 install-sidecar checkout
+    without needing a re-run), else default to small anyway so a fresh
+    install's error message still points at the modern name."""
+    checkpoints_dir = script_parent / "checkpoints"
+    small = checkpoints_dir / "sam2.1_hiera_small.pt"
+    if small.is_file():
+        return small, "configs/sam2.1/sam2.1_hiera_s.yaml"
+    tiny = checkpoints_dir / "sam2.1_hiera_tiny.pt"
+    if tiny.is_file():
+        return tiny, "configs/sam2.1/sam2.1_hiera_t.yaml"
+    return small, "configs/sam2.1/sam2.1_hiera_s.yaml"
+
+
 def _run_sidecar(
     image_path: str,
     *,
@@ -285,8 +311,9 @@ def _run_sidecar(
         # always fell through to "sidecar failed", which is straightforward
         # to miss because the GrabCut fallback (see run_segmentation) masks
         # it with a working-but-lower-quality result instead of a loud error.
-        cmd += ["--checkpoint", checkpoint or str(script.parent / "checkpoints" / "sam2.1_hiera_small.pt")]
-        cmd += ["--model-cfg", model_cfg or DEFAULT_MODEL_CFG]
+        default_ckpt, default_cfg = _resolve_default_checkpoint(script.parent)
+        cmd += ["--checkpoint", checkpoint or str(default_ckpt)]
+        cmd += ["--model-cfg", model_cfg or default_cfg]
 
     logger.debug("segmentation sidecar cmd: %s", cmd)
     try:
