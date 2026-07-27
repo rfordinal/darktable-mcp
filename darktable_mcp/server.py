@@ -190,6 +190,18 @@ def _inline_image_content(
         return None
 
 
+def _polygon_bbox(polygon: List[Dict[str, float]]) -> Dict[str, float]:
+    """Min/max bbox of a normalized {x,y} point list -- used to report the
+    same bbox shape the segmentation sidecar already returns, but for the
+    mask-frame polygon actually written to add_path_mask, so a caller can
+    compare the two frames directly (see _backtransform_polygon_to_mask_space)."""
+    xs = [p["x"] for p in polygon]
+    ys = [p["y"] for p in polygon]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
 def _mask_overlay_content(
     base_png_path: str,
     polygon: List[Dict[str, Any]],
@@ -3919,6 +3931,55 @@ class DarktableMCPServer:
             "feather": target_result.get("len2", 0.0) if display_feather > 0 else 0.0,
         }, None
 
+    def _backtransform_polygon_to_mask_space(
+        self, polygon_display: List[Dict[str, float]]
+    ):
+        """mask_object's segmentation sidecar returns a polygon normalized
+        against dev_preview's PROCESSED/DISPLAY frame (it segments that
+        render directly). add_path_mask stores points in the PIPE-INPUT/
+        mask frame instead -- the exact same mismatch already fixed for
+        retouch's target/source points (_backtransform_to_mask_space above;
+        see dt.develop.backtransform_point's doc comment in
+        src-dt/src/lua/develop.c for why the two frames differ, e.g. any
+        portrait EXIF orientation swaps width/height between them).
+
+        Bugreport 2026-07-27 (SAM2 body mask landing on a tree instead of
+        the subject) traced to this exact gap: mask_object wrote the
+        sidecar's display-frame polygon straight into add_path_mask with a
+        comment claiming no rescaling was needed. It was needed.
+
+        Backtransforms every vertex individually via the same
+        dev_backtransform_point bridge call retouch already uses (no C
+        change required -- the binding has no batch form yet, so this is
+        one bridge round-trip per vertex, ~10-30 total).
+
+        Returns (mask_frame_points, None) or (None, error_response)."""
+        mask_points: List[Dict[str, float]] = []
+        for i, pt in enumerate(polygon_display):
+            try:
+                result = self.bridge.call(
+                    "dev_backtransform_point", {"x": pt["x"], "y": pt["y"]}, timeout=15.0
+                )
+            except BridgePluginNotInstalledError:
+                return None, [TextContent(
+                    type="text",
+                    text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+                )]
+            except BridgeTimeoutError:
+                return None, [TextContent(
+                    type="text",
+                    text="darktable not running, or plugin not loaded. Open darktable and try again.",
+                )]
+            except BridgeError as e:
+                return None, [TextContent(type="text", text=f"Plugin error: {e}")]
+            if result.get("error"):
+                return None, [TextContent(
+                    type="text",
+                    text=f"mask_object: backtransform_point(polygon[{i}]): {result['error']}",
+                )]
+            mask_points.append({"x": result["x"], "y": result["y"]})
+        return mask_points, None
+
     async def _handle_get_preview(self, arguments: Dict[str, Any]) -> List[Any]:
         max_w = int(arguments.get("max_w", 1024))
         max_h = int(arguments.get("max_h", 1024))
@@ -5359,9 +5420,11 @@ class DarktableMCPServer:
         opacity = float(arguments.get("opacity", 1.0))
         new_instance = bool(arguments.get("new_instance", True))
 
-        # (a) full-frame preview -- the sidecar's coords line up 1:1 with
-        # this render, so the polygon it returns is directly valid for
-        # add_path_mask without any rescaling.
+        # (a) full-frame preview -- the sidecar segments THIS render, so its
+        # polygon comes back normalized in the same DISPLAY/PROCESSED frame
+        # (fine for the overlay drawn on this same image below). It is NOT
+        # yet valid for add_path_mask, which stores PIPE-INPUT/mask-frame
+        # coordinates -- see step (b2)/_backtransform_polygon_to_mask_space.
         try:
             preview_result = self.bridge.call(
                 "dev_preview", {"max_w": 2048, "max_h": 2048}, timeout=20.0
@@ -5412,6 +5475,15 @@ class DarktableMCPServer:
                 ),
             )]
 
+        # (b2) frame fix -- convert the sidecar's display-frame polygon into
+        # the mask-frame points add_path_mask actually stores (see
+        # _backtransform_polygon_to_mask_space's doc comment). Must happen
+        # before add_instance so a bad backtransform never leaves an orphan
+        # module instance behind.
+        mask_polygon, backtransform_err = self._backtransform_polygon_to_mask_space(polygon)
+        if backtransform_err is not None:
+            return backtransform_err
+
         # (c) add_instance, if requested -- from here on, ANY failure must
         # roll back this instance before returning (no orphan module).
         instance = 0
@@ -5433,7 +5505,7 @@ class DarktableMCPServer:
         try:
             mask_result = self.bridge.call(
                 "dev_add_path_mask",
-                {"op": op, "instance": instance, "points": polygon, "opacity": opacity},
+                {"op": op, "instance": instance, "points": mask_polygon, "opacity": opacity},
                 timeout=15.0,
             )
             mask_err = mask_result.get("error")
@@ -5477,7 +5549,8 @@ class DarktableMCPServer:
             f"  segmentation backend: {seg.get('backend')} "
             f"({'precise SAM2' if seg.get('backend') == 'sam2' else 'rough zero-install fallback'})",
             f"  polygon: {len(polygon)} nodes, score={seg.get('score')}, "
-            f"bbox={json.dumps(seg.get('bbox'))}",
+            f"bbox_display_frame={json.dumps(seg.get('bbox'))} "
+            f"bbox_mask_frame={json.dumps(_polygon_bbox(mask_polygon))}",
             f"  mask_id={mask_result.get('mask_id')} opacity={mask_result.get('opacity')}",
             f"  applied: {json.dumps(set_result.get('applied') or {})}",
         ]

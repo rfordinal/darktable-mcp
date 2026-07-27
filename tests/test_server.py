@@ -1691,3 +1691,148 @@ async def test_handle_preview_lut_opacity_refused_when_already_masked(tmp_path):
     methods_called = [c.args[0] for c in server.bridge.call.call_args_list]
     assert "dev_set_params" not in methods_called
     assert "dev_set_blend_params" not in methods_called
+
+
+# ---- mask_object: SAM2 polygon frame-mismatch fix (2026-07-27 bugreport) ----
+# Bugreport: SAM2 body mask landed on a tree instead of the subject on a
+# portrait ARW with an active `flip` module. Root cause: the sidecar
+# segments dev_preview's render (PROCESSED/DISPLAY frame) but add_path_mask
+# stores PIPE-INPUT/mask-frame points -- the exact mismatch already fixed
+# for retouch's target/source (2026-07-25) but never applied to mask_object.
+
+
+def _mask_object_bridge_router(polygon_len, backtransform_reply, new_instance=True):
+    """Build a side_effect list for server.bridge.call matching
+    _handle_mask_object's call order: dev_preview,
+    dev_backtransform_point * polygon_len (runs BEFORE add_instance, so a
+    bad backtransform never creates an orphan instance), [dev_add_instance],
+    dev_add_path_mask, dev_set_params, dev_preview (final)."""
+    calls = [{"path": "/tmp/preview.png"}]
+    calls.extend([backtransform_reply] * polygon_len)
+    if new_instance:
+        calls.append({"instance": 1})
+    calls.append({"ok": True, "mask_id": 555, "opacity": 1.0})
+    calls.append({"applied": {"exposure": 0.2}})
+    calls.append({"path": "/tmp/preview2.png"})
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_handle_mask_object_backtransforms_polygon_before_add_path_mask():
+    """Guards against regressing to the pre-fix bug: mask_object must convert
+    every sidecar polygon vertex through dev_backtransform_point before
+    writing it to add_path_mask, not pass the sidecar's display-frame
+    polygon straight through. Non-identity mock (simulating a portrait
+    orientation swap) proves the handler actually uses the backtransformed
+    output, not the raw sidecar value."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    sidecar_polygon = [{"x": 0.1, "y": 0.2}, {"x": 0.3, "y": 0.2}, {"x": 0.2, "y": 0.4}]
+    # Deliberately NOT equal to the sidecar input -- proves the handler uses
+    # the backtransform's output rather than the raw display-frame polygon.
+    backtransformed_reply = {"x": 0.9, "y": 0.05}
+    server.bridge.call.side_effect = _mask_object_bridge_router(
+        len(sidecar_polygon), backtransformed_reply
+    )
+
+    with patch(
+        "darktable_mcp.server.run_segmentation",
+        return_value={
+            "polygon": sidecar_polygon,
+            "bbox": {"x": 0.1, "y": 0.2, "w": 0.2, "h": 0.2},
+            "score": 0.86,
+            "backend": "sam2",
+        },
+    ):
+        result = await server._handle_mask_object({
+            "op": "exposure",
+            "adjustment": {"exposure": 0.2},
+            "box": {"x": 0.2, "y": 0.3, "w": 0.2, "h": 0.4},
+        })
+
+    text = result[0].text
+    assert "ok=True" in text
+
+    calls = server.bridge.call.call_args_list
+    methods_called = [c.args[0] for c in calls]
+    assert methods_called.count("dev_backtransform_point") == len(sidecar_polygon)
+
+    add_path_mask_call = next(c for c in calls if c.args[0] == "dev_add_path_mask")
+    written_points = add_path_mask_call.args[1]["points"]
+    assert len(written_points) == len(sidecar_polygon)
+    for pt in written_points:
+        assert pt == {"x": 0.9, "y": 0.05}
+    # Never the raw sidecar polygon straight through.
+    assert written_points != sidecar_polygon
+
+
+@pytest.mark.asyncio
+async def test_handle_mask_object_reports_both_frame_bboxes():
+    """Output must clearly label which bbox is display-frame (what the
+    sidecar segmented) vs mask-frame (what actually got written) -- the
+    bugreport's core complaint was that it could not tell these apart."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    sidecar_polygon = [{"x": 0.1, "y": 0.2}, {"x": 0.3, "y": 0.2}, {"x": 0.2, "y": 0.4}]
+    server.bridge.call.side_effect = _mask_object_bridge_router(
+        len(sidecar_polygon), {"x": 0.9, "y": 0.05}
+    )
+
+    with patch(
+        "darktable_mcp.server.run_segmentation",
+        return_value={
+            "polygon": sidecar_polygon,
+            "bbox": {"x": 0.1, "y": 0.2, "w": 0.2, "h": 0.2},
+            "score": 0.86,
+            "backend": "sam2",
+        },
+    ):
+        result = await server._handle_mask_object({
+            "op": "exposure",
+            "adjustment": {"exposure": 0.2},
+            "box": {"x": 0.2, "y": 0.3, "w": 0.2, "h": 0.4},
+        })
+
+    text = result[0].text
+    assert "bbox_display_frame=" in text
+    assert "bbox_mask_frame=" in text
+    # Mask-frame bbox must reflect the (non-identity) backtransformed points,
+    # not the sidecar's display-frame bbox.
+    assert '"x": 0.9' in text.replace("'", '"') or "0.9" in text
+
+
+@pytest.mark.asyncio
+async def test_handle_mask_object_backtransform_failure_no_orphan_instance():
+    """If dev_backtransform_point errors mid-polygon, mask_object must fail
+    cleanly with no add_path_mask call. The backtransform step runs BEFORE
+    add_instance specifically so this failure mode can never create an
+    orphan module instance -- assert add_instance is never even reached."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    sidecar_polygon = [{"x": 0.1, "y": 0.2}, {"x": 0.3, "y": 0.2}, {"x": 0.2, "y": 0.4}]
+    server.bridge.call.side_effect = [
+        {"path": "/tmp/preview.png"},
+        {"x": 0.9, "y": 0.05},
+        {"error": "no darkroom image loaded"},
+    ]
+
+    with patch(
+        "darktable_mcp.server.run_segmentation",
+        return_value={
+            "polygon": sidecar_polygon,
+            "bbox": {"x": 0.1, "y": 0.2, "w": 0.2, "h": 0.2},
+            "score": 0.86,
+            "backend": "sam2",
+        },
+    ):
+        result = await server._handle_mask_object({
+            "op": "exposure",
+            "adjustment": {"exposure": 0.2},
+            "box": {"x": 0.2, "y": 0.3, "w": 0.2, "h": 0.4},
+        })
+
+    text = result[0].text
+    assert "backtransform_point(polygon[1])" in text
+    methods_called = [c.args[0] for c in server.bridge.call.call_args_list]
+    assert "dev_add_instance" not in methods_called
+    assert "dev_add_path_mask" not in methods_called
