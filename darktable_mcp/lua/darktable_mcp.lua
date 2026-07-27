@@ -2,7 +2,7 @@
 -- tag_photo, list_collections, list_photos_in_collection (tag-backed --
 -- darktable's Lua API has no separate "collection" object), and the
 -- darktable.develop.* darkroom-editing bridge (open_darkroom,
--- dev_version, dev_active_modules, dev_current_image, dev_get_params,
+-- dev_version, dev_active_modules, dev_current_image, dev_get_conf_string, dev_get_params,
 -- dev_set_params, dev_preview, dev_history_count, dev_enable_module,
 -- dev_add_instance, dev_get_viewport, dev_add_path_mask,
 -- dev_remove_last_instance, dev_set_raster_source) to the Python MCP server via file-based JSON
@@ -642,6 +642,17 @@ methods.dev_current_image = function(p)
   return dt.develop.current_image()
 end
 
+-- Read-only passthrough to an arbitrary core dt_conf key, e.g.
+-- "plugins/darkroom/lut3d/def_path" (the lut3d module's configured LUT root
+-- directory -- same key the UI file-chooser widget reads). Returns the raw
+-- string verbatim ("" if the key resolves to an empty default -- never nil).
+methods.dev_get_conf_string = function(p)
+  p = p or {}
+  local key = p.key
+  if not key or key == "" then error("dev_get_conf_string: key required") end
+  return dt.develop.get_conf_string(key)
+end
+
 -- Typed field map for one module instance (PLAN.md §3.1): scalar fields come
 -- back as {value, min, max, default}. Returns the C result verbatim --
 -- {op, instance, id, fields=...} on success, {error=...} if op/instance is
@@ -666,6 +677,30 @@ methods.dev_set_params = function(p)
   local fields = p.fields
   if type(fields) ~= "table" then error("dev_set_params: fields table required") end
   return dt.develop.set_params(op, instance, fields)
+end
+
+-- Read-only blend_params snapshot (opacity, mask_mode, blend_mode). Separate
+-- from dev_get_params: blend_params is a plain struct outside module
+-- introspection (LUT tooling, 2026-07-26 -- see get_blend_params_cb).
+methods.dev_get_blend_params = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_get_blend_params: op required") end
+  local instance = tonumber(p.instance) or 0
+  return dt.develop.get_blend_params(op, instance)
+end
+
+-- Write blend_params fields (opacity 0..100, blend_mode raw int,
+-- enable_uniform_blend convenience bool) and commit to history. See
+-- set_blend_params_cb for the enable_uniform_blend all-or-nothing contract.
+methods.dev_set_blend_params = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_set_blend_params: op required") end
+  local instance = tonumber(p.instance) or 0
+  local fields = p.fields
+  if type(fields) ~= "table" then error("dev_set_blend_params: fields table required") end
+  return dt.develop.set_blend_params(op, instance, fields)
 end
 
 -- Read-only history entry count for the open image (used to confirm history
@@ -717,11 +752,24 @@ end
 -- second exposure instance, a second sharpen for a specific area, etc).
 -- Returns the C result verbatim: {ok, op, instance=<new multi_priority>,
 -- base_instance, multi_name} | {error=...}.
+-- `fields` (optional): initial param overrides applied to the new instance
+-- right after duplication, via the same introspection write path as
+-- dev_set_params -- see add_instance_cb's doc comment (src/lua/develop.c) for
+-- why this collapses into ONE history entry instead of the duplicate's own
+-- commit plus a separate later dev_set_params call. Use this for modules
+-- whose reload_defaults() gives a fresh instance different defaults than the
+-- base instance it was cloned from (exposure's compensate_exposure_bias/
+-- compensate_hilite_pres is the motivating case) -- dt_iop_gui_duplicate's
+-- copy_params=TRUE clobbers those with the BASE instance's values otherwise.
 methods.dev_add_instance = function(p)
   p = p or {}
   local op = p.op
   if not op or op == "" then error("dev_add_instance: op required") end
-  return dt.develop.add_instance(op)
+  local fields = p.fields
+  if fields ~= nil and type(fields) ~= "table" then
+    error("dev_add_instance: fields must be a table if given")
+  end
+  return dt.develop.add_instance(op, fields)
 end
 
 -- Build a drawn PATH mask from a normalized polygon and attach it to a
@@ -962,6 +1010,72 @@ methods.dev_set_raster_source = function(p)
     return dt.develop.set_raster_source(cop, cinst, sop, sinst, tonumber(p.opacity))
   end
   return dt.develop.set_raster_source(cop, cinst, sop, sinst)
+end
+
+-- Read-only enumeration of the drawn masks wired into ONE module instance's
+-- blend group (mask_id/type/opacity/nb_points/name/operation/invert per
+-- shape) -- the per-module half of get_module_mask; combine with
+-- dev_get_blend_params (group-level opacity/mask_mode/blend_mode/invert) for
+-- the full picture. Returns [] when the module has no drawn masks.
+methods.dev_list_masks = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_list_masks: op required") end
+  local instance = tonumber(p.instance) or 0
+  return dt.develop.list_masks(op, instance)
+end
+
+-- Read-only enumeration of EVERY drawn mask shape in the current image,
+-- independent of which module currently uses it -- so a caller can find a
+-- shape drawn earlier (by hand in the GUI, or by another tool this session)
+-- and attach it to a NEW module instance via dev_attach_mask, instead of
+-- guessing a formid or redrawing it. Each entry also reports `used_by`
+-- ({op, instance} pairs) so a caller can see who else already references it.
+methods.dev_list_all_masks = function(p)
+  return dt.develop.list_all_masks()
+end
+
+-- Wire an EXISTING drawn mask shape (formid, from dev_list_all_masks or the
+-- return value of dev_add_path_mask/dev_mask_object/dev_retouch_add_shape)
+-- into module (op, instance)'s blend group WITHOUT copying it -- the shape
+-- stays one dev->forms entry, now referenced by this module's group in
+-- ADDITION to whatever already referenced it (the same shape can back
+-- several modules at once). `operation` (default "union") selects how this
+-- shape combines with whatever else is already in the group: "union",
+-- "intersection", "difference", "exclusion".
+--
+-- Also ORs DEVELOP_MASK_MASK|DEVELOP_MASK_ENABLED into blend_params->
+-- mask_mode (bugreport 2026-07-27: wiring the group reference alone left
+-- the mask inert -- dt_dev_pixelpipe's _piece_wants_blending gates the
+-- actual blend on DEVELOP_MASK_ENABLED, so the shape existed but had no
+-- visible effect until the pencil icon was clicked by hand). The returned
+-- `mask_mode` is read back from the live struct after the write, so a
+-- caller can verify it stuck instead of trusting the call silently.
+methods.dev_attach_mask = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_attach_mask: op required") end
+  local instance = tonumber(p.instance) or 0
+  local formid = tonumber(p.formid)
+  if formid == nil then error("dev_attach_mask: formid required") end
+  local operation = p.operation
+  return dt.develop.attach_mask(op, instance, formid, operation)
+end
+
+-- Unwire a drawn mask shape from module (op, instance)'s blend group WITHOUT
+-- deleting the shape itself -- it stays in dev->forms and can be re-attached
+-- (to this module or another) via dev_attach_mask. If this was the LAST shape
+-- in the group, darktable's own dt_masks_form_remove cascades into deleting
+-- the now-empty group, which resets EVERY module referencing it back to "no
+-- mask" -- expected, mirrors the GUI's own "no masks" action exactly.
+methods.dev_detach_mask = function(p)
+  p = p or {}
+  local op = p.op
+  if not op or op == "" then error("dev_detach_mask: op required") end
+  local instance = tonumber(p.instance) or 0
+  local formid = tonumber(p.formid)
+  if formid == nil then error("dev_detach_mask: formid required") end
+  return dt.develop.detach_mask(op, instance, formid)
 end
 
 -- ---- Dispatch --------------------------------------------------------------

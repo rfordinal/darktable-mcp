@@ -163,6 +163,65 @@ stub_dt.develop = {
     if len2 ~= nil then out.len2 = len2 end
     return out
   end,
+  -- LUT tooling (2026-07-26): reads an arbitrary core conf key. Stub returns
+  -- a canned lut3d root path for the one key the tests exercise, "" for
+  -- anything else (matches the real C binding's never-nil contract).
+  get_conf_string = function(key)
+    table.insert(develop_calls, {name = "get_conf_string", args = {key}})
+    if key == "plugins/darkroom/lut3d/def_path" then
+      return "/tmp/luts"
+    end
+    return ""
+  end,
+  -- Blend opacity control (2026-07-26): lut3d has no "amount" of its own, so
+  -- intensity control goes through blend_params instead of module params.
+  get_blend_params = function(op, instance)
+    table.insert(develop_calls, {name = "get_blend_params", args = {op, instance}})
+    return {op = op, instance = instance, opacity = 100.0, mask_mode = 0, blend_mode = 3}
+  end,
+  set_blend_params = function(op, instance, fields)
+    table.insert(develop_calls, {name = "set_blend_params", args = {op, instance, fields}})
+    return {
+      ok = true, op = op, instance = instance,
+      opacity = fields.opacity or 100.0,
+      mask_mode = fields.enable_uniform_blend and 1 or 0,
+      blend_mode = fields.blend_mode or 3,
+      invert = fields.invert or false,
+    }
+  end,
+  -- Mask group management (2026-07-27): attach/detach an EXISTING shape to a
+  -- module's blend group without copying it, plus global/per-module listing.
+  add_instance = function(op, fields)
+    table.insert(develop_calls, {name = "add_instance", args = {op, fields}})
+    local result = {ok = true, op = op, instance = 1, base_instance = 0, multi_name = ""}
+    if fields ~= nil then
+      result.fields_applied = {ok = true, applied = fields, clamped = {}, unknown_fields = {}}
+    end
+    return result
+  end,
+  list_masks = function(op, instance)
+    table.insert(develop_calls, {name = "list_masks", args = {op, instance}})
+    return {
+      {mask_id = 42, type = "circle", opacity = 1.0, nb_points = 1, name = "circle 1",
+       module = op, instance = instance, operation = "union", invert = false},
+    }
+  end,
+  list_all_masks = function()
+    table.insert(develop_calls, {name = "list_all_masks", args = {}})
+    return {
+      {formid = 42, name = "circle 1", type = "circle", used_by = {{op = "retouch", instance = 0}}},
+    }
+  end,
+  attach_mask = function(op, instance, formid, operation)
+    table.insert(develop_calls, {name = "attach_mask", args = {op, instance, formid, operation}})
+    -- mask_mode=3 = DEVELOP_MASK_ENABLED|DEVELOP_MASK_MASK, matching the real
+    -- C binding's post-2026-07-27-fix behavior (see attach_mask_cb).
+    return {ok = true, op = op, instance = instance, formid = formid, operation = operation or "union", mask_mode = 3}
+  end,
+  detach_mask = function(op, instance, formid)
+    table.insert(develop_calls, {name = "detach_mask", args = {op, instance, formid}})
+    return {ok = true, op = op, instance = instance, formid = formid}
+  end,
 }
 
 -- Make `require("darktable")` return our stub by pre-populating package.loaded.
@@ -520,6 +579,171 @@ do
   local ok, err = pcall(internals.methods.dev_transform_point, {x = 0.4})
   assertTrue(not ok, "dev_transform_point errors without y")
   assertTrue(string.find(err or "", "x/y") ~= nil, "error mentions x/y")
+end
+
+-- ---- methods.dev_get_conf_string: LUT tooling (2026-07-26), needed to read
+-- the lut3d module's configured root dir (plugins/darkroom/lut3d/def_path)
+-- so list_luts scans the SAME directory as the darktable UI dropdown.
+do
+  develop_calls = {}
+  local result = internals.methods.dev_get_conf_string({key = "plugins/darkroom/lut3d/def_path"})
+  assertEq(result, "/tmp/luts", "dev_get_conf_string forwards the C return value")
+  local call = develop_calls[1]
+  assertEq(call.name, "get_conf_string", "correct C function called")
+  assertEq(call.args[1], "plugins/darkroom/lut3d/def_path", "key forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_get_conf_string, {})
+  assertTrue(not ok, "dev_get_conf_string errors without key")
+  assertTrue(string.find(err or "", "key") ~= nil, "error mentions key")
+end
+
+-- ---- methods.dev_get_blend_params / dev_set_blend_params: blend opacity
+-- control (2026-07-26), needed for LUT intensity since lut3d has no "amount"
+-- of its own -- blend_params is a separate flat struct from module params.
+do
+  develop_calls = {}
+  local result = internals.methods.dev_get_blend_params({op = "lut3d", instance = 0})
+  assertEq(result.opacity, 100.0, "dev_get_blend_params forwards opacity")
+  local call = develop_calls[1]
+  assertEq(call.name, "get_blend_params", "correct C function called")
+  assertEq(call.args[1], "lut3d", "op forwarded")
+  assertEq(call.args[2], 0, "instance forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_get_blend_params, {})
+  assertTrue(not ok, "dev_get_blend_params errors without op")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_set_blend_params({
+    op = "lut3d", instance = 0,
+    fields = {opacity = 35.0, enable_uniform_blend = true},
+  })
+  assertEq(result.ok, true, "dev_set_blend_params reports ok")
+  assertEq(result.opacity, 35.0, "dev_set_blend_params forwards opacity")
+  local call = develop_calls[1]
+  assertEq(call.name, "set_blend_params", "correct C function called")
+  assertEq(call.args[3].opacity, 35.0, "fields forwarded")
+  assertEq(call.args[3].enable_uniform_blend, true, "enable_uniform_blend forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_set_blend_params, {op = "lut3d", instance = 0})
+  assertTrue(not ok, "dev_set_blend_params errors without fields")
+  assertTrue(string.find(err or "", "fields") ~= nil, "error mentions fields")
+end
+
+-- ---- methods.dev_add_instance: fields={} initial-param overrides
+-- (2026-07-27) -- exposure's compensate_exposure_bias/compensate_hilite_pres
+-- must be settable on the NEW instance without a second history entry.
+do
+  develop_calls = {}
+  local result = internals.methods.dev_add_instance({op = "exposure"})
+  assertEq(result.instance, 1, "dev_add_instance without fields forwards result")
+  local call = develop_calls[1]
+  assertEq(call.name, "add_instance", "correct C function called")
+  assertEq(call.args[1], "exposure", "op forwarded")
+  assertTrue(call.args[2] == nil, "no fields table forwarded when fields omitted")
+  assertTrue(result.fields_applied == nil, "no fields_applied when fields omitted")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_add_instance({
+    op = "exposure",
+    fields = {compensate_exposure_bias = false, compensate_hilite_pres = false},
+  })
+  local call = develop_calls[1]
+  assertEq(call.args[2].compensate_exposure_bias, false, "fields forwarded to C call")
+  assertTrue(result.fields_applied ~= nil, "fields_applied present when fields given")
+  assertEq(result.fields_applied.applied.compensate_hilite_pres, false,
+    "fields_applied echoes the applied field")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_add_instance, {op = "exposure", fields = "not-a-table"})
+  assertTrue(not ok, "dev_add_instance errors when fields is not a table")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_add_instance, {})
+  assertTrue(not ok, "dev_add_instance errors without op")
+end
+
+-- ---- methods.dev_list_masks / dev_list_all_masks / dev_attach_mask /
+-- dev_detach_mask: mask group management (2026-07-27) -- attach/detach an
+-- EXISTING shape to a module's blend group without copying it. -----------
+do
+  develop_calls = {}
+  local result = internals.methods.dev_list_masks({op = "retouch", instance = 0})
+  assertEq(#result, 1, "dev_list_masks forwards the C result")
+  assertEq(result[1].operation, "union", "dev_list_masks includes operation")
+  local call = develop_calls[1]
+  assertEq(call.name, "list_masks", "correct C function called")
+  assertEq(call.args[1], "retouch", "op forwarded")
+  assertEq(call.args[2], 0, "instance forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_list_masks, {})
+  assertTrue(not ok, "dev_list_masks errors without op")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_list_all_masks({})
+  assertEq(#result, 1, "dev_list_all_masks forwards the C result")
+  assertEq(result[1].formid, 42, "dev_list_all_masks includes formid")
+  assertEq(result[1].used_by[1].op, "retouch", "dev_list_all_masks includes used_by")
+  assertEq(develop_calls[1].name, "list_all_masks", "correct C function called")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_attach_mask({op = "exposure", instance = 1, formid = 42})
+  assertEq(result.ok, true, "dev_attach_mask reports ok")
+  local call = develop_calls[1]
+  assertEq(call.name, "attach_mask", "correct C function called")
+  assertEq(call.args[1], "exposure", "op forwarded")
+  assertEq(call.args[2], 1, "instance forwarded")
+  assertEq(call.args[3], 42, "formid forwarded")
+  assertTrue(call.args[4] == nil, "operation omitted forwards nil (C defaults to union)")
+end
+
+do
+  develop_calls = {}
+  internals.methods.dev_attach_mask({op = "exposure", instance = 1, formid = 42, operation = "difference"})
+  local call = develop_calls[1]
+  assertEq(call.args[4], "difference", "operation forwarded when given")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_attach_mask, {op = "exposure", instance = 1})
+  assertTrue(not ok, "dev_attach_mask errors without formid")
+  assertTrue(string.find(err or "", "formid") ~= nil, "error mentions formid")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_attach_mask, {formid = 42})
+  assertTrue(not ok, "dev_attach_mask errors without op")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_detach_mask({op = "exposure", instance = 1, formid = 42})
+  assertEq(result.ok, true, "dev_detach_mask reports ok")
+  local call = develop_calls[1]
+  assertEq(call.name, "detach_mask", "correct C function called")
+  assertEq(call.args[3], 42, "formid forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_detach_mask, {op = "exposure", instance = 1})
+  assertTrue(not ok, "dev_detach_mask errors without formid")
 end
 
 -- ---- methods.tag_photo ------------------------------------------------------

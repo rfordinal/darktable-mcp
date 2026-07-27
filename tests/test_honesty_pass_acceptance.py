@@ -45,9 +45,19 @@ EXPECTED_TOOLS = {
     "list_modules",
     "get_params",
     "set_params",
+    # LUT tooling (2026-07-26): blend_params is a separate flat struct from
+    # module params, needed since lut3d has no "amount" of its own.
+    "get_blend_params",
+    "set_blend_params",
     "get_preview",
     # T1.7: enable/instance/viewport wiring (see PLAN.md §5 T1.7).
     "enable_module",
+    # LUT tooling (2026-07-26): list the lut3d module's configured LUT root
+    # (same conf key the UI's own file-chooser dropdown reads), try a LUT
+    # without a lasting edit, and compare several side by side.
+    "list_luts",
+    "preview_lut",
+    "compare_luts",
     "add_instance",
     "get_viewport",
     # Viewport-relative retouch (2026-07-25 design proposal): capture a
@@ -71,6 +81,15 @@ EXPECTED_TOOLS = {
     # because darktable's own mask overlay is painted on the GUI widget and is
     # absent from every buffer we can capture (see retouch_overlay.py).
     "retouch_render_overlay",
+    # Mask group management (2026-07-27): attach/detach an EXISTING drawn
+    # shape to/from a module's blend group without copying it, so hand-drawn
+    # shapes or shapes from other tools can be shared across new module
+    # instances instead of redrawn per instance.
+    "list_masks",
+    "get_module_mask",
+    "attach_mask",
+    "detach_mask",
+    "set_module_mask",
 }
 
 

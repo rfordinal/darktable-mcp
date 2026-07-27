@@ -1,5 +1,6 @@
 """Tests for the main MCP server."""
 
+import json
 import os
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -52,8 +53,13 @@ class TestDarktableMCPServer:
             "list_modules",
             "get_params",
             "set_params",
+            "get_blend_params",
+            "set_blend_params",
             "get_preview",
             "enable_module",
+            "list_luts",
+            "preview_lut",
+            "compare_luts",
             "add_instance",
             "get_viewport",
             "capture_viewport",
@@ -67,6 +73,11 @@ class TestDarktableMCPServer:
             "retouch_render_overlay",
             "mask_object",
             "mask_raster",
+            "list_masks",
+            "get_module_mask",
+            "attach_mask",
+            "detach_mask",
+            "set_module_mask",
         }
         assert set(server.list_tools()) == expected_tools
 
@@ -1152,3 +1163,531 @@ async def test_retouch_list_shapes_reports_both_frames():
     assert "opacity=1.0" in text
     assert "display frame: target=(0.5,0.5)" in text
     assert "retouch_render_overlay" in text
+
+
+# ---- list_luts / preview_lut / compare_luts (2026-07-26) -------------------
+
+LUT3D_SNAPSHOT_FIELDS = {
+    "filepath": "",
+    "lutname": "",
+    "colorspace": {"value": 0, "label": "DT_IOP_SRGB", "options": ["DT_IOP_SRGB", "DT_IOP_LIN_REC709"]},
+    "interpolation": {"value": 0, "label": "DT_IOP_TETRAHEDRAL", "options": ["DT_IOP_TETRAHEDRAL", "DT_IOP_TRILINEAR"]},
+}
+
+
+def _lut3d_bridge_router(root_dir, preview_path="/run/cache-mcp/preview.png", blend_mask_mode=0, blend_opacity=100.0):
+    """A bridge.call side_effect that plays the real sequence
+    _lut3d_preview_once drives: active_modules -> get_params -> [get_blend_params]
+    -> set_params (apply) -> [set_blend_params] -> preview -> set_params
+    (restore) -> [set_blend_params restore]. Routes purely on method name +
+    fields content since dev_set_params/dev_set_blend_params are each called
+    twice with different args but the same method name.
+
+    blend_mask_mode/blend_opacity seed the module's PRIOR blend state (as
+    dev_get_blend_params would report it) -- tests use this to simulate an
+    already-masked instance (mask_mode not in (0,1), the opacity refusal
+    case) or a plain never-blended one (the default, mask_mode=0)."""
+    state = {"mask_mode": blend_mask_mode, "opacity": blend_opacity}
+
+    def _router(method, params=None, timeout=None):
+        params = params or {}
+        if method == "dev_get_conf_string":
+            return root_dir
+        if method == "dev_active_modules":
+            return {"modules": [{"op": "lut3d", "instance": 0, "enabled": False}]}
+        if method == "dev_get_params":
+            return {"op": "lut3d", "instance": 0, "fields": dict(LUT3D_SNAPSHOT_FIELDS)}
+        if method == "dev_set_params":
+            fields = params.get("fields", {})
+            return {"ok": True, "applied": fields, "clamped": [], "unknown_fields": []}
+        if method == "dev_get_blend_params":
+            return {"op": "lut3d", "instance": 0, "opacity": state["opacity"], "mask_mode": state["mask_mode"], "blend_mode": 3}
+        if method == "dev_set_blend_params":
+            fields = params.get("fields", {})
+            if "opacity" in fields:
+                state["opacity"] = fields["opacity"]
+            if "enable_uniform_blend" in fields:
+                state["mask_mode"] = 1 if fields["enable_uniform_blend"] else 0
+            return {"ok": True, "op": "lut3d", "instance": 0, "opacity": state["opacity"], "mask_mode": state["mask_mode"], "blend_mode": 3}
+        if method == "dev_preview":
+            return {"status": "ok", "path": preview_path, "width": 100, "height": 75}
+        raise AssertionError(f"unexpected bridge call: {method}")
+    return _router
+
+
+@pytest.mark.asyncio
+async def test_handle_list_luts_lists_files(tmp_path):
+    (tmp_path / "FG").mkdir()
+    (tmp_path / "FG" / "FGCineBasic.cube").write_text("")
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = str(tmp_path)
+    result = await server._handle_list_luts({})
+    text = result[0].text
+    assert "FGCineBasic" in text
+    assert "FG/FGCineBasic.cube" in text
+    server.bridge.call.assert_called_once_with(
+        "dev_get_conf_string", {"key": "plugins/darkroom/lut3d/def_path"}, timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_list_luts_not_configured():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = ""
+    result = await server._handle_list_luts({})
+    assert "def_path is not set" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_preview_lut_applies_and_restores(tmp_path):
+    (tmp_path / "FG").mkdir()
+    (tmp_path / "FG" / "a.cube").write_text("")
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = _lut3d_bridge_router(str(tmp_path))
+
+    with patch("darktable_mcp.server._remap_bridge_path", side_effect=lambda p: p), \
+         patch("darktable_mcp.server._inline_image_content", return_value=None):
+        result = await server._handle_preview_lut({"path": "FG/a.cube"})
+
+    text = result[-1].text
+    assert "ok=True" in text
+    assert "restored" in text
+
+    calls = server.bridge.call.call_args_list
+    apply_call = next(c for c in calls if c.args[0] == "dev_set_params" and c.args[1]["fields"].get("filepath") == "FG/a.cube")
+    assert apply_call.args[1]["fields"]["enabled"] is True
+    restore_call = calls[-1]
+    assert restore_call.args[0] == "dev_set_params"
+    # Restored to the snapshot taken before applying -- empty filepath,
+    # disabled (the router's dev_active_modules said enabled=False).
+    assert restore_call.args[1]["fields"]["filepath"] == ""
+    assert restore_call.args[1]["fields"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_preview_lut_missing_file_never_touches_lut3d(tmp_path):
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = _lut3d_bridge_router(str(tmp_path))
+    result = await server._handle_preview_lut({"path": "FG/missing.cube"})
+    text = result[0].text
+    assert "not found" in text
+    # Only the conf-string lookup should have happened -- no set_params, no
+    # active_modules, nothing applied to a nonexistent file.
+    methods_called = [c.args[0] for c in server.bridge.call.call_args_list]
+    assert methods_called == ["dev_get_conf_string"]
+
+
+@pytest.mark.asyncio
+async def test_handle_preview_lut_requires_path():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_preview_lut({})
+    assert "path is required" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_luts_mixed_success_and_missing_file(tmp_path):
+    (tmp_path / "a.cube").write_text("")
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = _lut3d_bridge_router(str(tmp_path))
+
+    with patch("darktable_mcp.server._remap_bridge_path", side_effect=lambda p: p), \
+         patch("darktable_mcp.server._inline_image_content", return_value=None):
+        result = await server._handle_compare_luts({"paths": ["a.cube", "missing.cube"]})
+
+    response = json.loads(result[-1].text)
+    assert response["requested"] == 2
+    assert response["succeeded"] == 1
+    assert response["failed"] == 1
+    items_by_path = {item["path"]: item for item in response["items"]}
+    assert items_by_path["a.cube"]["ok"] is True
+    assert items_by_path["missing.cube"]["ok"] is False
+    assert "not found" in items_by_path["missing.cube"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_handle_compare_luts_requires_nonempty_paths():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_compare_luts({"paths": []})
+    assert "non-empty" in result[0].text
+
+
+# ---- get_blend_params / set_blend_params (2026-07-26) ----------------------
+
+@pytest.mark.asyncio
+async def test_handle_get_blend_params_returns_result():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"op": "lut3d", "instance": 0, "opacity": 100.0, "mask_mode": 0, "blend_mode": 3}
+    result = await server._handle_get_blend_params({"op": "lut3d"})
+    assert "opacity" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_get_blend_params", {"op": "lut3d", "instance": 0}, timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_get_blend_params_requires_op():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_get_blend_params({})
+    assert "op is required" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_set_blend_params_forwards_fields():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"ok": True, "op": "lut3d", "instance": 0, "opacity": 35.0, "mask_mode": 1, "blend_mode": 3}
+    result = await server._handle_set_blend_params({
+        "op": "lut3d", "opacity": 0.35, "enable_uniform_blend": True,
+    })
+    assert "ok=True" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_set_blend_params",
+        {"op": "lut3d", "instance": 0, "fields": {"opacity": 0.35, "enable_uniform_blend": True}},
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_set_blend_params_requires_at_least_one_field():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_set_blend_params({"op": "lut3d"})
+    assert "at least one of" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+# ---- add_instance fields={} (2026-07-27) -----------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_add_instance_without_fields_omits_fields_from_call():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "op": "exposure", "instance": 1, "base_instance": 0, "multi_name": "",
+    }
+    result = await server._handle_add_instance({"op": "exposure"})
+    assert "new instance=1" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_add_instance", {"op": "exposure"}, timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_add_instance_forwards_fields_and_reports_applied():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "op": "exposure", "instance": 1, "base_instance": 0, "multi_name": "",
+        "fields_applied": {
+            "ok": True,
+            "applied": {"compensate_exposure_bias": False, "compensate_hilite_pres": False},
+            "clamped": [],
+            "unknown_fields": [],
+        },
+    }
+    result = await server._handle_add_instance({
+        "op": "exposure",
+        "fields": {"compensate_exposure_bias": False, "compensate_hilite_pres": False},
+    })
+    server.bridge.call.assert_called_once_with(
+        "dev_add_instance",
+        {"op": "exposure", "fields": {"compensate_exposure_bias": False, "compensate_hilite_pres": False}},
+        timeout=15.0,
+    )
+    assert "fields applied" in result[0].text
+    assert "compensate_hilite_pres" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_add_instance_rejects_non_dict_fields():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_add_instance({"op": "exposure", "fields": "nope"})
+    assert "must be an object" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+# ---- mask group management: list_masks/get_module_mask/attach_mask/
+# detach_mask/set_module_mask (2026-07-27) -----------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_list_masks_wraps_bare_array():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = [
+        {"formid": 42, "name": "circle 1", "type": "circle", "used_by": [{"op": "retouch", "instance": 0}]},
+    ]
+    result = await server._handle_list_masks({})
+    response = json.loads(result[0].text)
+    assert response["masks"][0]["formid"] == 42
+    server.bridge.call.assert_called_once_with("dev_list_all_masks", {}, timeout=15.0)
+
+
+@pytest.mark.asyncio
+async def test_handle_list_masks_empty_result():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = []
+    result = await server._handle_list_masks({})
+    response = json.loads(result[0].text)
+    assert response["masks"] == []
+
+
+@pytest.mark.asyncio
+async def test_handle_get_module_mask_merges_blend_params_and_shapes():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+
+    def router(method, params, timeout=None):
+        if method == "dev_get_blend_params":
+            return {"op": "exposure", "instance": 1, "opacity": 100.0, "mask_mode": 2, "blend_mode": 3, "invert": False}
+        if method == "dev_list_masks":
+            return [
+                {"mask_id": 42, "type": "circle", "opacity": 1.0, "nb_points": 1, "name": "circle 1",
+                 "module": "exposure", "instance": 1, "operation": "union", "invert": False},
+            ]
+        raise AssertionError(f"unexpected bridge call: {method}")
+
+    server.bridge.call.side_effect = router
+    result = await server._handle_get_module_mask({"op": "exposure", "instance": 1})
+    response = json.loads(result[0].text)
+    assert response["opacity"] == 100.0
+    assert response["shapes"][0]["mask_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_handle_get_module_mask_requires_op():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_get_module_mask({})
+    assert "op is required" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_attach_mask_forwards_args():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+
+    def router(method, params, timeout=None):
+        if method == "dev_attach_mask":
+            return {"ok": True, "op": "exposure", "instance": 1, "formid": 42, "operation": "union", "mask_mode": 3}
+        if method == "dev_get_blend_params":
+            return {"op": "exposure", "instance": 1, "opacity": 100.0, "mask_mode": 3, "blend_mode": 3, "invert": False}
+        raise AssertionError(f"unexpected bridge call: {method}")
+
+    server.bridge.call.side_effect = router
+    result = await server._handle_attach_mask({"op": "exposure", "instance": 1, "formid": 42})
+    assert "formid=42" in result[0].text
+    server.bridge.call.assert_any_call(
+        "dev_attach_mask",
+        {"op": "exposure", "instance": 1, "formid": 42, "operation": "union"},
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_attach_mask_warns_if_drawn_mask_not_enabled():
+    """Regression guard for the 2026-07-27 bugreport: attaching a shape wired
+    the group reference but left mask_mode's DEVELOP_MASK_MASK bit off, so the
+    mask existed but had zero visible effect until the user clicked the
+    pencil icon by hand. attach_mask must verify via an INDEPENDENT
+    get_blend_params read, not just trust its own reported mask_mode."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+
+    def router(method, params, timeout=None):
+        if method == "dev_attach_mask":
+            # Reports mask_mode=3 (bit set) but the independent verify read
+            # disagrees -- the WARNING must come from the verify call, not
+            # from trusting attach_mask's own claim.
+            return {"ok": True, "op": "exposure", "instance": 1, "formid": 42, "operation": "union", "mask_mode": 3}
+        if method == "dev_get_blend_params":
+            return {"op": "exposure", "instance": 1, "opacity": 100.0, "mask_mode": 0, "blend_mode": 3, "invert": False}
+        raise AssertionError(f"unexpected bridge call: {method}")
+
+    server.bridge.call.side_effect = router
+    result = await server._handle_attach_mask({"op": "exposure", "instance": 1, "formid": 42})
+    assert "WARNING" in result[0].text
+    assert "NOT enabled" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_attach_mask_requires_formid():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_attach_mask({"op": "exposure"})
+    assert "formid" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_detach_mask_forwards_args():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"ok": True, "op": "exposure", "instance": 1, "formid": 42}
+    result = await server._handle_detach_mask({"op": "exposure", "instance": 1, "formid": 42})
+    assert "detached" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_detach_mask", {"op": "exposure", "instance": 1, "formid": 42}, timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_set_module_mask_attaches_new_and_detaches_missing():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    calls = []
+
+    def router(method, params, timeout=None):
+        calls.append((method, params))
+        if method == "dev_list_masks":
+            return [
+                {"mask_id": 1, "operation": "union"},
+                {"mask_id": 2, "operation": "union"},
+            ]
+        if method == "dev_attach_mask":
+            return {"ok": True, "formid": params["formid"], "operation": params["operation"]}
+        if method == "dev_detach_mask":
+            return {"ok": True, "formid": params["formid"]}
+        if method == "dev_get_blend_params":
+            return {"op": "exposure", "instance": 1, "opacity": 100.0, "mask_mode": 3, "blend_mode": 3, "invert": False}
+        raise AssertionError(f"unexpected bridge call: {method}")
+
+    server.bridge.call.side_effect = router
+    result = await server._handle_set_module_mask({
+        "op": "exposure", "instance": 1,
+        "shapes": [{"formid": 2, "operation": "union"}, {"formid": 3, "operation": "difference"}],
+    })
+    text = result[0].text
+    assert "attached=[3]" in text
+    assert "detached=[1]" in text
+    # formid=2 already present with the same operation -> untouched.
+    detach_targets = [p["formid"] for m, p in calls if m == "dev_detach_mask"]
+    attach_targets = [p["formid"] for m, p in calls if m == "dev_attach_mask"]
+    assert detach_targets == [1]
+    assert attach_targets == [3]
+
+
+@pytest.mark.asyncio
+async def test_handle_set_module_mask_reattaches_on_operation_change():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    calls = []
+
+    def router(method, params, timeout=None):
+        calls.append((method, params))
+        if method == "dev_list_masks":
+            return [{"mask_id": 1, "operation": "union"}]
+        if method == "dev_attach_mask":
+            return {"ok": True, "formid": params["formid"], "operation": params["operation"]}
+        if method == "dev_detach_mask":
+            return {"ok": True, "formid": params["formid"]}
+        if method == "dev_get_blend_params":
+            return {"op": "exposure", "instance": 1, "opacity": 100.0, "mask_mode": 3, "blend_mode": 3, "invert": False}
+        raise AssertionError(f"unexpected bridge call: {method}")
+
+    server.bridge.call.side_effect = router
+    result = await server._handle_set_module_mask({
+        "op": "exposure", "instance": 1,
+        "shapes": [{"formid": 1, "operation": "difference"}],
+    })
+    detach_targets = [p["formid"] for m, p in calls if m == "dev_detach_mask"]
+    attach_targets = [(p["formid"], p["operation"]) for m, p in calls if m == "dev_attach_mask"]
+    assert detach_targets == [1], "operation change must detach the stale link first"
+    assert attach_targets == [(1, "difference")]
+    assert "attached=[1]" in result[0].text
+    assert "detached=[1]" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_set_module_mask_forwards_opacity_and_invert():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+
+    def router(method, params, timeout=None):
+        if method == "dev_list_masks":
+            return []
+        if method == "dev_attach_mask":
+            return {"ok": True, "formid": params["formid"], "operation": params["operation"]}
+        if method == "dev_set_blend_params":
+            return {"ok": True, "opacity": params["fields"]["opacity"], "invert": params["fields"]["invert"]}
+        if method == "dev_get_blend_params":
+            return {"op": "exposure", "instance": 1, "opacity": 40.0, "mask_mode": 3, "blend_mode": 3, "invert": True}
+        raise AssertionError(f"unexpected bridge call: {method}")
+
+    server.bridge.call.side_effect = router
+    result = await server._handle_set_module_mask({
+        "op": "exposure", "instance": 1,
+        "shapes": [{"formid": 5}],
+        "opacity": 40.0, "invert": True,
+    })
+    assert "opacity=40.0" in result[0].text
+    assert "invert=True" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_set_module_mask_requires_shapes_list():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_set_module_mask({"op": "exposure", "shapes": "nope"})
+    assert "shapes must be a list" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+# ---- preview_lut/compare_luts opacity (blend) integration (2026-07-26) -----
+
+@pytest.mark.asyncio
+async def test_handle_preview_lut_opacity_applies_and_restores_blend(tmp_path):
+    (tmp_path / "a.cube").write_text("")
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = _lut3d_bridge_router(str(tmp_path), blend_mask_mode=0, blend_opacity=100.0)
+
+    with patch("darktable_mcp.server._remap_bridge_path", side_effect=lambda p: p), \
+         patch("darktable_mcp.server._inline_image_content", return_value=None):
+        result = await server._handle_preview_lut({"path": "a.cube", "opacity": 0.35})
+
+    assert "ok=True" in result[-1].text
+
+    calls = server.bridge.call.call_args_list
+    blend_calls = [c for c in calls if c.args[0] == "dev_set_blend_params"]
+    assert len(blend_calls) == 2, "one apply, one restore"
+    apply_fields = blend_calls[0].args[1]["fields"]
+    assert apply_fields["opacity"] == pytest.approx(35.0)
+    assert apply_fields["enable_uniform_blend"] is True
+    restore_fields = blend_calls[1].args[1]["fields"]
+    # Restored to the pre-call snapshot: opacity=100.0, mask_mode=0 -> disabled.
+    assert restore_fields["opacity"] == pytest.approx(100.0)
+    assert restore_fields["enable_uniform_blend"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_preview_lut_opacity_refused_when_already_masked(tmp_path):
+    (tmp_path / "a.cube").write_text("")
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    # mask_mode=3 (ENABLED|MASK) -- a drawn mask is already wired to this
+    # instance; enable_uniform_blend's all-or-nothing write would clobber it.
+    server.bridge.call.side_effect = _lut3d_bridge_router(str(tmp_path), blend_mask_mode=3, blend_opacity=80.0)
+
+    result = await server._handle_preview_lut({"path": "a.cube", "opacity": 0.5})
+    text = result[0].text
+    assert "already has a mask configured" in text
+
+    # Nothing should have been written -- get_blend_params was read-only, no
+    # set_params/set_blend_params call ever happened.
+    methods_called = [c.args[0] for c in server.bridge.call.call_args_list]
+    assert "dev_set_params" not in methods_called
+    assert "dev_set_blend_params" not in methods_called

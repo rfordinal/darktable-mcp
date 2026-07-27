@@ -49,6 +49,14 @@ from .tools.contact_sheet_tools import (
     write_sheet,
 )
 from .tools import retouch_overlay as overlay
+from .tools.lut_tools import (
+    LutRootNotConfiguredError,
+    compose_lut_compare_grid,
+    effective_cell_width,
+    parse_cube_header,
+    resolve_lut_path,
+    scan_lut_directory,
+)
 from .tools.segmentation_tools import run_segmentation
 from .utils.errors import DarktableMCPError, MattingServiceError, SegmentationServiceError
 from .utils.viewport_coords import (
@@ -130,6 +138,15 @@ def _matte_output_dir() -> Path:
 # (RAW formats -- CR2/NEF/ARW/RW2/...) needs a rendered substitute first,
 # see _handle_mask_raster's "(a) matting input" step.
 _DIRECT_MATTE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+
+# dt_develop_mask_mode_t bit (src-dt/src/develop/blend.h) that must be set
+# for a module's DRAWN mask group to actually apply during pixel processing
+# -- dt_dev_pixelpipe's _piece_wants_blending gates the blend call on
+# DEVELOP_MASK_ENABLED, and blend.c's own mode_drawn check needs this bit.
+# Used to verify attach_mask actually turned the mask on (bugreport
+# 2026-07-27: wiring the group reference alone left it inert until the user
+# clicked the pencil icon by hand), not just trust the write succeeded.
+_DEVELOP_MASK_MASK = 1 << 1
 
 
 def _inline_image_content(
@@ -320,6 +337,11 @@ class DarktableMCPServer:
 
         @self.app.call_tool()
         async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+            # The mcp library's own log line ("Processing request of type
+            # CallToolRequest") never names the tool, making the server's
+            # stdout useless for "what is actually being called right now"
+            # (2026-07-27 feedback). Log it ourselves, one line per call.
+            logger.info("tool call: %s(%s)", name, arguments)
             handler = self._handler_map.get(name)
             if handler is None:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -1057,6 +1079,276 @@ class DarktableMCPServer:
                 },
             ),
             Tool(
+                name="get_blend_params",
+                description=(
+                    "Read a module's BLEND state (opacity, blend mode, mask "
+                    "mode) -- a SEPARATE flat struct from the introspected "
+                    "fields get_params returns, so it needs its own tool. "
+                    "This is how you check/adjust a module's overall "
+                    "strength when the module itself has no 'amount' field "
+                    "of its own -- e.g. lut3d, which is otherwise all-or-"
+                    "nothing at 100%. opacity is 0..100 (percent, matches "
+                    "the GUI's own blend-opacity slider). mask_mode is a "
+                    "bitmask (0=off, 1=uniformly/opacity-only, higher bits = "
+                    "drawn/parametric/raster masks already set up by other "
+                    "tools -- treat it as informational here, see "
+                    "set_blend_params for the one safe write path)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "description": "Module operation name, e.g. 'lut3d' (see list_modules)",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the module instance; 0 = base instance",
+                        },
+                    },
+                    "required": ["op"],
+                },
+            ),
+            Tool(
+                name="set_blend_params",
+                description=(
+                    "Set a module's overall blend opacity (0..100 percent, "
+                    "e.g. 30 for a subtle LUT/effect, 100 for full strength) "
+                    "-- the fix for modules like lut3d that have no 'amount' "
+                    "of their own and are otherwise all-or-nothing. Pass "
+                    "enable_uniform_blend=true the FIRST time you set opacity "
+                    "on a module (mask_mode defaults to fully off, so opacity "
+                    "alone is a silent no-op until this is set once); it "
+                    "OVERWRITES mask_mode wholesale to plain uniform blending "
+                    "-- do NOT use this on a module you've masked via "
+                    "mask_object/mask_raster/retouch/set_raster_source, since "
+                    "it would clobber that mask wiring. Those tools manage "
+                    "their own blend_params bits directly; this one is for "
+                    "the simple 'run this module at X% strength, no mask' case."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "description": "Module operation name, e.g. 'lut3d' (see list_modules)",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the module instance; 0 = base instance",
+                        },
+                        "opacity": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "Blend opacity, 0..100 percent; clamped, never rejected",
+                        },
+                        "enable_uniform_blend": {
+                            "type": "boolean",
+                            "description": (
+                                "true: set mask_mode to plain uniform blending "
+                                "(opacity applies, no mask). false: disable "
+                                "blending entirely (module runs at native 100%, "
+                                "opacity ignored). Omit to leave mask_mode "
+                                "untouched -- only do this if you already know "
+                                "it's set up correctly."
+                            ),
+                        },
+                        "blend_mode": {
+                            "type": "integer",
+                            "description": "Advanced: raw dt_develop_blend_mode_t value; omit unless you specifically need a non-normal blend mode",
+                        },
+                    },
+                    "required": ["op"],
+                },
+            ),
+            Tool(
+                name="list_masks",
+                description=(
+                    "List EVERY drawn mask shape in the current image, "
+                    "regardless of which module(s) currently use it -- so you "
+                    "can find a shape drawn earlier (by hand in the GUI, or "
+                    "via add_path_mask/mask_object/retouch_add_shape earlier "
+                    "this session) and wire it into a NEW module instance "
+                    "with attach_mask, instead of guessing its formid or "
+                    "redrawing it. Each entry reports `used_by` (which "
+                    "op/instance pairs already reference this shape) -- a "
+                    "shape can legally back several modules at once."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="get_module_mask",
+                description=(
+                    "Read module (op, instance)'s full mask state in one "
+                    "call: the group-level opacity/mask_mode/blend_mode/"
+                    "invert (from get_blend_params) PLUS the list of drawn "
+                    "shapes wired into its blend group, each with its own "
+                    "boolean-combine operation (union/intersection/"
+                    "difference/exclusion) and per-shape invert. Use this "
+                    "before attach_mask/detach_mask to see what is already "
+                    "there, and after them to confirm the change landed."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "description": "Module operation name, e.g. 'exposure' (see list_modules)",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the module instance; 0 = base instance",
+                        },
+                    },
+                    "required": ["op"],
+                },
+            ),
+            Tool(
+                name="attach_mask",
+                description=(
+                    "Wire an EXISTING drawn mask shape (formid, from "
+                    "list_masks or the return value of add_path_mask/"
+                    "mask_object/retouch_add_shape) into module (op, "
+                    "instance)'s blend group WITHOUT copying it -- the same "
+                    "shape stays a single underlying object, now referenced "
+                    "by this module IN ADDITION to whatever already used it. "
+                    "Typical use: draw shapes once by hand in the GUI (or "
+                    "via add_path_mask), create several new module instances "
+                    "(add_instance), then attach the right shape(s) to each "
+                    "instance's mask instead of redrawing per instance. Fails "
+                    "loudly if formid does not exist or the module does not "
+                    "support blending -- never silently no-ops. Also turns "
+                    "the module's drawn-mask blend bit ON (equivalent to "
+                    "clicking the mask pencil icon in the GUI) and verifies "
+                    "it stuck by reading blend params back -- otherwise the "
+                    "shape would be wired in but invisible/inactive until "
+                    "someone toggled it by hand."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "description": "Module operation name, e.g. 'exposure' (see list_modules)",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the module instance; 0 = base instance",
+                        },
+                        "formid": {
+                            "type": "integer",
+                            "description": "Shape id to attach, from list_masks() or a mask-creating tool's return value",
+                        },
+                        "operation": {
+                            "type": "string",
+                            "enum": ["union", "intersection", "difference", "exclusion"],
+                            "default": "union",
+                            "description": (
+                                "How this shape combines with whatever else "
+                                "is already in the module's mask group. "
+                                "Irrelevant for the first shape attached to "
+                                "an empty group."
+                            ),
+                        },
+                    },
+                    "required": ["op", "formid"],
+                },
+            ),
+            Tool(
+                name="detach_mask",
+                description=(
+                    "Unwire a drawn mask shape from module (op, instance)'s "
+                    "blend group WITHOUT deleting the shape itself -- it "
+                    "stays available in list_masks() and can be re-attached "
+                    "(to this module or a different one) via attach_mask. If "
+                    "this was the LAST shape in the group, the module's mask "
+                    "is fully cleared (mirrors the GUI's own 'no masks' "
+                    "action) -- expected, not an error."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "description": "Module operation name, e.g. 'exposure' (see list_modules)",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the module instance; 0 = base instance",
+                        },
+                        "formid": {
+                            "type": "integer",
+                            "description": "Shape id to detach, from get_module_mask/list_masks",
+                        },
+                    },
+                    "required": ["op", "formid"],
+                },
+            ),
+            Tool(
+                name="set_module_mask",
+                description=(
+                    "Replace module (op, instance)'s ENTIRE set of attached "
+                    "shapes in one call: shapes not in the new list are "
+                    "detached (not deleted -- still available for other "
+                    "modules), shapes in the new list that are not yet "
+                    "attached are attached, and shapes already attached with "
+                    "a DIFFERENT operation are re-attached with the new one. "
+                    "Optionally also sets the group's overall opacity/invert "
+                    "in the same call (forwarded to set_blend_params). Prefer "
+                    "attach_mask/detach_mask for a single incremental change; "
+                    "use this when you know the FULL desired shape list "
+                    "up front (e.g. scripting several new instances from the "
+                    "same set of hand-drawn shapes)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "description": "Module operation name, e.g. 'exposure' (see list_modules)",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the module instance; 0 = base instance",
+                        },
+                        "shapes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "formid": {"type": "integer"},
+                                    "operation": {
+                                        "type": "string",
+                                        "enum": ["union", "intersection", "difference", "exclusion"],
+                                        "default": "union",
+                                    },
+                                },
+                                "required": ["formid"],
+                            },
+                            "description": "The complete desired shape list (formid + combine operation each). Empty list clears the module's mask.",
+                        },
+                        "opacity": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "Optional: also set overall blend opacity (0..100), forwarded to set_blend_params",
+                        },
+                        "invert": {
+                            "type": "boolean",
+                            "description": "Optional: also set the whole-group mask polarity, forwarded to set_blend_params",
+                        },
+                    },
+                    "required": ["op", "shapes"],
+                },
+            ),
+            Tool(
                 name="enable_module",
                 description=(
                     "Turn a module instance on or off and commit to darkroom "
@@ -1089,6 +1381,161 @@ class DarktableMCPServer:
                 },
             ),
             Tool(
+                name="list_luts",
+                description=(
+                    "List LUT files (.cube, .3dl, .png haldclut) under the "
+                    "lut3d module's configured root directory -- the SAME "
+                    "folder darktable's own file-chooser dropdown reads "
+                    "(plugins/darkroom/lut3d/def_path), so this listing "
+                    "matches what a human sees in the UI. Each result: "
+                    "{name, path, format, category}; for .cube files, "
+                    "'title' and 'size' (LUT_3D_SIZE, e.g. 17/33/65) are "
+                    "included when the file's header declares them. 'path' "
+                    "is relative to the root and is exactly what set_params's "
+                    "lut3d 'filepath' field expects -- copy it straight "
+                    "through, no further resolution needed. 'category' is "
+                    "the LUT's first-level subfolder (e.g. 'FG'), '' if it "
+                    "sits directly in the root. Scans recursively regardless "
+                    "of 'directory' (the UI's own combobox only shows one "
+                    "folder at a time; this surfaces the whole tree, or a "
+                    "scoped subtree when 'directory' is given). Fails with a "
+                    "clear message if no LUT folder has ever been configured "
+                    "in darktable."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "directory": {
+                            "type": "string",
+                            "description": (
+                                "Optional subdirectory under the LUT root to "
+                                "scope the scan to, e.g. 'FG'. Omit to scan "
+                                "the whole root."
+                            ),
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="preview_lut",
+                description=(
+                    "Try a LUT (path from list_luts) on the open image WITHOUT "
+                    "a lasting edit: apply it to lut3d, render a preview, then "
+                    "restore lut3d to exactly the state it was in before this "
+                    "call (filepath, colorspace, interpolation, enabled/disabled) "
+                    "-- so trying 20 LUTs in a row leaves darkroom history "
+                    "unchanged. Note darktable already coalesces consecutive "
+                    "edits of the SAME module into one history entry, so even "
+                    "set_params directly would not spam history; this tool's "
+                    "real job is the automatic restore, not history hygiene. "
+                    "Fails validation up front if the resolved file does not "
+                    "exist under the LUT root (see list_luts). colorspace/"
+                    "interpolation are optional strings -- check "
+                    "get_params('lut3d').fields.colorspace.options / "
+                    ".interpolation.options for the valid enum labels; omit "
+                    "either to keep whatever lut3d is currently set to."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "LUT path relative to the configured root (list_luts' 'path' field)",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the lut3d module instance; 0 = base instance",
+                        },
+                        "colorspace": {
+                            "type": "string",
+                            "description": "Optional enum label, e.g. 'DT_IOP_SRGB'; omit to keep current",
+                        },
+                        "interpolation": {
+                            "type": "string",
+                            "description": "Optional enum label, e.g. 'DT_IOP_TETRAHEDRAL'; omit to keep current",
+                        },
+                        "opacity": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                            "description": (
+                                "Optional blend opacity 0..1 (lut3d has no "
+                                "'amount' of its own -- e.g. 0.3 for a subtle "
+                                "look). Restored afterward along with everything "
+                                "else. Refused if this instance already has a "
+                                "mask configured (see set_blend_params) -- omit "
+                                "to run the LUT at its current blend state."
+                            ),
+                        },
+                        "max_w": {"type": "integer", "default": 1024},
+                        "max_h": {"type": "integer", "default": 1024},
+                        "region": {
+                            "type": "object",
+                            "description": "Optional {x,y,w,h} normalized 0..1 sub-rectangle, same convention as get_preview",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            ),
+            Tool(
+                name="compare_luts",
+                description=(
+                    "Render the SAME open image once per LUT in `paths` (each "
+                    "via preview_lut -- applied, rendered, restored, one at a "
+                    "time) and stitch the results into one labelled grid image "
+                    "so several looks can be judged side by side in a single "
+                    "glance instead of N separate preview_lut calls. NOT "
+                    "atomic across paths: each LUT is independently applied "
+                    "and restored, so one bad path (missing file, invalid "
+                    "enum) shows as an ERROR cell labelled with its path "
+                    "rather than aborting the rest. colorspace/interpolation, "
+                    "if given, apply to every LUT in the comparison."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": "LUT paths relative to the configured root (list_luts' 'path' field)",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the lut3d module instance; 0 = base instance",
+                        },
+                        "colorspace": {
+                            "type": "string",
+                            "description": "Optional enum label applied to every LUT in the comparison",
+                        },
+                        "interpolation": {
+                            "type": "string",
+                            "description": "Optional enum label applied to every LUT in the comparison",
+                        },
+                        "opacity": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                            "description": "Optional blend opacity 0..1 applied to every LUT in the comparison, same as preview_lut's",
+                        },
+                        "columns": {"type": "integer", "default": 4, "minimum": 1},
+                        "cell_width": {
+                            "type": "integer",
+                            "default": 480,
+                            "description": "Per-cell render width in pixels (shrunk if the grid would exceed the max sheet width)",
+                        },
+                        "background": {
+                            "type": "string",
+                            "enum": ["dark", "light"],
+                            "default": "dark",
+                        },
+                    },
+                    "required": ["paths"],
+                },
+            ),
+            Tool(
                 name="add_instance",
                 description=(
                     "Add a new masked/parametric instance of a module "
@@ -1099,7 +1546,19 @@ class DarktableMCPServer:
                     "since instance 0 stays the global edit and the new "
                     "instance can be masked and adjusted independently via "
                     "get_params/set_params with instance=<returned index>. "
-                    "Call list_modules() afterward to see both instances."
+                    "Call list_modules() afterward to see both instances.\n\n"
+                    "IMPORTANT for local edits: a new instance is created by "
+                    "COPYING instance 0's params verbatim, not by recomputing "
+                    "this module's own defaults for a fresh instance — for "
+                    "some modules that copy is wrong for a LOCAL edit. "
+                    "exposure is the known case: instance 0 typically has "
+                    "compensate_exposure_bias/compensate_hilite_pres on "
+                    "(global exposure compensation), but a local dodge/burn "
+                    "instance almost always wants both OFF so its exposure "
+                    "value is a pure, unadjusted offset. Pass `fields` to set "
+                    "the new instance's initial params in the SAME call/"
+                    "history entry, instead of a separate set_params call "
+                    "after the fact."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1107,6 +1566,17 @@ class DarktableMCPServer:
                         "op": {
                             "type": "string",
                             "description": "Module operation name, e.g. 'exposure' (see list_modules)",
+                        },
+                        "fields": {
+                            "type": "object",
+                            "description": (
+                                "Optional initial param overrides for the new "
+                                "instance, applied in the same history entry "
+                                "as its creation. Same field names/semantics "
+                                "as set_params(op). For a local exposure "
+                                "instance: {'compensate_exposure_bias': "
+                                "false, 'compensate_hilite_pres': false}."
+                            ),
                         },
                     },
                     "required": ["op"],
@@ -2004,8 +2474,18 @@ class DarktableMCPServer:
             "list_modules": self._handle_list_modules,
             "get_params": self._handle_get_params,
             "set_params": self._handle_set_params,
+            "get_blend_params": self._handle_get_blend_params,
+            "set_blend_params": self._handle_set_blend_params,
+            "list_masks": self._handle_list_masks,
+            "get_module_mask": self._handle_get_module_mask,
+            "attach_mask": self._handle_attach_mask,
+            "detach_mask": self._handle_detach_mask,
+            "set_module_mask": self._handle_set_module_mask,
             "get_preview": self._handle_get_preview,
             "enable_module": self._handle_enable_module,
+            "list_luts": self._handle_list_luts,
+            "preview_lut": self._handle_preview_lut,
+            "compare_luts": self._handle_compare_luts,
             "add_instance": self._handle_add_instance,
             "get_viewport": self._handle_get_viewport,
             "capture_viewport": self._handle_capture_viewport,
@@ -2865,6 +3345,336 @@ class DarktableMCPServer:
         lines.append("Call get_preview() to see the result.")
         return [TextContent(type="text", text="\n".join(lines))]
 
+    async def _handle_get_blend_params(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        op = arguments.get("op")
+        if not op:
+            return [TextContent(type="text", text="op is required")]
+        instance = int(arguments.get("instance", 0))
+        try:
+            result = self.bridge.call(
+                "dev_get_blend_params", {"op": op, "instance": instance}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(type="text", text=f"get_blend_params('{op}', {instance}): {result['error']}")]
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    async def _handle_set_blend_params(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        op = arguments.get("op")
+        if not op:
+            return [TextContent(type="text", text="op is required")]
+        instance = int(arguments.get("instance", 0))
+        fields: Dict[str, Any] = {}
+        if arguments.get("opacity") is not None:
+            fields["opacity"] = float(arguments["opacity"])
+        if arguments.get("enable_uniform_blend") is not None:
+            fields["enable_uniform_blend"] = bool(arguments["enable_uniform_blend"])
+        if arguments.get("blend_mode") is not None:
+            fields["blend_mode"] = int(arguments["blend_mode"])
+        if not fields:
+            return [TextContent(
+                type="text",
+                text="set_blend_params: at least one of opacity/enable_uniform_blend/blend_mode is required",
+            )]
+
+        try:
+            result = self.bridge.call(
+                "dev_set_blend_params", {"op": op, "instance": instance, "fields": fields}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(type="text", text=f"set_blend_params('{op}', {instance}): {result['error']}")]
+        return [TextContent(
+            type="text",
+            text=(
+                f"set_blend_params('{op}', instance={instance}): ok=True "
+                f"opacity={result.get('opacity')} mask_mode={result.get('mask_mode')} "
+                f"blend_mode={result.get('blend_mode')}\n"
+                "Call get_preview() to see the result."
+            ),
+        )]
+
+    async def _handle_list_masks(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        try:
+            result = self.bridge.call("dev_list_all_masks", {}, timeout=15.0)
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if isinstance(result, dict) and result.get("error"):
+            return [TextContent(type="text", text=f"list_masks: {result['error']}")]
+        masks = result if isinstance(result, list) else []
+        return [TextContent(type="text", text=json.dumps({"masks": masks}, indent=2))]
+
+    async def _handle_get_module_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        op = arguments.get("op")
+        if not op:
+            return [TextContent(type="text", text="op is required")]
+        instance = int(arguments.get("instance", 0))
+        try:
+            blend = self.bridge.call(
+                "dev_get_blend_params", {"op": op, "instance": instance}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if blend.get("error"):
+            return [TextContent(type="text", text=f"get_module_mask('{op}', {instance}): {blend['error']}")]
+
+        try:
+            shapes_result = self.bridge.call(
+                "dev_list_masks", {"op": op, "instance": instance}, timeout=15.0,
+            )
+        except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+            return [TextContent(type="text", text=f"get_module_mask('{op}', {instance}): {e}")]
+
+        if isinstance(shapes_result, dict) and shapes_result.get("error"):
+            return [TextContent(
+                type="text", text=f"get_module_mask('{op}', {instance}): {shapes_result['error']}",
+            )]
+        shapes = shapes_result if isinstance(shapes_result, list) else []
+
+        response = {
+            "op": op,
+            "instance": instance,
+            "opacity": blend.get("opacity"),
+            "mask_mode": blend.get("mask_mode"),
+            "blend_mode": blend.get("blend_mode"),
+            "invert": blend.get("invert"),
+            "shapes": shapes,
+        }
+        return [TextContent(type="text", text=json.dumps(response, indent=2))]
+
+    async def _handle_attach_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        op = arguments.get("op")
+        if not op:
+            return [TextContent(type="text", text="op is required")]
+        instance = int(arguments.get("instance", 0))
+        formid = arguments.get("formid")
+        if formid is None:
+            return [TextContent(type="text", text="attach_mask: formid is required")]
+        operation = arguments.get("operation") or "union"
+        try:
+            result = self.bridge.call(
+                "dev_attach_mask",
+                {"op": op, "instance": instance, "formid": int(formid), "operation": operation},
+                timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(
+                type="text", text=f"attach_mask('{op}', {instance}, formid={formid}): {result['error']}",
+            )]
+
+        lines = [
+            f"attach_mask('{op}', instance={instance}): formid={result.get('formid')} "
+            f"operation={result.get('operation')}"
+        ]
+        lines.append(self._verify_drawn_mask_enabled(op, instance, result.get("mask_mode")))
+        lines.append("Call get_preview() to see the result.")
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    def _verify_drawn_mask_enabled(self, op: str, instance: int, reported_mask_mode: Any) -> str:
+        """Read blend_params back from the bridge (a SEPARATE call, not just
+        trusting the mask_mode attach_mask/set_module_mask already reported)
+        and confirm DEVELOP_MASK_MASK actually stuck -- attaching a shape to
+        the group used to leave the mask inert until the user clicked the
+        pencil icon by hand (bugreport 2026-07-27). Returns a one-line status
+        string; never raises."""
+        try:
+            blend = self.bridge.call(
+                "dev_get_blend_params", {"op": op, "instance": instance}, timeout=15.0,
+            )
+        except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+            return f"  WARNING: could not verify mask_mode after attach: {e}"
+        if blend.get("error"):
+            return f"  WARNING: could not verify mask_mode after attach: {blend['error']}"
+        mask_mode = blend.get("mask_mode")
+        if not isinstance(mask_mode, int) or not (mask_mode & _DEVELOP_MASK_MASK):
+            return (
+                f"  WARNING: drawn mask is NOT enabled after attach (mask_mode={mask_mode}, "
+                f"reported={reported_mask_mode}) -- the mask exists but will have NO visible "
+                "effect until enabled; this should not happen, report it"
+            )
+        return f"  verified: drawn mask enabled (mask_mode={mask_mode})"
+
+    async def _handle_detach_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        op = arguments.get("op")
+        if not op:
+            return [TextContent(type="text", text="op is required")]
+        instance = int(arguments.get("instance", 0))
+        formid = arguments.get("formid")
+        if formid is None:
+            return [TextContent(type="text", text="detach_mask: formid is required")]
+        try:
+            result = self.bridge.call(
+                "dev_detach_mask", {"op": op, "instance": instance, "formid": int(formid)}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(
+                type="text", text=f"detach_mask('{op}', {instance}, formid={formid}): {result['error']}",
+            )]
+        return [TextContent(
+            type="text",
+            text=(
+                f"detach_mask('{op}', instance={instance}): formid={result.get('formid')} detached\n"
+                "Call get_preview() to see the result."
+            ),
+        )]
+
+    async def _handle_set_module_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        op = arguments.get("op")
+        if not op:
+            return [TextContent(type="text", text="op is required")]
+        instance = int(arguments.get("instance", 0))
+        shapes = arguments.get("shapes")
+        if not isinstance(shapes, list):
+            return [TextContent(type="text", text="set_module_mask: shapes must be a list")]
+
+        desired: Dict[int, str] = {}
+        for s in shapes:
+            if not isinstance(s, dict) or s.get("formid") is None:
+                return [TextContent(type="text", text="set_module_mask: each shape needs a formid")]
+            desired[int(s["formid"])] = s.get("operation") or "union"
+
+        def call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+            try:
+                result = self.bridge.call(method, params, timeout=15.0)
+            except BridgePluginNotInstalledError:
+                return {"error": "darktable-mcp plugin not installed. Run: darktable-mcp install-plugin"}
+            except BridgeTimeoutError:
+                return {"error": "darktable not running, or plugin not loaded. Open darktable and try again."}
+            except BridgeError as e:
+                return {"error": f"Plugin error: {e}"}
+            return result if isinstance(result, dict) else {"_list": result}
+
+        current_result = call("dev_list_masks", {"op": op, "instance": instance})
+        if current_result.get("error"):
+            return [TextContent(
+                type="text", text=f"set_module_mask('{op}', {instance}): {current_result['error']}",
+            )]
+        current_list = current_result.get("_list") or []
+        current: Dict[int, str] = {
+            int(s["mask_id"]): s.get("operation") or "union" for s in current_list
+        }
+
+        detached: List[int] = []
+        attached: List[int] = []
+        errors: List[str] = []
+
+        # Shapes to drop, and shapes whose operation changed: attach_mask
+        # cannot rewrite an already-attached shape's operation in place (the
+        # underlying dt_masks_group_add_form would append a SECOND, duplicate
+        # point for the same formid rather than updating the existing one) --
+        # so a changed operation goes through detach+reattach, same as a
+        # plain removal.
+        for formid, current_op in current.items():
+            if formid not in desired or desired[formid] != current_op:
+                result = call("dev_detach_mask", {"op": op, "instance": instance, "formid": formid})
+                if result.get("error"):
+                    errors.append(f"detach formid={formid}: {result['error']}")
+                else:
+                    detached.append(formid)
+
+        for formid, wanted_op in desired.items():
+            if formid not in current or current[formid] != wanted_op:
+                result = call("dev_attach_mask", {
+                    "op": op, "instance": instance, "formid": formid, "operation": wanted_op,
+                })
+                if result.get("error"):
+                    errors.append(f"attach formid={formid}: {result['error']}")
+                else:
+                    attached.append(formid)
+
+        fields: Dict[str, Any] = {}
+        if arguments.get("opacity") is not None:
+            fields["opacity"] = float(arguments["opacity"])
+        if arguments.get("invert") is not None:
+            fields["invert"] = bool(arguments["invert"])
+        blend_result = None
+        if fields:
+            blend_result = call("dev_set_blend_params", {"op": op, "instance": instance, "fields": fields})
+            if blend_result.get("error"):
+                errors.append(f"set_blend_params: {blend_result['error']}")
+
+        lines = [f"set_module_mask('{op}', instance={instance}): attached={attached} detached={detached}"]
+        if blend_result and not blend_result.get("error"):
+            lines.append(f"  opacity={blend_result.get('opacity')} invert={blend_result.get('invert')}")
+        if attached:
+            lines.append(self._verify_drawn_mask_enabled(op, instance, None))
+        if errors:
+            lines.append("  errors: " + "; ".join(errors))
+        lines.append("Call get_module_mask() to confirm the final state.")
+        return [TextContent(type="text", text="\n".join(lines))]
+
     def _register_download(self, host_path: str) -> Optional[str]:
         """Register an absolute file path for HTTP download and return its token.
 
@@ -3235,12 +4045,416 @@ class DarktableMCPServer:
             text=f"enable_module('{op}', instance={instance}): enabled={result.get('enabled', bool(enabled))}",
         )]
 
+    async def _handle_list_luts(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        directory = arguments.get("directory") or None
+        try:
+            root_dir = self.bridge.call(
+                "dev_get_conf_string",
+                {"key": "plugins/darkroom/lut3d/def_path"},
+                timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        try:
+            items = scan_lut_directory(root_dir, directory)
+        except (LutRootNotConfiguredError, FileNotFoundError, ValueError) as e:
+            return [TextContent(type="text", text=f"list_luts: {e}")]
+
+        root = Path(root_dir).expanduser().resolve()
+        for item in items:
+            if item["format"] == "cube":
+                header = parse_cube_header(root / item["path"])
+                if "title" in header:
+                    item["title"] = header["title"]
+                if "size" in header:
+                    item["size"] = header["size"]
+
+        if not items:
+            scope = f" under {directory!r}" if directory else ""
+            return [TextContent(
+                type="text",
+                text=f"list_luts: no .cube/.3dl/.png files found{scope} in {root}",
+            )]
+
+        lines = [f"list_luts: {len(items)} file(s) under {root}"]
+        if directory:
+            lines[0] += f" (scoped to {directory!r})"
+        lines.append(json.dumps(items, indent=2))
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    async def _lut3d_preview_once(
+        self,
+        instance: int,
+        path: str,
+        colorspace: Optional[str],
+        interpolation: Optional[str],
+        max_w: int,
+        max_h: int,
+        region: Optional[Dict[str, Any]],
+        opacity: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Apply `path` to lut3d instance `instance`, render a preview, then
+        restore lut3d's prior filepath/colorspace/interpolation/lutname/
+        enabled/blend-opacity state -- the shared core of preview_lut and
+        compare_luts (each LUT in a compare_luts call goes through this
+        exactly once, one at a time -- never concurrently, since they all
+        mutate the same module).
+
+        `opacity`, if given, is 0..1 (mask_object/retouch's MCP-facing
+        convention) and is converted to blend_params' native 0..100 scale
+        here -- lut3d has no "amount" field of its own, so partial-strength
+        LUTs (the reported 15-50% portrait use case) only work through blend
+        opacity. Applying it always sets enable_uniform_blend=true (plain
+        blend, no mask) and is restored to the module's PRIOR blend state
+        (opacity + mask_mode) exactly like the params restore below.
+
+        Bridge-transport failures (BridgePluginNotInstalledError,
+        BridgeTimeoutError, and BridgeError generally) PROPAGATE to the
+        caller, which should catch them ONCE around the whole operation: a
+        transport failure means darktable itself is unreachable, not that
+        this one LUT is bad, so retrying it per-item would be pointless.
+        Anything else (instance not found, bad params, render error) comes
+        back as {"ok": False, "error": ...} instead of raising, so a caller
+        looping over several LUTs (compare_luts) can keep going after one
+        fails.
+        """
+        active = self.bridge.call("dev_active_modules", {}, timeout=15.0)
+        modules = active.get("modules", [])
+        match = next(
+            (m for m in modules if m.get("op") == "lut3d" and int(m.get("instance", 0)) == instance),
+            None,
+        )
+        if match is None:
+            return {"ok": False, "error": (
+                f"lut3d instance {instance} not found -- call add_instance('lut3d') "
+                "first if instance > 0, or open an image in darkroom first"
+            )}
+        was_enabled = bool(match.get("enabled"))
+
+        snap = self.bridge.call("dev_get_params", {"op": "lut3d", "instance": instance}, timeout=15.0)
+        if snap.get("error"):
+            return {"ok": False, "error": f"get_params: {snap['error']}"}
+        fields = snap.get("fields", {})
+        original_fields: Dict[str, Any] = {}
+        if isinstance(fields.get("filepath"), str):
+            original_fields["filepath"] = fields["filepath"]
+        if isinstance(fields.get("lutname"), str):
+            original_fields["lutname"] = fields["lutname"]
+        for key in ("colorspace", "interpolation"):
+            val = fields.get(key)
+            if isinstance(val, dict) and "label" in val:
+                original_fields[key] = val["label"]
+
+        original_blend: Optional[Dict[str, Any]] = None
+        if opacity is not None:
+            blend_snap = self.bridge.call(
+                "dev_get_blend_params", {"op": "lut3d", "instance": instance}, timeout=15.0,
+            )
+            if blend_snap.get("error"):
+                return {"ok": False, "error": f"get_blend_params: {blend_snap['error']}"}
+            snap_mask_mode = blend_snap.get("mask_mode")
+            if isinstance(snap_mask_mode, int) and snap_mask_mode not in (0, 1):
+                # enable_uniform_blend (the only write path available here) is
+                # ALL-OR-NOTHING on mask_mode -- restoring it later would
+                # clobber a drawn/parametric/raster mask already wired to this
+                # instance. Refuse rather than silently destroy that setup;
+                # use set_blend_params directly if this is deliberate.
+                return {"ok": False, "error": (
+                    f"lut3d instance {instance} already has a mask configured "
+                    f"(mask_mode={snap_mask_mode}) -- opacity via preview_lut/"
+                    "compare_luts only supports the plain no-mask case. Use "
+                    "set_blend_params directly if this is intentional."
+                )}
+            original_blend = {
+                "opacity": blend_snap.get("opacity"),
+                "mask_mode": snap_mask_mode,
+            }
+
+        new_fields: Dict[str, Any] = {"filepath": path, "enabled": True}
+        if colorspace:
+            new_fields["colorspace"] = colorspace
+        if interpolation:
+            new_fields["interpolation"] = interpolation
+
+        set_result = self.bridge.call(
+            "dev_set_params", {"op": "lut3d", "instance": instance, "fields": new_fields}, timeout=15.0,
+        )
+        if set_result.get("error"):
+            return {"ok": False, "error": f"set_params: {set_result['error']}"}
+        clamped = set_result.get("clamped") or []
+
+        if opacity is not None:
+            blend_set = self.bridge.call(
+                "dev_set_blend_params",
+                {
+                    "op": "lut3d", "instance": instance,
+                    "fields": {
+                        "opacity": max(0.0, min(1.0, opacity)) * 100.0,
+                        "enable_uniform_blend": True,
+                    },
+                },
+                timeout=15.0,
+            )
+            if blend_set.get("error"):
+                # lut3d params were already applied above -- restore them
+                # before reporting, same as any other failure past this point.
+                restore_fields = dict(original_fields)
+                restore_fields["enabled"] = was_enabled
+                self.bridge.call(
+                    "dev_set_params", {"op": "lut3d", "instance": instance, "fields": restore_fields}, timeout=15.0,
+                )
+                return {"ok": False, "error": f"set_blend_params: {blend_set['error']}"}
+
+        preview_error: Optional[str] = None
+        host_path: Optional[str] = None
+        try:
+            preview_params: Dict[str, Any] = {"max_w": max_w, "max_h": max_h}
+            if region:
+                preview_params["region"] = region
+            preview_result = self.bridge.call("dev_preview", preview_params, timeout=20.0)
+            if preview_result.get("error"):
+                preview_error = preview_result["error"]
+            else:
+                raw_path = preview_result.get("path") or preview_result.get("stale_preview")
+                if raw_path:
+                    host_path = _remap_bridge_path(raw_path)
+        finally:
+            restore_fields = dict(original_fields)
+            restore_fields["enabled"] = was_enabled
+            restore_result = self.bridge.call(
+                "dev_set_params", {"op": "lut3d", "instance": instance, "fields": restore_fields}, timeout=15.0,
+            )
+            restore_warning = (
+                f"restore failed, lut3d may be left in the applied state: {restore_result['error']}"
+                if restore_result.get("error") else None
+            )
+            if original_blend is not None:
+                blend_restore = self.bridge.call(
+                    "dev_set_blend_params",
+                    {
+                        "op": "lut3d", "instance": instance,
+                        "fields": {
+                            "opacity": original_blend["opacity"],
+                            # Snapshot-time guard above already refused
+                            # anything but mask_mode 0/1, so this is exactly
+                            # the module's prior on/off state, never a mask.
+                            "enable_uniform_blend": original_blend["mask_mode"] == 1,
+                        },
+                    },
+                    timeout=15.0,
+                )
+                if blend_restore.get("error") and not restore_warning:
+                    restore_warning = (
+                        f"blend restore failed, lut3d opacity may be left applied: {blend_restore['error']}"
+                    )
+
+        if preview_error:
+            return {"ok": False, "error": f"get_preview: {preview_error}", "restore_warning": restore_warning}
+        return {"ok": True, "host_path": host_path, "clamped": clamped, "restore_warning": restore_warning}
+
+    async def _handle_preview_lut(self, arguments: Dict[str, Any]) -> List[Any]:
+        path = arguments.get("path")
+        if not path:
+            return [TextContent(type="text", text="path is required")]
+        instance = int(arguments.get("instance", 0))
+        colorspace = arguments.get("colorspace")
+        interpolation = arguments.get("interpolation")
+        max_w = int(arguments.get("max_w", 1024))
+        max_h = int(arguments.get("max_h", 1024))
+        region = arguments.get("region")
+        if not (isinstance(region, dict) and all(k in region for k in ("x", "y", "w", "h"))):
+            region = None
+        opacity = arguments.get("opacity")
+        opacity = float(opacity) if opacity is not None else None
+
+        try:
+            root_dir = self.bridge.call(
+                "dev_get_conf_string", {"key": "plugins/darkroom/lut3d/def_path"}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        try:
+            resolve_lut_path(root_dir, path)
+        except (LutRootNotConfiguredError, FileNotFoundError, ValueError) as e:
+            return [TextContent(type="text", text=f"preview_lut: {e}")]
+
+        try:
+            result = await self._lut3d_preview_once(
+                instance, path, colorspace, interpolation, max_w, max_h, region, opacity,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if not result["ok"]:
+            lines = [f"preview_lut('{path}'): {result['error']}"]
+            if result.get("restore_warning"):
+                lines.append(f"WARNING: {result['restore_warning']}")
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        lines = [f"preview_lut('{path}'): ok=True (lut3d restored to its prior state)"]
+        if result["clamped"]:
+            lines.append(f"clamped/rejected fields: {json.dumps(result['clamped'])}")
+        if result.get("restore_warning"):
+            lines.append(f"WARNING: {result['restore_warning']}")
+
+        out: List[Any] = []
+        if result["host_path"]:
+            lines.append(f"path: {result['host_path']}")
+            img = _inline_image_content(result["host_path"])
+            if img is not None:
+                out.append(img)
+        out.append(TextContent(type="text", text="\n".join(lines)))
+        return out
+
+    async def _handle_compare_luts(self, arguments: Dict[str, Any]) -> List[Any]:
+        paths = arguments.get("paths")
+        if not isinstance(paths, list) or not paths:
+            return [TextContent(type="text", text="paths must be a non-empty array")]
+        instance = int(arguments.get("instance", 0))
+        colorspace = arguments.get("colorspace")
+        interpolation = arguments.get("interpolation")
+        opacity = arguments.get("opacity")
+        opacity = float(opacity) if opacity is not None else None
+        columns = max(1, int(arguments.get("columns", 4)))
+        requested_width = int(arguments.get("cell_width", 480))
+        background = arguments.get("background", "dark")
+        if background not in ("dark", "light"):
+            background = "dark"
+        cell_width = effective_cell_width(columns, requested_width)
+        # Aspect-preserving cell height cap (typical 3:2 photo) -- never
+        # upscaled beyond the render's own resolution, same as get_preview.
+        cell_height = int(cell_width * 0.75)
+
+        try:
+            root_dir = self.bridge.call(
+                "dev_get_conf_string", {"key": "plugins/darkroom/lut3d/def_path"}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        entries: List[Dict[str, Any]] = []
+        try:
+            for path in paths:
+                try:
+                    resolve_lut_path(root_dir, path)
+                except (LutRootNotConfiguredError, FileNotFoundError, ValueError) as e:
+                    entries.append({"label": path, "image_path": None, "error": str(e)})
+                    continue
+                result = await self._lut3d_preview_once(
+                    instance, path, colorspace, interpolation, cell_width, cell_height, None, opacity,
+                )
+                if result["ok"]:
+                    entries.append({
+                        "label": path,
+                        "image_path": result["host_path"],
+                        "error": None,
+                        "restore_warning": result.get("restore_warning"),
+                    })
+                else:
+                    entries.append({
+                        "label": path,
+                        "image_path": None,
+                        "error": result["error"],
+                        "restore_warning": result.get("restore_warning"),
+                    })
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        canvas = compose_lut_compare_grid(entries, columns, cell_width, background)
+        sheet_path = new_sheet_path()
+        write_sheet(canvas, sheet_path)
+
+        succeeded = sum(1 for e in entries if not e["error"])
+        response = {
+            "status": "ok",
+            "requested": len(paths),
+            "succeeded": succeeded,
+            "failed": len(paths) - succeeded,
+            "columns": columns,
+            "sheet_path": str(sheet_path),
+            "sheet_url": self._download_url(str(sheet_path)),
+            "items": [
+                {
+                    "path": e["label"],
+                    "ok": not e["error"],
+                    "error": e["error"],
+                    "restore_warning": e.get("restore_warning"),
+                }
+                for e in entries
+            ],
+        }
+
+        out: List[Any] = []
+        img = _inline_image_content(str(sheet_path), max_dim=1600, quality=88)
+        if img is not None:
+            out.append(img)
+        out.append(TextContent(type="text", text=json.dumps(response, indent=2)))
+        return out
+
     async def _handle_add_instance(self, arguments: Dict[str, Any]) -> List[TextContent]:
         op = arguments.get("op")
         if not op:
             return [TextContent(type="text", text="op is required")]
+        fields = arguments.get("fields")
+        if fields is not None and not isinstance(fields, dict):
+            return [TextContent(type="text", text="add_instance: fields must be an object")]
+        payload: Dict[str, Any] = {"op": op}
+        if fields:
+            payload["fields"] = fields
         try:
-            result = self.bridge.call("dev_add_instance", {"op": op}, timeout=15.0)
+            result = self.bridge.call("dev_add_instance", payload, timeout=15.0)
         except BridgePluginNotInstalledError:
             return [TextContent(
                 type="text",
@@ -3262,6 +4476,17 @@ class DarktableMCPServer:
         ]
         if result.get("multi_name"):
             lines.append(f"  multi_name: {result['multi_name']}")
+        applied_result = result.get("fields_applied")
+        if isinstance(applied_result, dict):
+            if applied_result.get("error"):
+                lines.append(f"  fields NOT applied: {applied_result['error']}")
+            else:
+                applied = applied_result.get("applied") or {}
+                if applied:
+                    lines.append(f"  fields applied: {json.dumps(applied)}")
+                unknown = applied_result.get("unknown_fields") or []
+                if unknown:
+                    lines.append(f"  unknown_fields (ignored): {unknown}")
         return [TextContent(type="text", text="\n".join(lines))]
 
     async def _handle_get_viewport(self, arguments: Dict[str, Any]) -> List[TextContent]:
