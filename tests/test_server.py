@@ -482,6 +482,76 @@ async def test_handle_retouch_add_shape_requires_source():
 
 
 @pytest.mark.asyncio
+async def test_handle_retouch_add_shape_blur_no_source_required():
+    """2026-07-31 blur/fill batch: blur has no source point at all -- omitting
+    it must NOT be rejected the way heal/clone's missing source is."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "formid": 42, "algorithm": "blur", "wavelet_scale": 3,
+        "blur_type": "gaussian", "blur_radius": 8.0,
+    }
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "blur",
+        "target": {"x": 0.4, "y": 0.3},
+        "radius": 0.05,
+        "wavelet_scale": 3,
+        "blur_type": "gaussian",
+        "blur_radius": 8.0,
+    })
+    assert "blur_type=gaussian" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_retouch_add_shape",
+        {
+            "op": "retouch",
+            "instance": 0,
+            "algorithm": "blur",
+            "target": {"x": 0.4, "y": 0.3},
+            "radius": 0.05,
+            "feather": 0.0,
+            "opacity": 1.0,
+            "wavelet_scale": 3,
+            "blur_type": "gaussian",
+            "blur_radius": 8.0,
+        },
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_fill_no_source_required():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "formid": 43, "algorithm": "fill",
+        "fill_mode": "erase", "fill_brightness": 0.1,
+    }
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "fill",
+        "target": {"x": 0.6, "y": 0.7},
+        "radius": 0.04,
+        "fill_mode": "erase",
+        "fill_brightness": 0.1,
+    })
+    assert "fill_mode=erase" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_retouch_add_shape",
+        {
+            "op": "retouch",
+            "instance": 0,
+            "algorithm": "fill",
+            "target": {"x": 0.6, "y": 0.7},
+            "radius": 0.04,
+            "feather": 0.0,
+            "opacity": 1.0,
+            "fill_mode": "erase",
+            "fill_brightness": 0.1,
+        },
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
 async def test_handle_retouch_add_shape_rejects_non_circle():
     server = DarktableMCPServer()
     server.bridge = Mock()
@@ -1036,6 +1106,48 @@ async def test_handle_retouch_add_shape_in_viewport_success():
     assert params["target"]["y"] == pytest.approx(0.3)
     # radius 0.1 (viewport_normalized) * region.w 0.2 = 0.02 (display), identity -> 0.02 (mask)
     assert params["radius"] == pytest.approx(0.02)
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_in_viewport_blur_skips_source_backtransform():
+    """2026-07-31 blur/fill batch: blur/fill have no source point, so the
+    source leg of the two-stage viewport pipeline (dev_backtransform_point
+    for source) must be skipped entirely -- only 3 bridge calls total
+    (current_image, backtransform target, retouch_add_shape), not 4."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"x": 0.4, "y": 0.6, "len1": 0.05},
+        {"ok": True, "formid": 55, "algorithm": "blur", "wavelet_scale": 3,
+         "blur_type": "gaussian", "blur_radius": 8.0},
+    ]
+    result = await server._handle_retouch_add_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "algorithm": "blur",
+        "target": {"x": 0.4, "y": 0.6},
+        "radius": 0.05,
+        "wavelet_scale": 3,
+        "blur_type": "gaussian",
+        "blur_radius": 8.0,
+        "return_preview": False,
+    })
+    assert "blur_type=gaussian" in result[0].text
+    assert server.bridge.call.call_count == 3
+    call_args_list = server.bridge.call.call_args_list
+    assert call_args_list[0][0][0] == "dev_current_image"
+    assert call_args_list[1][0][0] == "dev_backtransform_point"
+    assert call_args_list[2][0][0] == "dev_retouch_add_shape"
+    params = call_args_list[2][0][1]
+    assert "source" not in params
+    assert params["blur_type"] == "gaussian"
+    assert params["blur_radius"] == 8.0
 
 
 @pytest.mark.asyncio

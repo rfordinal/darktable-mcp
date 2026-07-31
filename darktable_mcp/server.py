@@ -2060,8 +2060,17 @@ class DarktableMCPServer:
                         },
                         "algorithm": {
                             "type": "string",
-                            "enum": ["heal", "clone"],
-                            "description": "Retouch algorithm for this shape",
+                            "enum": ["heal", "clone", "blur", "fill"],
+                            "description": (
+                                "Retouch algorithm for this shape. heal/clone sample "
+                                "from a separate source point and always affect the "
+                                "full pixel value (texture AND tone). blur/fill have "
+                                "no source -- they only ever act on the target area, "
+                                "and on a NONZERO wavelet_scale they affect texture "
+                                "only, leaving tone/shadow on other scales untouched "
+                                "(the standard fix for wrinkles/pores: heal at scale 0 "
+                                "visibly brightens/flattens shadow it should not touch)."
+                            ),
                         },
                         "coordinate_space": {
                             "type": "string",
@@ -2098,7 +2107,12 @@ class DarktableMCPServer:
                         },
                         "source": {
                             "type": "object",
-                            "description": "Source point to sample from (absolute, not an offset), in coordinate_space units",
+                            "description": (
+                                "Source point to sample from (absolute, not an "
+                                "offset), in coordinate_space units. Required for "
+                                "algorithm='heal'/'clone'; omit for 'blur'/'fill' "
+                                "(they have no source)."
+                            ),
                             "properties": {
                                 "x": {"type": "number"},
                                 "y": {"type": "number"},
@@ -2126,7 +2140,43 @@ class DarktableMCPServer:
                         "wavelet_scale": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "Wavelet scale to retouch on; defaults to the module's current scale",
+                            "description": (
+                                "Wavelet scale to retouch on; defaults to the "
+                                "module's current scale. Use a NONZERO scale with "
+                                "algorithm='blur' to soften texture (wrinkles, "
+                                "pores) while leaving tone/shadow untouched."
+                            ),
+                        },
+                        "blur_type": {
+                            "type": "string",
+                            "enum": ["gaussian", "bilateral"],
+                            "description": "Only used when algorithm='blur'; default = module's current blur_type",
+                        },
+                        "blur_radius": {
+                            "type": "number",
+                            "minimum": 0.1,
+                            "maximum": 200.0,
+                            "description": "Only used when algorithm='blur'; default = module's current blur_radius",
+                        },
+                        "fill_mode": {
+                            "type": "string",
+                            "enum": ["erase", "color"],
+                            "description": "Only used when algorithm='fill'; default = module's current fill_mode",
+                        },
+                        "fill_color": {
+                            "type": "object",
+                            "description": "Only used when algorithm='fill' and fill_mode='color'; default = module's current fill_color",
+                            "properties": {
+                                "r": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "g": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "b": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            },
+                        },
+                        "fill_brightness": {
+                            "type": "number",
+                            "minimum": -1.0,
+                            "maximum": 1.0,
+                            "description": "Only used when algorithm='fill'; default = module's current fill_brightness",
                         },
                         "return_preview": {
                             "type": "boolean",
@@ -2134,7 +2184,7 @@ class DarktableMCPServer:
                             "description": "Render the same captured region again after the edit, for immediate visual verification",
                         },
                     },
-                    "required": ["snapshot_id", "algorithm", "target", "source", "radius"],
+                    "required": ["snapshot_id", "algorithm", "target", "radius"],
                 },
             ),
             Tool(
@@ -2167,8 +2217,14 @@ class DarktableMCPServer:
                         },
                         "algorithm": {
                             "type": "string",
-                            "enum": ["heal", "clone"],
-                            "description": "Optional: change the shape's algorithm; omit to keep it unchanged",
+                            "enum": ["heal", "clone", "blur", "fill"],
+                            "description": (
+                                "Optional: change the shape's algorithm; omit to "
+                                "keep it unchanged. Switching TO heal/clone requires "
+                                "'source'; switching to/staying on blur/fill ignores "
+                                "it (see retouch_add_shape_in_viewport's description "
+                                "for the wavelet-scale texture-vs-tone distinction)."
+                            ),
                         },
                         "coordinate_space": {
                             "type": "string",
@@ -2196,7 +2252,12 @@ class DarktableMCPServer:
                         },
                         "source": {
                             "type": "object",
-                            "description": "New source point, in coordinate_space units",
+                            "description": (
+                                "New source point, in coordinate_space units. "
+                                "Required if the shape's EFFECTIVE algorithm (the "
+                                "new one above, or its current one if omitted) is "
+                                "heal/clone; omit for blur/fill."
+                            ),
                             "properties": {
                                 "x": {"type": "number"},
                                 "y": {"type": "number"},
@@ -2223,13 +2284,44 @@ class DarktableMCPServer:
                             "minimum": 0,
                             "description": "Optional: change the wavelet scale; omit to keep it unchanged",
                         },
+                        "blur_type": {
+                            "type": "string",
+                            "enum": ["gaussian", "bilateral"],
+                            "description": "Optional, only used when the effective algorithm is 'blur'; omit to keep the shape's current value",
+                        },
+                        "blur_radius": {
+                            "type": "number",
+                            "minimum": 0.1,
+                            "maximum": 200.0,
+                            "description": "Optional, only used when the effective algorithm is 'blur'; omit to keep the shape's current value",
+                        },
+                        "fill_mode": {
+                            "type": "string",
+                            "enum": ["erase", "color"],
+                            "description": "Optional, only used when the effective algorithm is 'fill'; omit to keep the shape's current value",
+                        },
+                        "fill_color": {
+                            "type": "object",
+                            "description": "Optional, only used when the effective algorithm is 'fill' and fill_mode='color'; omit to keep the shape's current value",
+                            "properties": {
+                                "r": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "g": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "b": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            },
+                        },
+                        "fill_brightness": {
+                            "type": "number",
+                            "minimum": -1.0,
+                            "maximum": 1.0,
+                            "description": "Optional, only used when the effective algorithm is 'fill'; omit to keep the shape's current value",
+                        },
                         "return_preview": {
                             "type": "boolean",
                             "default": True,
                             "description": "Render the same captured region again after the edit, for immediate visual verification",
                         },
                     },
-                    "required": ["snapshot_id", "formid", "target", "source", "radius"],
+                    "required": ["snapshot_id", "formid", "target", "radius"],
                 },
             ),
             Tool(
@@ -2616,17 +2708,22 @@ class DarktableMCPServer:
                     "post-crop/post-rotate frame get_preview renders. "
                     "Hand-deriving this frame from a preview image is the "
                     "#1 cause of misplaced shapes. "
-                    "Create a local HEAL or CLONE circle shape on the retouch "
-                    "module — the module's actual local-editing surface, "
-                    "distinct from add_path_mask's generic 'restrict this "
-                    "module's blend to a region'. Fixes sensor dust, small "
-                    "surface marks, or localized image artifacts by sampling "
-                    "a source region onto a target region, optionally on a "
-                    "specific wavelet scale (fine detail vs base tones vs "
-                    "residual). Only "
-                    "'circle' shapes and 'heal'/'clone' algorithms are "
-                    "supported so far — ellipse/path/brush and blur/fill are "
-                    "a later phase. Requires a retouch module instance to "
+                    "Create a local HEAL, CLONE, BLUR, or FILL circle shape on "
+                    "the retouch module — the module's actual local-editing "
+                    "surface, distinct from add_path_mask's generic 'restrict "
+                    "this module's blend to a region'. heal/clone fix sensor "
+                    "dust or small marks by sampling a source region onto a "
+                    "target region; blur/fill act on the target area only "
+                    "(no source), optionally on a specific wavelet scale (fine "
+                    "detail vs base tones vs residual). heal/clone always "
+                    "rewrite the full pixel (texture AND tone) regardless of "
+                    "scale; blur/fill on a NONZERO scale affect only that "
+                    "scale's texture, leaving tone/shadow on other scales "
+                    "untouched — the fix for wrinkles/pores, where heal at "
+                    "scale 0 visibly brightens/flattens shadow it should not "
+                    "touch. Only "
+                    "'circle' shapes are supported so far — ellipse/path/brush "
+                    "are a later phase. Requires a retouch module instance to "
                     "already exist in the open image's history (call "
                     "enable_module/add_instance first if needed) and "
                     "darktable running with the darktable-mcp Lua plugin. "
@@ -2642,7 +2739,7 @@ class DarktableMCPServer:
                         },
                         "algorithm": {
                             "type": "string",
-                            "enum": ["heal", "clone"],
+                            "enum": ["heal", "clone", "blur", "fill"],
                             "description": "Retouch algorithm for this shape",
                         },
                         "shape_type": {
@@ -2664,8 +2761,9 @@ class DarktableMCPServer:
                             "type": "object",
                             "description": (
                                 "Source point to sample from, normalized "
-                                "0..1. Required for heal/clone — this is an "
-                                "ABSOLUTE point, not an offset from target."
+                                "0..1. Required for algorithm='heal'/'clone' — "
+                                "this is an ABSOLUTE point, not an offset from "
+                                "target. Omit for 'blur'/'fill' (no source)."
                             ),
                             "properties": {
                                 "x": {"type": "number", "minimum": 0, "maximum": 1},
@@ -2701,11 +2799,44 @@ class DarktableMCPServer:
                                 "image, 1..N = a specific detail scale, N+1 "
                                 "= residual. Defaults to the module's "
                                 "current scale if omitted — check "
-                                "retouch_list_shapes for num_scales/curr_scale."
+                                "retouch_list_shapes for num_scales/curr_scale. "
+                                "Use a NONZERO scale with algorithm='blur' to "
+                                "soften texture without touching tone."
                             ),
                         },
+                        "blur_type": {
+                            "type": "string",
+                            "enum": ["gaussian", "bilateral"],
+                            "description": "Only used when algorithm='blur'; default = module's current blur_type",
+                        },
+                        "blur_radius": {
+                            "type": "number",
+                            "minimum": 0.1,
+                            "maximum": 200.0,
+                            "description": "Only used when algorithm='blur'; default = module's current blur_radius",
+                        },
+                        "fill_mode": {
+                            "type": "string",
+                            "enum": ["erase", "color"],
+                            "description": "Only used when algorithm='fill'; default = module's current fill_mode",
+                        },
+                        "fill_color": {
+                            "type": "object",
+                            "description": "Only used when algorithm='fill' and fill_mode='color'; default = module's current fill_color",
+                            "properties": {
+                                "r": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "g": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "b": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            },
+                        },
+                        "fill_brightness": {
+                            "type": "number",
+                            "minimum": -1.0,
+                            "maximum": 1.0,
+                            "description": "Only used when algorithm='fill'; default = module's current fill_brightness",
+                        },
                     },
-                    "required": ["algorithm", "target", "source", "radius"],
+                    "required": ["algorithm", "target", "radius"],
                 },
             ),
             Tool(
@@ -4557,7 +4688,7 @@ class DarktableMCPServer:
     def _backtransform_to_mask_space(
         self,
         display_target: Dict[str, float],
-        display_source: Dict[str, float],
+        display_source: Optional[Dict[str, float]],
         display_radius: float,
         display_feather: float,
     ):
@@ -4568,8 +4699,13 @@ class DarktableMCPServer:
         retouch_update_shape actually store (see dt.develop.backtransform_point's
         doc comment, src-dt/src/lua/develop.c, for why these frames differ).
 
+        display_source is None for blur/fill shapes (no source point at all --
+        see retouch_add_shape's doc comment on why); the source leg is then
+        skipped entirely rather than backtransforming a meaningless point.
+
         Returns (mask_dict, error_response) -- exactly one is None. mask_dict
-        has target/source ({x,y}) and radius/feather (floats)."""
+        has target ({x,y}), source ({x,y} or None), and radius/feather
+        (floats)."""
         target_params: Dict[str, Any] = {
             "x": display_target["x"], "y": display_target["y"], "len1": display_radius,
         }
@@ -4594,32 +4730,35 @@ class DarktableMCPServer:
                 type="text", text=f"backtransform_point(target): {target_result['error']}"
             )]
 
-        try:
-            source_result = self.bridge.call(
-                "dev_backtransform_point",
-                {"x": display_source["x"], "y": display_source["y"]},
-                timeout=15.0,
-            )
-        except BridgePluginNotInstalledError:
-            return None, [TextContent(
-                type="text",
-                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
-            )]
-        except BridgeTimeoutError:
-            return None, [TextContent(
-                type="text",
-                text="darktable not running, or plugin not loaded. Open darktable and try again.",
-            )]
-        except BridgeError as e:
-            return None, [TextContent(type="text", text=f"Plugin error: {e}")]
-        if source_result.get("error"):
-            return None, [TextContent(
-                type="text", text=f"backtransform_point(source): {source_result['error']}"
-            )]
+        source_out = None
+        if display_source is not None:
+            try:
+                source_result = self.bridge.call(
+                    "dev_backtransform_point",
+                    {"x": display_source["x"], "y": display_source["y"]},
+                    timeout=15.0,
+                )
+            except BridgePluginNotInstalledError:
+                return None, [TextContent(
+                    type="text",
+                    text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+                )]
+            except BridgeTimeoutError:
+                return None, [TextContent(
+                    type="text",
+                    text="darktable not running, or plugin not loaded. Open darktable and try again.",
+                )]
+            except BridgeError as e:
+                return None, [TextContent(type="text", text=f"Plugin error: {e}")]
+            if source_result.get("error"):
+                return None, [TextContent(
+                    type="text", text=f"backtransform_point(source): {source_result['error']}"
+                )]
+            source_out = {"x": source_result["x"], "y": source_result["y"]}
 
         return {
             "target": {"x": target_result["x"], "y": target_result["y"]},
-            "source": {"x": source_result["x"], "y": source_result["y"]},
+            "source": source_out,
             "radius": target_result.get("len1", display_radius),
             "feather": target_result.get("len2", 0.0) if display_feather > 0 else 0.0,
         }, None
@@ -6162,7 +6301,8 @@ class DarktableMCPServer:
         if not isinstance(target, dict) or "x" not in target or "y" not in target:
             return [TextContent(type="text", text="target {x,y} is required")]
         source = arguments.get("source")
-        if not isinstance(source, dict) or "x" not in source or "y" not in source:
+        needs_source = algorithm in ("heal", "clone")
+        if needs_source and (not isinstance(source, dict) or "x" not in source or "y" not in source):
             return [TextContent(type="text", text="source {x,y} is required for heal/clone")]
         radius = arguments.get("radius")
         if radius is None:
@@ -6177,13 +6317,29 @@ class DarktableMCPServer:
             "instance": instance,
             "algorithm": algorithm,
             "target": {"x": float(target["x"]), "y": float(target["y"])},
-            "source": {"x": float(source["x"]), "y": float(source["y"])},
             "radius": float(radius),
             "feather": float(arguments.get("feather", 0.0)),
             "opacity": float(arguments.get("opacity", 1.0)),
         }
+        if isinstance(source, dict) and "x" in source and "y" in source:
+            params["source"] = {"x": float(source["x"]), "y": float(source["y"])}
         if arguments.get("wavelet_scale") is not None:
             params["wavelet_scale"] = int(arguments["wavelet_scale"])
+        if arguments.get("blur_type") is not None:
+            params["blur_type"] = arguments["blur_type"]
+        if arguments.get("blur_radius") is not None:
+            params["blur_radius"] = float(arguments["blur_radius"])
+        if arguments.get("fill_mode") is not None:
+            params["fill_mode"] = arguments["fill_mode"]
+        fill_color = arguments.get("fill_color")
+        if isinstance(fill_color, dict):
+            params["fill_color"] = {
+                "r": float(fill_color.get("r", 0.0)),
+                "g": float(fill_color.get("g", 0.0)),
+                "b": float(fill_color.get("b", 0.0)),
+            }
+        if arguments.get("fill_brightness") is not None:
+            params["fill_brightness"] = float(arguments["fill_brightness"])
 
         try:
             result = self.bridge.call("dev_retouch_add_shape", params, timeout=15.0)
@@ -6214,8 +6370,17 @@ class DarktableMCPServer:
             f"formid={result.get('formid')} algorithm={result.get('algorithm')} "
             f"wavelet_scale={result.get('wavelet_scale')} radius={result.get('radius')} "
             f"feather={result.get('feather')} opacity={result.get('opacity')}",
-            "Call get_preview() to see the retouched result.",
         ]
+        if result.get("algorithm") == "blur":
+            lines.append(
+                f"  blur_type={result.get('blur_type')} blur_radius={result.get('blur_radius')}"
+            )
+        elif result.get("algorithm") == "fill":
+            lines.append(
+                f"  fill_mode={result.get('fill_mode')} fill_color={result.get('fill_color')} "
+                f"fill_brightness={result.get('fill_brightness')}"
+            )
+        lines.append("Call get_preview() to see the retouched result.")
         return [TextContent(type="text", text="\n".join(lines))]
 
     async def _handle_retouch_add_shape_in_viewport(self, arguments: Dict[str, Any]) -> List[Any]:
@@ -6226,8 +6391,11 @@ class DarktableMCPServer:
         algorithm = arguments.get("algorithm")
         if not algorithm:
             return [TextContent(type="text", text="algorithm is required")]
+        needs_source = algorithm in ("heal", "clone")
         target = arguments.get("target")
         source = arguments.get("source")
+        if needs_source and not isinstance(source, dict):
+            return [TextContent(type="text", text="source {x,y} is required for heal/clone")]
         radius = arguments.get("radius")
         if radius is None:
             return [TextContent(type="text", text="radius is required")]
@@ -6238,12 +6406,18 @@ class DarktableMCPServer:
         radius_space = canonical_space(arguments.get("radius_space", coordinate_space))
 
         # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized
-        # (same frame get_viewport()/get_preview() use).
+        # (same frame get_viewport()/get_preview() use). source is skipped
+        # for blur/fill (no source point at all -- see retouch_add_shape's
+        # doc comment).
         display_target = viewport_point_to_image(
             region, target, coordinate_space, render["width"], render["height"], label="target"
         )
-        display_source = viewport_point_to_image(
-            region, source, coordinate_space, render["width"], render["height"], label="source"
+        display_source = (
+            viewport_point_to_image(
+                region, source, coordinate_space, render["width"], render["height"], label="source"
+            )
+            if isinstance(source, dict)
+            else None
         )
         display_radius = viewport_radius_to_image(region, float(radius), radius_space, render["width"])
         feather_local = float(arguments.get("feather", 0.0))
@@ -6281,13 +6455,29 @@ class DarktableMCPServer:
             "instance": instance,
             "algorithm": algorithm,
             "target": full_target,
-            "source": full_source,
             "radius": full_radius,
             "feather": full_feather,
             "opacity": float(arguments.get("opacity", 1.0)),
         }
+        if full_source is not None:
+            params["source"] = full_source
         if arguments.get("wavelet_scale") is not None:
             params["wavelet_scale"] = int(arguments["wavelet_scale"])
+        if arguments.get("blur_type") is not None:
+            params["blur_type"] = arguments["blur_type"]
+        if arguments.get("blur_radius") is not None:
+            params["blur_radius"] = float(arguments["blur_radius"])
+        if arguments.get("fill_mode") is not None:
+            params["fill_mode"] = arguments["fill_mode"]
+        fill_color = arguments.get("fill_color")
+        if isinstance(fill_color, dict):
+            params["fill_color"] = {
+                "r": float(fill_color.get("r", 0.0)),
+                "g": float(fill_color.get("g", 0.0)),
+                "b": float(fill_color.get("b", 0.0)),
+            }
+        if arguments.get("fill_brightness") is not None:
+            params["fill_brightness"] = float(arguments["fill_brightness"])
 
         try:
             result = self.bridge.call("dev_retouch_add_shape", params, timeout=15.0)
@@ -6329,6 +6519,15 @@ class DarktableMCPServer:
             f"'{arguments.get('snapshot_id')}', mode='source_and_target', "
             f"highlight_formid={result.get('formid')})",
         ]
+        if result.get("algorithm") == "blur":
+            lines.append(
+                f"  blur_type={result.get('blur_type')} blur_radius={result.get('blur_radius')}"
+            )
+        elif result.get("algorithm") == "fill":
+            lines.append(
+                f"  fill_mode={result.get('fill_mode')} fill_color={result.get('fill_color')} "
+                f"fill_brightness={result.get('fill_brightness')}"
+            )
 
         out: List[Any] = []
         if bool(arguments.get("return_preview", True)):
@@ -6349,6 +6548,12 @@ class DarktableMCPServer:
             return [TextContent(type="text", text="formid is required")]
         target = arguments.get("target")
         source = arguments.get("source")
+        # algorithm is optional here (omit to keep the shape's current one),
+        # so only reject client-side when it's explicitly given as heal/clone
+        # without a source -- C does the authoritative check when algorithm
+        # is omitted, since only it knows the shape's current algorithm.
+        if arguments.get("algorithm") in ("heal", "clone") and not isinstance(source, dict):
+            return [TextContent(type="text", text="source {x,y} is required for heal/clone")]
         radius = arguments.get("radius")
         if radius is None:
             return [TextContent(type="text", text="radius is required")]
@@ -6362,8 +6567,12 @@ class DarktableMCPServer:
         display_target = viewport_point_to_image(
             region, target, coordinate_space, render["width"], render["height"], label="target"
         )
-        display_source = viewport_point_to_image(
-            region, source, coordinate_space, render["width"], render["height"], label="source"
+        display_source = (
+            viewport_point_to_image(
+                region, source, coordinate_space, render["width"], render["height"], label="source"
+            )
+            if isinstance(source, dict)
+            else None
         )
         display_radius = viewport_radius_to_image(region, float(radius), radius_space, render["width"])
         feather_local = float(arguments.get("feather", 0.0))
@@ -6396,16 +6605,32 @@ class DarktableMCPServer:
             "instance": instance,
             "formid": int(formid),
             "target": full_target,
-            "source": full_source,
             "radius": full_radius,
             "feather": full_feather,
         }
+        if full_source is not None:
+            params["source"] = full_source
         if arguments.get("algorithm"):
             params["algorithm"] = arguments["algorithm"]
         if arguments.get("wavelet_scale") is not None:
             params["wavelet_scale"] = int(arguments["wavelet_scale"])
         if arguments.get("opacity") is not None:
             params["opacity"] = float(arguments["opacity"])
+        if arguments.get("blur_type") is not None:
+            params["blur_type"] = arguments["blur_type"]
+        if arguments.get("blur_radius") is not None:
+            params["blur_radius"] = float(arguments["blur_radius"])
+        if arguments.get("fill_mode") is not None:
+            params["fill_mode"] = arguments["fill_mode"]
+        fill_color = arguments.get("fill_color")
+        if isinstance(fill_color, dict):
+            params["fill_color"] = {
+                "r": float(fill_color.get("r", 0.0)),
+                "g": float(fill_color.get("g", 0.0)),
+                "b": float(fill_color.get("b", 0.0)),
+            }
+        if arguments.get("fill_brightness") is not None:
+            params["fill_brightness"] = float(arguments["fill_brightness"])
 
         try:
             result = self.bridge.call("dev_retouch_update_shape", params, timeout=15.0)
@@ -6447,6 +6672,15 @@ class DarktableMCPServer:
             f"'{arguments.get('snapshot_id')}', mode='source_and_target', "
             f"highlight_formid={formid})",
         ]
+        if result.get("algorithm") == "blur":
+            lines.append(
+                f"  blur_type={result.get('blur_type')} blur_radius={result.get('blur_radius')}"
+            )
+        elif result.get("algorithm") == "fill":
+            lines.append(
+                f"  fill_mode={result.get('fill_mode')} fill_color={result.get('fill_color')} "
+                f"fill_brightness={result.get('fill_brightness')}"
+            )
 
         out: List[Any] = []
         if bool(arguments.get("return_preview", True)):

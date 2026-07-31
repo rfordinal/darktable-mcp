@@ -543,10 +543,28 @@ end
 
 do
   local ok, err = pcall(internals.methods.dev_retouch_update_shape, {
+    op = "retouch", formid = 42, algorithm = "heal",
+    target = {x = 0.4, y = 0.3}, radius = 0.02,
+  })
+  assertTrue(not ok, "dev_retouch_update_shape errors without a source point when algorithm='heal'")
+  assertTrue(string.find(err or "", "source") ~= nil, "error mentions source")
+end
+
+do
+  -- algorithm omitted entirely (keep the shape's current one) AND source
+  -- omitted: the bridge no longer knows whether the shape's current
+  -- algorithm needs a source, so it must NOT error here -- only C (which
+  -- knows the shape's live algorithm) can make that call. 2026-07-31 blur/
+  -- fill batch: source is nil for blur/fill algorithms, so a bare "move"
+  -- call must be allowed through without one.
+  develop_calls = {}
+  local result = internals.methods.dev_retouch_update_shape({
     op = "retouch", formid = 42, target = {x = 0.4, y = 0.3}, radius = 0.02,
   })
-  assertTrue(not ok, "dev_retouch_update_shape errors without a source point")
-  assertTrue(string.find(err or "", "source") ~= nil, "error mentions source")
+  assertEq(result.formid, 42, "dev_retouch_update_shape without algorithm/source reaches C")
+  local call = develop_calls[1]
+  assertEq(call.args[8], nil, "source_x omitted -> nil when algorithm is unspecified and no source given")
+  assertEq(call.args[9], nil, "source_y omitted -> nil when algorithm is unspecified and no source given")
 end
 
 do

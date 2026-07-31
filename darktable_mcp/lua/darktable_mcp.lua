@@ -822,12 +822,18 @@ methods.dev_add_path_mask = function(p)
   return dt.develop.add_path_mask(op, instance, points, opacity, feather, smooth)
 end
 
--- Retouch module: local heal/clone shapes tied to the module's own wavelet
--- scale + rt_forms array (dt.develop.retouch_add_shape/delete_shape/
+-- Retouch module: local heal/clone/blur/fill shapes tied to the module's own
+-- wavelet scale + rt_forms array (dt.develop.retouch_add_shape/delete_shape/
 -- list_shapes, src/lua/develop.c) -- distinct from dev_add_path_mask's
--- generic "restrict this module's blend to a region". Only circle shapes /
--- heal+clone algorithms are supported this phase; ellipse/path/brush and
--- blur/fill are a later phase (see PLAN.md).
+-- generic "restrict this module's blend to a region". Only circle shapes are
+-- supported this phase; ellipse/path/brush are a later phase (see PLAN.md).
+-- blur/fill let you soften/erase texture on a nonzero wavelet scale WITHOUT
+-- touching tone/shadow on the other scales -- unlike heal/clone at scale 0,
+-- which always rewrites the full pixel (tone included). See
+-- dt.develop.retouch_add_shape's doc comment (src/lua/develop.c) for the full
+-- wavelet-scale explanation.
+local RETOUCH_ALGOS_NEEDING_SOURCE = { heal = true, clone = true }
+
 methods.dev_retouch_add_shape = function(p)
   p = p or {}
   local op = p.op
@@ -843,8 +849,14 @@ methods.dev_retouch_add_shape = function(p)
     error("dev_retouch_add_shape: target {x,y} required")
   end
   local source = p.source
-  if type(source) ~= "table" or tonumber(source.x) == nil or tonumber(source.y) == nil then
-    error("dev_retouch_add_shape: source {x,y} required for heal/clone")
+  local source_x, source_y
+  if RETOUCH_ALGOS_NEEDING_SOURCE[algorithm] then
+    if type(source) ~= "table" or tonumber(source.x) == nil or tonumber(source.y) == nil then
+      error("dev_retouch_add_shape: source {x,y} required for heal/clone")
+    end
+    source_x, source_y = tonumber(source.x), tonumber(source.y)
+  elseif type(source) == "table" then
+    source_x, source_y = tonumber(source.x), tonumber(source.y)
   end
   local radius = tonumber(p.radius)
   if radius == nil then error("dev_retouch_add_shape: radius required") end
@@ -852,16 +864,30 @@ methods.dev_retouch_add_shape = function(p)
   local scale = tonumber(p.wavelet_scale) -- nil -> C default (module's curr_scale)
   local opacity = tonumber(p.opacity)
   if opacity == nil then opacity = 1.0 end
+  local blur_type = p.blur_type -- nil -> C default (module's current blur_type)
+  local blur_radius = tonumber(p.blur_radius) -- nil -> C default (module's current blur_radius)
+  local fill_mode = p.fill_mode -- nil -> C default (module's current fill_mode)
+  local fill_color = p.fill_color
+  local fill_r, fill_g, fill_b
+  if type(fill_color) == "table" then
+    fill_r, fill_g, fill_b =
+      tonumber(fill_color.r), tonumber(fill_color.g), tonumber(fill_color.b)
+  end
+  local fill_brightness = tonumber(p.fill_brightness) -- nil -> C default
   return dt.develop.retouch_add_shape(op, instance, algorithm,
     tonumber(target.x), tonumber(target.y), radius, feather,
-    tonumber(source.x), tonumber(source.y), scale, opacity)
+    source_x, source_y, scale, opacity,
+    blur_type, blur_radius, fill_mode, fill_r, fill_g, fill_b, fill_brightness)
 end
 
 -- Move/resize an existing shape in place (same formid) -- see
 -- dt.develop.retouch_update_shape's doc comment in src/lua/develop.c for why
 -- this is a masks-history commit, distinct from retouch_add_shape's
--- iop-params-history one. algorithm/wavelet_scale/opacity are all optional:
--- omit to keep the shape's current value.
+-- iop-params-history one. algorithm/wavelet_scale/opacity/blur_*/fill_* are
+-- all optional: omit to keep the shape's current value. source is required
+-- only when the EFFECTIVE algorithm (the one given here, or the shape's
+-- current one if omitted) is heal/clone -- C does the authoritative check
+-- since only it knows the shape's current algorithm when none is passed.
 methods.dev_retouch_update_shape = function(p)
   p = p or {}
   local op = p.op
@@ -873,19 +899,33 @@ methods.dev_retouch_update_shape = function(p)
   if type(target) ~= "table" or tonumber(target.x) == nil or tonumber(target.y) == nil then
     error("dev_retouch_update_shape: target {x,y} required")
   end
+  local algorithm = p.algorithm -- nil -> C keeps the shape's current algorithm
   local source = p.source
-  if type(source) ~= "table" or tonumber(source.x) == nil or tonumber(source.y) == nil then
-    error("dev_retouch_update_shape: source {x,y} required")
+  local source_x, source_y
+  if type(source) == "table" then
+    source_x, source_y = tonumber(source.x), tonumber(source.y)
+  elseif RETOUCH_ALGOS_NEEDING_SOURCE[algorithm] then
+    error("dev_retouch_update_shape: source {x,y} required for heal/clone")
   end
   local radius = tonumber(p.radius)
   if radius == nil then error("dev_retouch_update_shape: radius required") end
   local feather = tonumber(p.feather) or 0.0
-  local algorithm = p.algorithm -- nil -> C keeps the shape's current algorithm
   local scale = tonumber(p.wavelet_scale) -- nil -> C keeps the shape's current scale
   local opacity = tonumber(p.opacity) -- nil -> C leaves opacity untouched
+  local blur_type = p.blur_type
+  local blur_radius = tonumber(p.blur_radius)
+  local fill_mode = p.fill_mode
+  local fill_color = p.fill_color
+  local fill_r, fill_g, fill_b
+  if type(fill_color) == "table" then
+    fill_r, fill_g, fill_b =
+      tonumber(fill_color.r), tonumber(fill_color.g), tonumber(fill_color.b)
+  end
+  local fill_brightness = tonumber(p.fill_brightness)
   return dt.develop.retouch_update_shape(op, instance, formid,
     tonumber(target.x), tonumber(target.y), radius, feather,
-    tonumber(source.x), tonumber(source.y), algorithm, scale, opacity)
+    source_x, source_y, algorithm, scale, opacity,
+    blur_type, blur_radius, fill_mode, fill_r, fill_g, fill_b, fill_brightness)
 end
 
 methods.dev_retouch_delete_shape = function(p)
