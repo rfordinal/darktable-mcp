@@ -63,6 +63,8 @@ class TestDarktableMCPServer:
             "compare_luts",
             "add_instance",
             "get_viewport",
+            "set_viewport",
+            "restore_viewport",
             "capture_viewport",
             "add_path_mask",
             "add_path_mask_in_viewport",
@@ -578,6 +580,65 @@ async def test_handle_capture_viewport_success():
     # The snapshot must carry the image it is a picture of, so later mutating
     # calls can refuse to write to a different photo.
     assert snapshot["image"]["id"] == 13406
+    # 2026-07-31 fix: capture_viewport must read the pixels from THIS
+    # viewport's own pipe (dev_preview's viewport= param), and must NOT also
+    # pass `region` -- dev->full.pipe's own backbuf is already exactly that
+    # crop once zoomed, passing region again would double-crop it.
+    preview_call = server.bridge.call.call_args_list[2]
+    assert preview_call.args[0] == "dev_preview"
+    assert preview_call.args[1] == {"max_w": 1400, "max_h": 1400, "viewport": "main"}
+
+
+@pytest.mark.asyncio
+async def test_handle_capture_viewport_preview2_reads_preview2_pipe():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"preview2": {"active": True, "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}}},
+        IMAGE_13406,
+        {"path": "/tmp/preview2.png", "width": 900, "height": 600},
+        IMAGE_13406,
+    ]
+    result = await server._handle_capture_viewport({"viewport": "preview2", "return_image": False})
+    assert "snapshot_id=vp_" in result[0].text
+    preview_call = server.bridge.call.call_args_list[2]
+    assert preview_call.args[1] == {"max_w": 1400, "max_h": 1400, "viewport": "preview2"}
+
+
+@pytest.mark.asyncio
+async def test_handle_get_preview_viewport_passthrough():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "status": "ok", "path": "/tmp/p.png", "width": 500, "height": 400,
+        "viewport_source": "main",
+    }
+    result = await server._handle_get_preview({"viewport": "main"})
+    first_call = server.bridge.call.call_args_list[0]
+    assert first_call.args == ("dev_preview", {"max_w": 1024, "max_h": 1024, "viewport": "main"})
+    assert first_call.kwargs == {"timeout": 20.0}
+    assert "source: main" in result[-1].text
+
+
+@pytest.mark.asyncio
+async def test_handle_get_preview_omitted_viewport_unchanged():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"status": "ok", "path": "/tmp/p.png", "width": 500, "height": 400}
+    result = await server._handle_get_preview({})
+    first_call = server.bridge.call.call_args_list[0]
+    assert first_call.args == ("dev_preview", {"max_w": 1024, "max_h": 1024})
+    assert first_call.kwargs == {"timeout": 20.0}
+    assert "source: preview_pipe" in result[-1].text
+
+
+@pytest.mark.asyncio
+async def test_handle_get_preview_rejects_bad_viewport():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_get_preview({"viewport": "nope"})
+    assert "viewport must be" in result[0].text
+    server.bridge.call.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -589,6 +650,346 @@ async def test_handle_capture_viewport_preview2_inactive():
         "preview2": {"active": False},
     }
     result = await server._handle_capture_viewport({"viewport": "preview2"})
+    assert "viewport_not_active" in result[0].text
+
+
+# ---- set_viewport / restore_viewport (2026-07-31 set-viewport-design) -----
+#
+# Fixture geometry chosen so the aspect-expand math is hand-verifiable:
+# viewport_width/processed_width and viewport_height/processed_height are
+# both exactly 0.5, so k = (viewport_w*proch)/(viewport_h*procw) == 1.0 --
+# a square region request needs no expansion, a non-square one does, by a
+# predictable amount.
+_VP_MAIN_BASE = {
+    "region": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.2},
+    "scale": 0.5,
+    "zoom_x": -0.07,
+    "zoom_y": 0.11,
+    "viewport_width": 1000,
+    "viewport_height": 700,
+    "processed_width": 2000,
+    "processed_height": 1400,
+}
+
+_SET_VIEWPORT_PREVIOUS = {
+    "zoom": 3, "zoom_label": "free", "closeup": 0,
+    "zoom_x": -0.07, "zoom_y": 0.11, "scale": 0.5,
+}
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_region_no_aspect_adjustment():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    # sequence: (1) dev_get_viewport [current state], (2) dev_set_viewport,
+    # (3) dev_get_viewport [re-read achieved], (4) dev_preview [probe].
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": -0.1, "zoom_y": -0.05, "scale": 2.5},
+            "clamped": [], "pipe_ready": True, "waited_ms": 30,
+        },
+        {"main": {"region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2}, "scale": 2.5}},
+        {"path": "/tmp/probe.png", "width": 1000, "height": 1000},
+    ]
+    # square request (rw==rh) with k==1.0 -> no expansion needed.
+    result = await server._handle_set_viewport({
+        "region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2},
+    })
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["aspect_adjusted"] is False
+    assert payload["achieved"]["region"] == {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2}
+    assert payload["achieved"]["renderable_px"] == {"w": 1000, "h": 1000}
+    assert payload["pipe_ready"] is True
+    assert payload["previous"] == _SET_VIEWPORT_PREVIOUS
+    assert payload["clamped"] == []
+
+    # verify the inverted region->zoom_x/zoom_y/scale math handed to the
+    # bridge: center=(0.4,0.5) -> zoom_x=-0.1, zoom_y=0.0; required_h=rw=rh
+    # =0.2 -> scale = viewport_h/(proch*0.2) = 700/(1400*0.2) = 2.5.
+    set_call = server.bridge.call.call_args_list[1]
+    assert set_call.args[0] == "dev_set_viewport"
+    params = set_call.args[1]
+    assert params["viewport"] == "main"
+    assert params["scale"] == pytest.approx(2.5)
+    assert params["zoom_x"] == pytest.approx(-0.1)
+    assert params["zoom_y"] == pytest.approx(0.0)
+    assert params["wait_for_pipe"] is True
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_region_aspect_expand():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": -0.1, "zoom_y": -0.05, "scale": 2.5},
+            "clamped": [], "pipe_ready": True, "waited_ms": 30,
+        },
+        {"main": {"region": {"x": 0.3, "y": 0.35, "w": 0.2, "h": 0.2}, "scale": 2.5}},
+        {"path": "/tmp/probe.png", "width": 900, "height": 900},
+    ]
+    # rw=0.2, rh=0.1 -- narrower than the image/viewport aspect (k=1), so the
+    # HEIGHT must expand to 0.2 to keep the request fully visible without
+    # cropping (requirement 2), centered on the same point.
+    result = await server._handle_set_viewport({
+        "region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.1},
+    })
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["aspect_adjusted"] is True
+    assert payload["requested_region"] == {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.1}
+
+    set_call = server.bridge.call.call_args_list[1]
+    params = set_call.args[1]
+    # center_x=0.4,center_y=0.45 -> zoom_x=-0.1, zoom_y=-0.05; required_h=0.2
+    # -> scale=700/(1400*0.2)=2.5
+    assert params["scale"] == pytest.approx(2.5)
+    assert params["zoom_x"] == pytest.approx(-0.1)
+    assert params["zoom_y"] == pytest.approx(-0.05)
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_scale_keeps_current_pan():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": -0.07, "zoom_y": 0.11, "scale": 2.0},
+            "clamped": [], "pipe_ready": True, "waited_ms": 10,
+        },
+        {"main": {"region": {"x": 0.2, "y": 0.3, "w": 0.25, "h": 0.25}, "scale": 2.0}},
+        {"path": "/tmp/probe.png", "width": 800, "height": 800},
+    ]
+    result = await server._handle_set_viewport({"scale": 2.0})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    set_call = server.bridge.call.call_args_list[1]
+    params = set_call.args[1]
+    # a plain scale change must NOT move the pan.
+    assert params["zoom_x"] == pytest.approx(_VP_MAIN_BASE["zoom_x"])
+    assert params["zoom_y"] == pytest.approx(_VP_MAIN_BASE["zoom_y"])
+    assert params["scale"] == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_mode_fit_centers_pan():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": 0.0, "zoom_y": 0.0, "scale": 0.5},
+            "clamped": [], "pipe_ready": True, "waited_ms": 5,
+        },
+        {"main": {"region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}, "scale": 0.5}},
+        {"path": "/tmp/probe.png", "width": 1000, "height": 700},
+    ]
+    result = await server._handle_set_viewport({"mode": "fit"})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    set_call = server.bridge.call.call_args_list[1]
+    params = set_call.args[1]
+    # fit_scale = min(viewport_w/procw, viewport_h/proch) = min(0.5, 0.5) = 0.5
+    assert params["scale"] == pytest.approx(0.5)
+    assert params["zoom_x"] == pytest.approx(0.0)
+    assert params["zoom_y"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_clamped_scale_reported():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": -0.07, "zoom_y": 0.11, "scale": 16.0},
+            "clamped": [
+                {"field": "scale", "requested": 99.0, "clamped_to": 16.0,
+                 "floor": 0.35, "ceiling": 16.0},
+            ],
+            "pipe_ready": True, "waited_ms": 40,
+        },
+        {"main": {"region": {"x": 0.4, "y": 0.4, "w": 0.03, "h": 0.03}, "scale": 16.0}},
+        {"path": "/tmp/probe.png", "width": 800, "height": 800},
+    ]
+    result = await server._handle_set_viewport({"scale": 99.0})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    # requirement 6: report the clamp using set_params' own clamped-list
+    # convention (field/requested/applied/min/max), not the C-side's
+    # internal clamped_to/floor/ceiling names.
+    assert payload["clamped"] == [
+        {"field": "scale", "requested": 99.0, "applied": 16.0, "min": 0.35, "max": 16.0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_pipe_not_ready_is_reported_not_swallowed():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": -0.07, "zoom_y": 0.11, "scale": 2.0},
+            "clamped": [], "pipe_ready": False, "waited_ms": 4000,
+        },
+        {"main": {"region": {"x": 0.2, "y": 0.3, "w": 0.25, "h": 0.25}, "scale": 2.0}},
+        {"path": "/tmp/probe.png", "width": 800, "height": 800},
+    ]
+    result = await server._handle_set_viewport({"scale": 2.0})
+    payload = json.loads(result[0].text)
+    # ok=True (the call itself succeeded) but pipe_ready must surface the
+    # timeout truthfully -- this is requirement 3's core guard: never a false
+    # "ok" hiding a stale-pipe timeout.
+    assert payload["ok"] is True
+    assert payload["pipe_ready"] is False
+    assert payload["waited_ms"] == 4000
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_preview2_inactive_no_state_change():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "main": dict(_VP_MAIN_BASE),
+        "preview2": {"active": False},
+    }
+    result = await server._handle_set_viewport({"viewport": "preview2", "scale": 1.0})
+    assert "viewport_not_active" in result[0].text
+    # acceptance test 5: no state change -- only the read-only dev_get_viewport
+    # probe was ever called, dev_set_viewport must never be reached.
+    assert server.bridge.call.call_count == 1
+    server.bridge.call.assert_called_once_with("dev_get_viewport", {}, timeout=15.0)
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_requires_exactly_one_of_region_scale_mode():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_set_viewport({})
+    assert "exactly one of" in result[0].text
+    result2 = await server._handle_set_viewport({"region": {"x": 0, "y": 0, "w": 1, "h": 1}, "scale": 1.0})
+    assert "exactly one of" in result2[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_rejects_out_of_bounds_region():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"main": dict(_VP_MAIN_BASE)}
+    result = await server._handle_set_viewport({"region": {"x": 0.9, "y": 0.0, "w": 0.5, "h": 0.2}})
+    assert "region must be within" in result[0].text
+    # the out-of-bounds region is caught after reading current state (needed
+    # to know if preview2 is even active) but strictly BEFORE ever calling
+    # dev_set_viewport -- no zoom/pan write is attempted for invalid input.
+    server.bridge.call.assert_called_once_with("dev_get_viewport", {}, timeout=15.0)
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_min_render_px_across_not_pursued_when_unmet():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": -0.1, "zoom_y": 0.0, "scale": 2.5},
+            "clamped": [], "pipe_ready": True, "waited_ms": 20,
+        },
+        {"main": {"region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2}, "scale": 2.5}},
+        {"path": "/tmp/probe.png", "width": 200, "height": 200},
+    ]
+    result = await server._handle_set_viewport({
+        "region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2},
+        "min_render_px_across": 800,
+    })
+    payload = json.loads(result[0].text)
+    assert payload["min_render_px_across_satisfied"] is False
+    assert "note" in payload
+    # exactly 4 bridge calls -- no extra "zoom in further" attempt.
+    assert server.bridge.call.call_count == 4
+    # the probe itself must use viewport=, not region= -- same fix as
+    # capture_viewport (2026-07-31): full.pipe's backbuf IS already the
+    # achieved-region crop once zoomed, passing region again double-crops.
+    probe_call = server.bridge.call.call_args_list[3]
+    assert probe_call.args[1] == {"max_w": 8192, "max_h": 8192, "viewport": "main"}
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_min_render_px_across_satisfied():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": -0.1, "zoom_y": 0.0, "scale": 2.5},
+            "clamped": [], "pipe_ready": True, "waited_ms": 20,
+        },
+        {"main": {"region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2}, "scale": 2.5}},
+        # 2026-07-31 fix: once capture_viewport reads dev->full.pipe's own
+        # backbuf, a zoomed-in region genuinely CAN reach a high pixel
+        # count (up to the darkroom window's own size) -- unlike before,
+        # this is now achievable, not permanently defeatist.
+        {"path": "/tmp/probe.png", "width": 1000, "height": 1000},
+    ]
+    result = await server._handle_set_viewport({
+        "region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2},
+        "min_render_px_across": 800,
+    })
+    payload = json.loads(result[0].text)
+    assert payload["min_render_px_across_satisfied"] is True
+    assert "note" not in payload
+
+
+@pytest.mark.asyncio
+async def test_handle_restore_viewport_success():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "viewport": "main", "pipe_ready": True, "waited_ms": 12,
+    }
+    result = await server._handle_restore_viewport({"previous": _SET_VIEWPORT_PREVIOUS})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    server.bridge.call.assert_called_once_with(
+        "dev_restore_viewport",
+        {
+            "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "wait_for_pipe": True, "timeout_ms": 4000,
+        },
+        timeout=20.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_restore_viewport_requires_previous():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_restore_viewport({})
+    assert "previous" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_restore_viewport_preview2_inactive():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"error": "viewport_not_active: preview2 window is not open"}
+    result = await server._handle_restore_viewport({
+        "viewport": "preview2", "previous": _SET_VIEWPORT_PREVIOUS,
+    })
     assert "viewport_not_active" in result[0].text
 
 

@@ -1798,6 +1798,17 @@ class DarktableMCPServer:
                                 "h": {"type": "number", "minimum": 0, "maximum": 1},
                             },
                         },
+                        "viewport": {
+                            "type": "string",
+                            "enum": ["main", "preview2"],
+                            "description": (
+                                "Optional: read the darkroom canvas's own pipe "
+                                "instead of the default fixed-resolution preview "
+                                "pipe -- use after set_viewport to actually see "
+                                "the zoomed-in detail. Omit for the original "
+                                "behavior (unrelated to any darkroom zoom)."
+                            ),
+                        },
                     },
                 },
             ),
@@ -1824,7 +1835,13 @@ class DarktableMCPServer:
                     "Snapshots expire after a few minutes -- re-capture if a "
                     "later add/update call reports snapshot_not_found_or_expired. "
                     "Errors with viewport_not_active if 'preview2' is requested "
-                    "but the second window isn't open."
+                    "but the second window isn't open. Reads pixels from THIS "
+                    "viewport's own darkroom canvas pipe, so it actually reflects "
+                    "a prior set_viewport zoom: call set_viewport to zoom into a "
+                    "region first, then capture_viewport to get that region at "
+                    "up to the darkroom window's own resolution devoted entirely "
+                    "to it, instead of a fixed-resolution full-image render "
+                    "cropped down to a small, low-detail sliver."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1853,6 +1870,162 @@ class DarktableMCPServer:
                             "description": "Return the render inline (downscaled JPEG) as well as its path",
                         },
                     },
+                },
+            ),
+            Tool(
+                name="set_viewport",
+                description=(
+                    "Write the darkroom zoom/pan for 'main' or 'preview2' -- "
+                    "the counterpart to get_viewport()/capture_viewport, whose "
+                    "render detail is otherwise capped by whatever zoom the "
+                    "human last happened to leave it at. Give exactly ONE of "
+                    "'region' (a sub-rectangle of the full PROCESSED, post-crop "
+                    "frame, normalized 0..1, top-left origin -- the SAME frame "
+                    "get_viewport().region / get_preview(region=...) use, no "
+                    "third coordinate frame), 'scale' (1.0 = 100%, 1 image px : "
+                    "1 screen px; keeps the current pan), or 'mode' (fit/fill/"
+                    "100%/200%). If the requested region's aspect does not "
+                    "match the window, the region is EXPANDED (never cropped) "
+                    "about its own center so the whole request stays visible -- "
+                    "see 'aspect_adjusted'/'achieved.region' in the response. "
+                    "By default (wait_for_pipe=true) this blocks until the "
+                    "pipe has actually reprocessed at the new zoom before "
+                    "returning, so an immediately-following capture_viewport "
+                    "never returns a stale, pre-zoom render -- if the bounded "
+                    "wait times out, 'pipe_ready' is false rather than a false "
+                    "'ok'. 'scale' is clamped to darktable's own zoom range; "
+                    "check 'clamped' for whether that happened. Errors with "
+                    "viewport_not_active if 'preview2' is requested but the "
+                    "second window is not open (no state change). "
+                    "capture_viewport(same viewport)/get_preview(viewport=...) "
+                    "now actually read this zoom's own pipe, so a tight region "
+                    "here genuinely yields more usable detail for that region -- "
+                    "'renderable_px' in the response is a real probe of what "
+                    "capture_viewport will actually return at the achieved "
+                    "region. Its ceiling is the darkroom window's own pixel "
+                    "size, not a fixed preview budget -- 'min_render_px_across' "
+                    "is honored on a best-effort basis against that ceiling: any "
+                    "non-full-image region already zooms in AT LEAST to it by "
+                    "construction, so if the probe still falls short this does "
+                    "NOT chase it with further zoom (there is nothing further "
+                    "zoom could do -- see 'note' in the response when this "
+                    "happens) and does NOT report a false success. Call "
+                    "restore_viewport with the returned 'previous' when done, "
+                    "so you don't leave the "
+                    "human's darkroom zoomed into a random detail."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "viewport": {
+                            "type": "string",
+                            "enum": ["main", "preview2"],
+                            "default": "main",
+                            "description": "Which darkroom window to zoom/pan",
+                        },
+                        "region": {
+                            "type": "object",
+                            "description": (
+                                "Sub-rectangle of the full processed frame to "
+                                "show, normalized 0..1, top-left origin: "
+                                "{x,y,w,h}. Mutually exclusive with scale/mode."
+                            ),
+                            "properties": {
+                                "x": {"type": "number", "minimum": 0, "maximum": 1},
+                                "y": {"type": "number", "minimum": 0, "maximum": 1},
+                                "w": {"type": "number", "minimum": 0, "maximum": 1},
+                                "h": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                        },
+                        "scale": {
+                            "type": "number",
+                            "description": (
+                                "Absolute zoom scale, 1.0 = 100%. Keeps the "
+                                "current pan. Mutually exclusive with region/mode."
+                            ),
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["fit", "fill", "100%", "200%"],
+                            "description": (
+                                "Named zoom preset. Mutually exclusive with "
+                                "region/scale."
+                            ),
+                        },
+                        "min_render_px_across": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Best-effort hint only -- see the tool "
+                                "description's IMPORTANT note. Reports "
+                                "min_render_px_across_satisfied instead of "
+                                "silently pretending success when it can't be met."
+                            ),
+                        },
+                        "wait_for_pipe": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": (
+                                "Block until the pipe has actually reprocessed "
+                                "at the new zoom before returning."
+                            ),
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "default": 4000,
+                            "minimum": 100,
+                            "description": "Bound for the wait_for_pipe wait, in milliseconds",
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="restore_viewport",
+                description=(
+                    "Put a viewport's zoom/pan back exactly as it was before "
+                    "a set_viewport call -- pass the SAME 'previous' object "
+                    "set_viewport (or get_viewport) returned, unmodified. Call "
+                    "this when you are done with a set_viewport-driven "
+                    "retouch/inspection loop so you don't leave the human's "
+                    "darkroom zoomed into a random detail. Same wait_for_pipe/ "
+                    "timeout_ms/pipe_ready semantics as set_viewport; no "
+                    "scale clamping (a state that was once valid is restored "
+                    "as-is). Errors with viewport_not_active if 'preview2' is "
+                    "requested but the second window is not open."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "viewport": {
+                            "type": "string",
+                            "enum": ["main", "preview2"],
+                            "default": "main",
+                            "description": "Which darkroom window to restore",
+                        },
+                        "previous": {
+                            "type": "object",
+                            "description": (
+                                "The exact object set_viewport's/get_viewport's "
+                                "'previous'/viewport state returned earlier -- "
+                                "{zoom, closeup, zoom_x, zoom_y, scale}."
+                            ),
+                        },
+                        "wait_for_pipe": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": (
+                                "Block until the pipe has actually reprocessed "
+                                "at the restored zoom before returning."
+                            ),
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "default": 4000,
+                            "minimum": 100,
+                            "description": "Bound for the wait_for_pipe wait, in milliseconds",
+                        },
+                    },
+                    "required": ["previous"],
                 },
             ),
             Tool(
@@ -2916,6 +3089,8 @@ class DarktableMCPServer:
             "compare_luts": self._handle_compare_luts,
             "add_instance": self._handle_add_instance,
             "get_viewport": self._handle_get_viewport,
+            "set_viewport": self._handle_set_viewport,
+            "restore_viewport": self._handle_restore_viewport,
             "capture_viewport": self._handle_capture_viewport,
             "add_path_mask": self._handle_add_path_mask,
             "add_path_mask_in_viewport": self._handle_add_path_mask_in_viewport,
@@ -4513,6 +4688,19 @@ class DarktableMCPServer:
                 "w": float(region["w"]),
                 "h": float(region["h"]),
             }
+        # Optional (2026-07-31): read dev->full.pipe/dev->preview2.pipe's own
+        # backbuf instead of the default dev->preview_pipe -- see
+        # capture_viewport's own doc comment for why this is the fix that
+        # makes a prior set_viewport zoom actually show up in the render.
+        # Omitted: zero change from the original behavior.
+        viewport = arguments.get("viewport")
+        if viewport in ("main", "preview2"):
+            params["viewport"] = viewport
+        elif viewport not in (None, ""):
+            return [TextContent(
+                type="text",
+                text="get_preview: viewport must be 'main' or 'preview2' (or omitted)",
+            )]
         try:
             result = self.bridge.call("dev_preview", params, timeout=20.0)
         except BridgePluginNotInstalledError:
@@ -4550,6 +4738,7 @@ class DarktableMCPServer:
             lines.append(
                 f"processed frame: {result['frame_width']}x{result['frame_height']}"
             )
+        lines.append(f"source: {result.get('viewport_source') or 'preview_pipe'}")
         rendered_region = result.get("region")
         if isinstance(rendered_region, dict):
             lines.append(f"rendered region: {json.dumps(rendered_region)}")
@@ -5141,10 +5330,25 @@ class DarktableMCPServer:
                 "-- open an image in darkroom first"
             ))]
 
+        # 2026-07-31 fix: read the pixels from THIS viewport's own pipe
+        # (dev->full.pipe for "main", dev->preview2.pipe for "preview2") via
+        # dev_preview's viewport= parameter, NOT the default dev->preview_pipe.
+        # dev->preview_pipe has a fixed native resolution entirely decoupled
+        # from any darkroom zoom (confirmed by reading
+        # dt_dev_process_preview_job_run: it always runs with port=NULL) --
+        # capture_viewport used to always read it regardless of which
+        # viewport was asked for, so set_viewport's zoom changed what
+        # `region` above reported but never what the actual pixels were. The
+        # `region` we already have is METADATA (what get_viewport says is
+        # visible) for the response below; it is NOT passed to dev_preview
+        # here because dev->full.pipe/dev->preview2.pipe's own backbuf IS
+        # already exactly that crop once zoomed (the same "relative to what
+        # this pipe rendered" contract dev_preview's region param already
+        # had) -- passing it again would double-crop.
         try:
             preview_result = self.bridge.call(
                 "dev_preview",
-                {"max_w": max_w, "max_h": max_h, "region": region},
+                {"max_w": max_w, "max_h": max_h, "viewport": viewport},
                 timeout=20.0,
             )
         except BridgePluginNotInstalledError:
@@ -5193,11 +5397,12 @@ class DarktableMCPServer:
             "image": image,
         })
 
+        viewport_source = preview_result.get("viewport_source") or "preview_pipe"
         lines = [
             f"capture_viewport('{viewport}'): snapshot_id={snapshot_id}",
             f"  image: id={image.get('id')} filename={image.get('filename')}",
             f"  region: {json.dumps({k: round(region[k], 6) for k in ('x', 'y', 'w', 'h')})}",
-            f"  render: {render_w}x{render_h} path={host_path}",
+            f"  render: {render_w}x{render_h} path={host_path} (source: {viewport_source})",
             f"  snapshot_pixels for this snapshot means 0..{render_w} x "
             f"0..{render_h} (the render above), NOT the darktable window size",
             f"  expires in ~{int(self._viewport_snapshot_ttl_s)}s",
@@ -5214,6 +5419,293 @@ class DarktableMCPServer:
                 lines.append("  (inline image: JPEG, downscaled; full-res PNG at path/url above)")
         out.append(TextContent(type="text", text="\n".join(lines)))
         return out
+
+    def _bridge_call_or_error(
+        self, method: str, params: Dict[str, Any], timeout: float = 15.0
+    ) -> "tuple[Optional[Dict[str, Any]], Optional[TextContent]]":
+        """Shared bridge-call + standard plugin/connection error mapping --
+        used by set_viewport/restore_viewport, which need several sequential
+        bridge round trips (get_viewport, set_viewport, get_viewport again,
+        a dev_preview probe) where duplicating the usual
+        BridgePluginNotInstalledError/BridgeTimeoutError/BridgeError
+        try/except per call (the convention every other handler repeats
+        inline) would be excessive. Returns (result, None) on success, or
+        (None, TextContent) on a plugin/connection failure. Does NOT inspect
+        an {"error": ...} payload the bridge itself returns successfully --
+        callers still check that themselves, exactly like every other
+        handler's own `if result.get("error")`."""
+        try:
+            return self.bridge.call(method, params, timeout=timeout), None
+        except BridgePluginNotInstalledError:
+            return None, TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )
+        except BridgeTimeoutError:
+            return None, TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )
+        except BridgeError as e:
+            return None, TextContent(type="text", text=f"Plugin error: {e}")
+
+    async def _handle_set_viewport(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        viewport = arguments.get("viewport", "main")
+        if viewport not in ("main", "preview2"):
+            return [TextContent(type="text", text="viewport must be 'main' or 'preview2'")]
+
+        region_arg = arguments.get("region")
+        scale_arg = arguments.get("scale")
+        mode_arg = arguments.get("mode")
+        given = [v for v in (region_arg, scale_arg, mode_arg) if v is not None]
+        if len(given) != 1:
+            return [TextContent(type="text", text=(
+                "set_viewport: exactly one of 'region', 'scale', or 'mode' is "
+                f"required (got {len(given)})"
+            ))]
+
+        wait_for_pipe = bool(arguments.get("wait_for_pipe", True))
+        timeout_ms = arguments.get("timeout_ms") or 4000
+        min_render_px_across = arguments.get("min_render_px_across")
+
+        # --- current state (needed to invert the region formula / keep the
+        # current pan for a plain scale change / know if preview2 is open).
+        vp_result, err = self._bridge_call_or_error("dev_get_viewport", {})
+        if err:
+            return [err]
+        if vp_result.get("error"):
+            return [TextContent(type="text", text=f"set_viewport: {vp_result['error']}")]
+
+        vp = vp_result.get(viewport)
+        if not isinstance(vp, dict) or vp.get("active") is False:
+            return [TextContent(
+                type="text",
+                text=f"set_viewport: viewport_not_active ({viewport})",
+            )]
+
+        region_now = vp.get("region")
+        procw = vp.get("processed_width")
+        proch = vp.get("processed_height")
+        viewport_w = vp.get("viewport_width")
+        viewport_h = vp.get("viewport_height")
+        cur_zoom_x = vp.get("zoom_x")
+        cur_zoom_y = vp.get("zoom_y")
+        if not (isinstance(region_now, dict) and procw and proch and viewport_w and viewport_h):
+            return [TextContent(type="text", text=(
+                f"set_viewport: no processed pipe yet for '{viewport}' -- open an "
+                "image in darkroom first"
+            ))]
+
+        requested_region: Optional[Dict[str, float]] = None
+        aspect_adjusted = False
+        target_scale: Optional[float] = None
+        target_zoom_x: Optional[float] = None
+        target_zoom_y: Optional[float] = None
+
+        if region_arg is not None:
+            if not (isinstance(region_arg, dict)
+                    and all(k in region_arg for k in ("x", "y", "w", "h"))):
+                return [TextContent(type="text", text="set_viewport: region must be {x,y,w,h}")]
+            try:
+                rx, ry, rw, rh = (float(region_arg[k]) for k in ("x", "y", "w", "h"))
+            except (TypeError, ValueError):
+                return [TextContent(type="text", text="set_viewport: region x/y/w/h must be numbers")]
+            if rw <= 0 or rh <= 0:
+                return [TextContent(type="text", text="set_viewport: region w and h must be > 0")]
+            if rx < -1e-6 or ry < -1e-6 or rx + rw > 1.0 + 1e-6 or ry + rh > 1.0 + 1e-6:
+                return [TextContent(type="text", text=(
+                    "set_viewport: region must be within the full image "
+                    "(x,y >= 0, x+w <= 1, y+h <= 1)"
+                ))]
+            requested_region = {"x": rx, "y": ry, "w": rw, "h": rh}
+
+            # Invert get_viewport's own region formula (region.w =
+            # viewport_w/(procw*scale), region.h = viewport_h/(proch*scale) --
+            # ONE shared scale, so an aspect-mismatched request is EXPANDED
+            # (never cropped, requirement 2) about its own center rather than
+            # solved independently per axis.
+            k = (viewport_w * proch) / (viewport_h * procw)  # width_shown = k * height_shown
+            required_h = max(rh, rw / k)
+            width_shown = k * required_h
+            if width_shown > rw + 1e-9 or required_h > rh + 1e-9:
+                aspect_adjusted = True
+            target_scale = viewport_h / (proch * required_h)
+            center_x = rx + rw / 2.0
+            center_y = ry + rh / 2.0
+            target_zoom_x = center_x - 0.5
+            target_zoom_y = center_y - 0.5
+
+        elif scale_arg is not None:
+            try:
+                target_scale = float(scale_arg)
+            except (TypeError, ValueError):
+                return [TextContent(type="text", text="set_viewport: scale must be a number")]
+            # A plain scale change keeps the current pan (zoom under the same
+            # center it was already at), like the GUI's own scroll-wheel zoom.
+            target_zoom_x = cur_zoom_x
+            target_zoom_y = cur_zoom_y
+
+        else:  # mode
+            if mode_arg not in ("fit", "fill", "100%", "200%"):
+                return [TextContent(type="text", text=(
+                    "set_viewport: mode must be one of fit, fill, 100%, 200%"
+                ))]
+            fit_scale = min(viewport_w / procw, viewport_h / proch)
+            fill_scale = max(viewport_w / procw, viewport_h / proch)
+            if mode_arg in ("fit", "fill"):
+                target_scale = fit_scale if mode_arg == "fit" else fill_scale
+                target_zoom_x = 0.0
+                target_zoom_y = 0.0
+            else:  # "100%" / "200%" -- keep current pan, only change scale.
+                target_scale = 1.0 if mode_arg == "100%" else 2.0
+                target_zoom_x = cur_zoom_x
+                target_zoom_y = cur_zoom_y
+
+        set_result, err = self._bridge_call_or_error(
+            "dev_set_viewport",
+            {
+                "viewport": viewport,
+                "zoom_x": target_zoom_x,
+                "zoom_y": target_zoom_y,
+                "scale": target_scale,
+                "wait_for_pipe": wait_for_pipe,
+                "timeout_ms": timeout_ms,
+            },
+            timeout=max(20.0, timeout_ms / 1000.0 + 8.0),
+        )
+        if err:
+            return [err]
+        if set_result.get("error"):
+            return [TextContent(type="text", text=f"set_viewport: {set_result['error']}")]
+
+        previous = set_result.get("previous") or {}
+        clamped_raw = set_result.get("clamped") or []
+        # Re-key to the SAME convention set_params' own `clamped` list uses
+        # (field/requested/applied/min/max) -- the C binding's own field
+        # names (clamped_to/floor/ceiling) are an internal C<->Python detail.
+        clamped = [
+            {
+                "field": c.get("field"),
+                "requested": c.get("requested"),
+                "applied": c.get("clamped_to"),
+                "min": c.get("floor"),
+                "max": c.get("ceiling"),
+            }
+            for c in clamped_raw
+        ]
+        pipe_ready = bool(set_result.get("pipe_ready", True))
+        waited_ms = set_result.get("waited_ms")
+
+        # Re-read: report the ACTUAL resulting state (requirement 4), never
+        # the request -- truthful by construction, no duplicated math.
+        achieved_region = None
+        achieved_scale = None
+        vp_result2, err2 = self._bridge_call_or_error("dev_get_viewport", {})
+        if not err2 and not vp_result2.get("error"):
+            vp2 = vp_result2.get(viewport) or {}
+            achieved_region = vp2.get("region")
+            achieved_scale = vp2.get("scale")
+
+        # renderable_px: an ACTUAL probe -- dev_preview(viewport=viewport), NO
+        # region -- rather than a formula. This is the SAME call
+        # capture_viewport(viewport) itself now makes (2026-07-31 fix):
+        # dev->full.pipe/dev->preview2.pipe's own backbuf, once zoomed via
+        # the writes above, IS already the achieved-region crop, at up to
+        # the darkroom window's own pixel dimensions (viewport_width/
+        # viewport_height) devoted entirely to it -- NOT dev->preview_pipe's
+        # old fixed, zoom-independent native resolution. A probe measures
+        # the real thing instead of risking drift from capture_viewport's
+        # own logic.
+        renderable_px = None
+        if isinstance(achieved_region, dict):
+            probe, perr = self._bridge_call_or_error(
+                "dev_preview",
+                {"max_w": 8192, "max_h": 8192, "viewport": viewport},
+            )
+            if not perr and not probe.get("error"):
+                w, h = probe.get("width"), probe.get("height")
+                if w and h:
+                    renderable_px = {"w": int(w), "h": int(h)}
+
+        min_render_px_across_satisfied = None
+        note = None
+        if min_render_px_across is not None and renderable_px is not None:
+            try:
+                min_px = float(min_render_px_across)
+            except (TypeError, ValueError):
+                min_px = None
+            if min_px is not None:
+                min_render_px_across_satisfied = renderable_px["w"] >= min_px
+                if not min_render_px_across_satisfied:
+                    note = (
+                        "min_render_px_across NOT satisfied, and NOT pursued by "
+                        "zooming in further: capture_viewport('%s') is now capped "
+                        "by the darkroom window's own pixel width (viewport_width "
+                        "in get_viewport's response), not the old fixed preview "
+                        "resolution -- and any region smaller than the full image "
+                        "already zooms in AT LEAST to that window-size ceiling by "
+                        "construction (see set_viewport's region math), so "
+                        "additional zoom cannot raise this further. The window "
+                        "itself would need to be larger. See CLAUDE.md's "
+                        "2026-07-31 set_viewport entries for the full analysis."
+                    ) % viewport
+
+        response: Dict[str, Any] = {
+            "ok": True,
+            "viewport": viewport,
+            "achieved": {
+                "region": achieved_region,
+                "scale": achieved_scale,
+                "renderable_px": renderable_px,
+            },
+            "aspect_adjusted": aspect_adjusted,
+            "pipe_ready": pipe_ready,
+            "waited_ms": waited_ms,
+            "previous": previous,
+            "clamped": clamped,
+        }
+        if requested_region is not None:
+            response["requested_region"] = requested_region
+        if min_render_px_across_satisfied is not None:
+            response["min_render_px_across_satisfied"] = min_render_px_across_satisfied
+        if note:
+            response["note"] = note
+
+        return [TextContent(type="text", text=json.dumps(response, indent=2))]
+
+    async def _handle_restore_viewport(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        viewport = arguments.get("viewport", "main")
+        if viewport not in ("main", "preview2"):
+            return [TextContent(type="text", text="viewport must be 'main' or 'preview2'")]
+
+        previous = arguments.get("previous")
+        if not isinstance(previous, dict) or not all(
+            k in previous for k in ("zoom", "closeup", "zoom_x", "zoom_y", "scale")
+        ):
+            return [TextContent(type="text", text=(
+                "restore_viewport: 'previous' must be the object set_viewport "
+                "(or get_viewport) returned -- {zoom, closeup, zoom_x, zoom_y, "
+                "scale} -- pass it straight through, do not construct it by hand"
+            ))]
+        wait_for_pipe = bool(arguments.get("wait_for_pipe", True))
+        timeout_ms = arguments.get("timeout_ms") or 4000
+
+        result, err = self._bridge_call_or_error(
+            "dev_restore_viewport",
+            {
+                "viewport": viewport,
+                "previous": previous,
+                "wait_for_pipe": wait_for_pipe,
+                "timeout_ms": timeout_ms,
+            },
+            timeout=max(20.0, timeout_ms / 1000.0 + 8.0),
+        )
+        if err:
+            return [err]
+        if result.get("error"):
+            return [TextContent(type="text", text=f"restore_viewport: {result['error']}")]
+
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     # ---- Phase 2 (T2.3): object masks --------------------------------------
 
