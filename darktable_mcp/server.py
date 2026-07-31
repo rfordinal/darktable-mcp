@@ -49,6 +49,7 @@ from .tools.contact_sheet_tools import (
     write_sheet,
 )
 from .tools import retouch_overlay as overlay
+from .tools import mask_overlay
 from .tools.lut_tools import (
     LutRootNotConfiguredError,
     compose_lut_compare_grid,
@@ -2246,6 +2247,190 @@ class DarktableMCPServer:
                 },
             ),
             Tool(
+                name="add_path_mask_in_viewport",
+                description=(
+                    "Like add_path_mask, but points are given relative to a "
+                    "snapshot from capture_viewport instead of the full "
+                    "image -- the server converts every node for you (same "
+                    "two-stage viewport-local -> display-frame -> mask-frame "
+                    "pipeline retouch_add_shape_in_viewport uses), so you "
+                    "never hand-compute the full-image PIPE-INPUT/mask frame "
+                    "from a cropped/zoomed render. Use this whenever the "
+                    "polygon comes from something you SAW in a "
+                    "capture_viewport render (picked by eye, or from a "
+                    "vision model run on that render) rather than mask_object "
+                    "(which segments its own full-frame preview and does "
+                    "not need a viewport at all). Rejects (does NOT clamp) "
+                    "any node that falls outside the captured viewport/"
+                    "render, and rejects an expired/unknown snapshot_id or a "
+                    "snapshot whose image is no longer the one open in "
+                    "darkroom -- both come back as an explicit error so a "
+                    "stale or wrong point never silently masks the wrong "
+                    "area. Set return_preview to get a render of the SAME "
+                    "region back immediately so you can verify the result "
+                    "without a second capture_viewport call; use "
+                    "render_module_mask afterward to SEE the polygon drawn "
+                    "on the render."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "snapshot_id": {
+                            "type": "string",
+                            "description": "snapshot_id from a prior capture_viewport call",
+                        },
+                        "op": {
+                            "type": "string",
+                            "description": "Module operation name, e.g. 'exposure' (see list_modules)",
+                        },
+                        "points": {
+                            "type": "array",
+                            "minItems": 3,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"},
+                                },
+                                "required": ["x", "y"],
+                            },
+                            "description": (
+                                "Polygon nodes, boundary order, in "
+                                "coordinate_space units (relative to the "
+                                "captured viewport/render, NOT the full image)"
+                            ),
+                        },
+                        "coordinate_space": {
+                            "type": "string",
+                            "enum": list(POINT_SPACES),
+                            "default": "snapshot_normalized",
+                            "description": (
+                                "'snapshot_normalized' (alias 'viewport_normalized'): "
+                                "0..1 within the captured render. 'snapshot_pixels' "
+                                "(alias 'viewport_pixels'): pixel coordinates of the "
+                                "RENDER capture_viewport returned (its reported "
+                                "render WxH) -- NOT the darktable window's pixel "
+                                "size, which is usually larger."
+                            ),
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the module instance to mask",
+                        },
+                        "opacity": {
+                            "type": "number",
+                            "default": 1.0,
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Mask opacity (1.0 = full effect inside the shape)",
+                        },
+                        "feather": {
+                            "type": "number",
+                            "default": 0.02,
+                            "minimum": 0.0,
+                            "maximum": 0.5,
+                            "description": (
+                                "Edge softening as a FRACTION of the mask's own "
+                                "bounding box (0.02 = 2%) -- NOT a viewport/render "
+                                "length, so it is passed through unconverted, same "
+                                "as add_path_mask."
+                            ),
+                        },
+                        "smooth": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": (
+                                "Smooth the boundary with Catmull-Rom bezier "
+                                "curves so rounded subjects are not faceted. "
+                                "Set false for a straight-segment polygon."
+                            ),
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Optional display name for the new mask (see add_path_mask)",
+                        },
+                        "return_preview": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Render the same captured region again after the edit, for immediate visual verification",
+                        },
+                    },
+                    "required": ["snapshot_id", "op", "points"],
+                },
+            ),
+            Tool(
+                name="render_module_mask",
+                description=(
+                    "Draw a module's drawn masks (path/brush polygons, "
+                    "circles) on top of a capture_viewport snapshot so you "
+                    "can SEE where they landed -- the generic-mask "
+                    "counterpart to retouch_render_overlay (which only "
+                    "knows retouch's own circle target/source pairs). "
+                    "Reads the module's attached shapes (list_masks) and "
+                    "each one's full point geometry (get_mask_geometry), "
+                    "forward-transforms mask-frame -> display-frame -> "
+                    "snapshot-render pixels, and draws the boundary through "
+                    "each node -- corner nodes as square markers, smooth "
+                    "(Bezier) nodes as round markers. The drawn boundary is "
+                    "a STRAIGHT-EDGE approximation through the nodes, not "
+                    "darktable's own Catmull-Rom curve, so treat it as "
+                    "'landed on the right subject', not 'pixel-perfect "
+                    "edge'. modes: all_shapes (every mask; highlight_formid "
+                    "optionally dims the rest), selected_shape (one mask "
+                    "prominent, others dimmed for context), mask_only (a "
+                    "greyscale fill of each mask's interior -- FLAT opacity, "
+                    "does not model darktable's per-node border/feather "
+                    "falloff). 'ellipse' masks are reported as unsupported "
+                    "rather than drawn wrong. Read-only: refuses if darkroom "
+                    "has moved to another image."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "snapshot_id": {
+                            "type": "string",
+                            "description": "Snapshot id from capture_viewport (the render to draw on)",
+                        },
+                        "op": {
+                            "type": "string",
+                            "description": "Module operation name whose drawn masks to render, e.g. 'exposure'",
+                        },
+                        "instance": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "multi_priority of the module instance",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": list(mask_overlay.MODES),
+                            "default": mask_overlay.MODE_ALL_SHAPES,
+                            "description": "What to draw (see the tool description)",
+                        },
+                        "highlight_formid": {
+                            "type": "integer",
+                            "description": (
+                                "Shape to emphasise. Required by "
+                                "selected_shape unless the module has "
+                                "exactly one drawn mask; optional for "
+                                "all_shapes"
+                            ),
+                        },
+                        "label_shapes": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Print each shape's formid next to its boundary",
+                        },
+                        "return_image": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Return the overlay inline (downscaled JPEG) as well as its path",
+                        },
+                    },
+                    "required": ["snapshot_id", "op"],
+                },
+            ),
+            Tool(
                 name="retouch_add_shape",
                 description=(
                     "You almost certainly want "
@@ -2733,6 +2918,8 @@ class DarktableMCPServer:
             "get_viewport": self._handle_get_viewport,
             "capture_viewport": self._handle_capture_viewport,
             "add_path_mask": self._handle_add_path_mask,
+            "add_path_mask_in_viewport": self._handle_add_path_mask_in_viewport,
+            "render_module_mask": self._handle_render_module_mask,
             "retouch_add_shape": self._handle_retouch_add_shape,
             "retouch_add_shape_in_viewport": self._handle_retouch_add_shape_in_viewport,
             "retouch_update_shape_in_viewport": self._handle_retouch_update_shape_in_viewport,
@@ -5096,6 +5283,384 @@ class DarktableMCPServer:
                 lines.append(f"  name NOT set: {e}")
         lines.append("Call get_preview() to see the masked result.")
         return [TextContent(type="text", text="\n".join(lines))]
+
+    @staticmethod
+    def _bbox(points: List[Dict[str, float]]) -> Dict[str, float]:
+        xs = [p["x"] for p in points]
+        ys = [p["y"] for p in points]
+        return {
+            "x_min": round(min(xs), 6), "y_min": round(min(ys), 6),
+            "x_max": round(max(xs), 6), "y_max": round(max(ys), 6),
+        }
+
+    async def _handle_add_path_mask_in_viewport(self, arguments: Dict[str, Any]) -> List[Any]:
+        snapshot = self._get_viewport_snapshot(arguments.get("snapshot_id"))
+        region = snapshot["region"]
+        render = snapshot["render"]
+
+        op = arguments.get("op")
+        if not op:
+            return [TextContent(type="text", text="op is required")]
+        points = arguments.get("points")
+        if not isinstance(points, list) or len(points) < 3:
+            return [TextContent(
+                type="text",
+                text="points must be an array of at least 3 {x,y} nodes",
+            )]
+
+        coordinate_space = canonical_space(
+            arguments.get("coordinate_space", "snapshot_normalized")
+        )
+
+        # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized, one
+        # call per vertex (same conversion retouch_add_shape_in_viewport uses
+        # for target/source, just looped over N polygon nodes instead of 2
+        # fixed points).
+        display_points = [
+            viewport_point_to_image(
+                region, pt, coordinate_space, render["width"], render["height"],
+                label=f"points[{i}]",
+            )
+            for i, pt in enumerate(points)
+        ]
+
+        # Same-image guard: runs after the (free, local) stage-1 transform so
+        # malformed input still fails without a bridge call.
+        guard = self._snapshot_image_guard(snapshot, "add_path_mask_in_viewport")
+        if guard is not None:
+            return guard
+
+        # Stage 2: display-frame polygon -> PIPE-INPUT/mask-frame polygon --
+        # the exact same helper mask_object's own internal flow uses, reused
+        # verbatim (see its doc comment for why the two frames differ).
+        mask_points, err = self._backtransform_polygon_to_mask_space(display_points)
+        if err is not None:
+            return err
+
+        instance = int(arguments.get("instance", 0))
+        opacity = float(arguments.get("opacity", 1.0))
+        feather = arguments.get("feather", None)  # None -> bridge/C default (0.02)
+
+        params: Dict[str, Any] = {
+            "op": op,
+            "instance": instance,
+            "points": mask_points,
+            "opacity": opacity,
+        }
+        if feather is not None:
+            params["feather"] = float(feather)
+        if "smooth" in arguments:
+            params["smooth"] = bool(arguments["smooth"])
+
+        try:
+            result = self.bridge.call("dev_add_path_mask", params, timeout=15.0)
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(
+                type="text",
+                text=(
+                    f"add_path_mask_in_viewport('{op}', instance={instance}): "
+                    f"{self._explain_darkroom_error(result['error'])}"
+                ),
+            )]
+
+        snap_image = snapshot.get("image") or {}
+        lines = [
+            f"add_path_mask_in_viewport('{op}', instance={instance}): ok=True "
+            f"mask_id={result.get('mask_id')} formid={result.get('formid')} "
+            f"nodes={result.get('points')} opacity={result.get('opacity')} "
+            f"feather={result.get('feather')} smooth={result.get('smooth')}",
+            f"  image: id={snap_image.get('id')} filename={snap_image.get('filename')} "
+            f"(snapshot_id={arguments.get('snapshot_id')})",
+            # A 40+ node polygon's full per-point trace would dwarf the rest
+            # of the response, so only a bbox per frame is reported -- enough
+            # to sanity-check "roughly the right place, roughly the right
+            # size" without an enormous dump (render_module_mask below is the
+            # real per-node verification).
+            f"  input ({coordinate_space}) bbox: {self._bbox(points)}",
+            f"  display-frame bbox: {self._bbox(display_points)}",
+            f"  mask-frame (actual write) bbox: {self._bbox(mask_points)}",
+        ]
+
+        name = arguments.get("name")
+        if name:
+            try:
+                rename_result = self.bridge.call(
+                    "dev_rename_mask", {"mask_id": result.get("formid"), "name": str(name)},
+                    timeout=15.0,
+                )
+                if rename_result.get("error"):
+                    lines.append(f"  name NOT set: {rename_result['error']}")
+                else:
+                    lines.append(f"  name={rename_result.get('name')!r}")
+            except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+                lines.append(f"  name NOT set: {e}")
+
+        lines.append(
+            f"  check placement: render_module_mask(snapshot_id="
+            f"'{arguments.get('snapshot_id')}', op='{op}', instance={instance}, "
+            f"highlight_formid={result.get('formid')})"
+        )
+
+        out: List[Any] = []
+        if bool(arguments.get("return_preview", True)):
+            preview_img, preview_line = self._render_snapshot_preview(snapshot)
+            if preview_img is not None:
+                out.append(preview_img)
+            lines.append(preview_line)
+        out.append(TextContent(type="text", text="\n".join(lines)))
+        return out
+
+    @staticmethod
+    def _mask_node_is_corner(node: Dict[str, Any]) -> bool:
+        """get_mask_geometry's own convention (see its tool description):
+        ctrl1/ctrl2 equal to corner means a corner node, differing means
+        smooth. Comparison is done on the raw MASK-frame values, before any
+        forward transform -- equality is frame-invariant (transform_point is
+        a function, so two identical input points map to identical output
+        points), so there is no need to transform ctrl1/ctrl2 at all just to
+        classify a node."""
+        corner = node.get("corner") or {}
+        ctrl1 = node.get("ctrl1") or {}
+        ctrl2 = node.get("ctrl2") or {}
+        eps = 1e-9
+        def _close(a, b):
+            return abs(float(a.get("x", 0.0)) - float(b.get("x", 0.0))) < eps \
+                and abs(float(a.get("y", 0.0)) - float(b.get("y", 0.0))) < eps
+        return _close(corner, ctrl1) and _close(corner, ctrl2)
+
+    async def _handle_render_module_mask(self, arguments: Dict[str, Any]) -> List[Any]:
+        snapshot = self._get_viewport_snapshot(arguments.get("snapshot_id"))
+
+        op = arguments.get("op")
+        if not op:
+            return [TextContent(type="text", text="op is required")]
+        instance = int(arguments.get("instance", 0))
+        mode = arguments.get("mode", mask_overlay.MODE_ALL_SHAPES)
+        label_shapes = bool(arguments.get("label_shapes", True))
+        return_image = bool(arguments.get("return_image", True))
+        highlight_formid = arguments.get("highlight_formid")
+        if highlight_formid is not None:
+            highlight_formid = int(highlight_formid)
+
+        # Read-only, but geometry only means something for the photo the
+        # snapshot is of -- same refusal retouch_render_overlay applies.
+        expected = snapshot.get("image") or {}
+        current = self._darkroom_image()
+        if not current.get("has_image"):
+            return [TextContent(type="text", text=(
+                f"render_module_mask: darkroom has no image open now "
+                f"({current.get('error')}); the snapshot is of "
+                f"{self._image_label(expected)}. Reopen that image in darkroom."
+            ))]
+        if expected.get("id") is not None and current.get("id") != expected.get("id"):
+            return [TextContent(type="text", text=(
+                f"render_module_mask: darkroom image mismatch -- snapshot "
+                f"image_id={expected.get('id')} ({expected.get('filename')}), "
+                f"active image_id={current.get('id')} ({current.get('filename')}). "
+                "The masks read now belong to the active image, so they must "
+                "not be drawn on this snapshot. Reopen the snapshot's image, or "
+                "call capture_viewport again for the active one."
+            ))]
+
+        try:
+            shapes_result = self.bridge.call(
+                "dev_list_masks", {"op": op, "instance": instance}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if isinstance(shapes_result, dict) and shapes_result.get("error"):
+            return [TextContent(
+                type="text",
+                text=f"render_module_mask('{op}', {instance}): {shapes_result['error']}",
+            )]
+        mask_refs = shapes_result if isinstance(shapes_result, list) else []
+        if not mask_refs:
+            return [TextContent(type="text", text=(
+                f"render_module_mask: module '{op}' instance {instance} has "
+                "no drawn masks attached (see list_masks/get_module_mask)"
+            ))]
+
+        drawable: List[Dict[str, Any]] = []
+        skipped_unsupported: List[Any] = []
+        for ref in mask_refs:
+            formid = ref.get("mask_id")
+            try:
+                geo = self.bridge.call("dev_get_mask", {"mask_id": int(formid)}, timeout=15.0)
+            except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+                return [TextContent(type="text", text=f"render_module_mask: get_mask_geometry({formid}): {e}")]
+            if geo.get("error"):
+                return [TextContent(
+                    type="text",
+                    text=f"render_module_mask: get_mask_geometry({formid}): {geo['error']}",
+                )]
+
+            mtype = geo.get("type")
+            nodes = geo.get("points") or []
+            if mtype in ("path", "brush") and len(nodes) >= 2:
+                nodes_display: List[Dict[str, Any]] = []
+                failed = False
+                for node in nodes:
+                    corner = node.get("corner") or {}
+                    is_corner = self._mask_node_is_corner(node)
+                    try:
+                        tp = self.bridge.call(
+                            "dev_transform_point",
+                            {"x": corner.get("x"), "y": corner.get("y")},
+                            timeout=15.0,
+                        )
+                    except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+                        return [TextContent(
+                            type="text", text=f"render_module_mask: transform_point({formid}): {e}",
+                        )]
+                    if tp.get("error"):
+                        failed = True
+                        break
+                    nodes_display.append({"x": tp["x"], "y": tp["y"], "is_corner": is_corner})
+                if failed or len(nodes_display) < 2:
+                    skipped_unsupported.append(formid)
+                    continue
+                drawable.append({
+                    "formid": formid, "type": mtype, "name": geo.get("name"),
+                    "opacity": ref.get("opacity"), "nodes_display": nodes_display,
+                })
+            elif mtype == "circle" and nodes:
+                c = nodes[0]
+                center = c.get("center") or {}
+                radius = c.get("radius")
+                if radius is None:
+                    skipped_unsupported.append(formid)
+                    continue
+                try:
+                    tp = self.bridge.call(
+                        "dev_transform_point",
+                        {"x": center.get("x"), "y": center.get("y"), "len1": radius},
+                        timeout=15.0,
+                    )
+                except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+                    return [TextContent(
+                        type="text", text=f"render_module_mask: transform_point({formid}): {e}",
+                    )]
+                if tp.get("error"):
+                    skipped_unsupported.append(formid)
+                    continue
+                drawable.append({
+                    "formid": formid, "type": "circle", "name": geo.get("name"),
+                    "opacity": ref.get("opacity"),
+                    "center_display": {"x": tp["x"], "y": tp["y"]},
+                    "radius_display": tp.get("len1", 0.0),
+                })
+            else:
+                skipped_unsupported.append(formid)
+
+        if not drawable:
+            return [TextContent(type="text", text=(
+                f"render_module_mask('{op}', {instance}): no drawable shapes "
+                f"(unsupported types or failed transform: {skipped_unsupported})"
+            ))]
+
+        render = snapshot["render"]
+        render_path = render.get("path")
+        out_dir = os.path.dirname(render_path) or tempfile.gettempdir()
+        if not os.access(out_dir, os.W_OK):
+            out_dir = tempfile.gettempdir()
+        out_path = os.path.join(out_dir, f"mask-overlay-{mode}-{uuid.uuid4().hex[:8]}.png")
+
+        try:
+            summary = mask_overlay.render_overlay(
+                render_path=render_path,
+                out_path=out_path,
+                shapes=drawable,
+                region=snapshot["region"],
+                render_width=int(render.get("width") or 0),
+                render_height=int(render.get("height") or 0),
+                mode=mode,
+                highlight_formid=highlight_formid,
+                label_shapes=label_shapes,
+            )
+        except (mask_overlay.MaskOverlayRenderError, ViewportCoordinateError) as e:
+            return [TextContent(type="text", text=f"render_module_mask: {e}")]
+        except OSError as e:
+            return [TextContent(
+                type="text", text=f"render_module_mask: could not write overlay: {e}"
+            )]
+
+        lines = [
+            f"render_module_mask(op='{op}', instance={instance}, mode={summary['mode']}): "
+            f"{summary['path']}",
+            f"  image: {self._image_label(current)}",
+            f"  drawn on snapshot render {summary['render']['width']}x"
+            f"{summary['render']['height']} (region "
+            f"{json.dumps({k: round(snapshot['region'][k], 6) for k in ('x', 'y', 'w', 'h')})})",
+        ]
+        if mode == mask_overlay.MODE_MASK_ONLY:
+            lines.append(
+                "  greyscale = FLAT mask interior alpha (white = masked) -- "
+                "does not model darktable's per-node border/feather falloff, "
+                "see render_module_mask's tool description"
+            )
+        else:
+            lines.append(
+                "  boundary = straight-edge approximation through each "
+                "node's corner (not darktable's own Bezier curve); square "
+                "marker = corner node, round marker = smooth node"
+            )
+        for g in summary["geometry"]:
+            if highlight_formid is not None and g["formid"] != highlight_formid \
+                    and mode == mask_overlay.MODE_SELECTED_SHAPE:
+                continue
+            lines.append(
+                f"  formid={g['formid']} type={g['type']} name={g.get('name')!r} "
+                f"opacity={g['opacity']} bbox_px={g['bbox_px']} "
+                f"node_count={g.get('node_count')} "
+                f"corner_node_count={g.get('corner_node_count')}"
+            )
+        if summary["offscreen"]:
+            lines.append(
+                f"  partly/fully outside this snapshot: {summary['offscreen']} "
+                "(drawn where they fall, but the render does not cover them -- "
+                "capture a wider viewport to inspect these)"
+            )
+        if skipped_unsupported:
+            lines.append(
+                f"  not drawable: {skipped_unsupported} (ellipse masks, or a "
+                "transform_point failure -- see get_mask_geometry directly)"
+            )
+        dl = self._download_url(summary["path"])
+        if dl:
+            lines.append(f"  url: {dl} (no auth header needed, token in URL is the credential)")
+
+        out: List[Any] = []
+        if return_image:
+            img = _inline_image_content(summary["path"])
+            if img is not None:
+                out.append(img)
+                lines.append("  (inline image: JPEG, downscaled; full-res PNG at path/url above)")
+        out.append(TextContent(type="text", text="\n".join(lines)))
+        return out
 
     async def _handle_retouch_add_shape(self, arguments: Dict[str, Any]) -> List[TextContent]:
         algorithm = arguments.get("algorithm")
