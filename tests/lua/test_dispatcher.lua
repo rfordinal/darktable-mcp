@@ -185,6 +185,19 @@ stub_dt.develop = {
       args = {viewport, zoom, closeup, zoom_x, zoom_y, scale, wait_for_pipe, timeout_ms}})
     return {ok = true, viewport = viewport, pipe_ready = true, waited_ms = 8}
   end,
+  -- capture_viewport/get_preview fix (2026-07-31 set-viewport-design
+  -- follow-up): preview(max_w, max_h[, x, y, w, h][, viewport]) -- viewport
+  -- picks dev->full.pipe/dev->preview2.pipe instead of the default
+  -- dev->preview_pipe. Canned response mirrors the real C binding's shape
+  -- (viewport_source echoes back what was actually used).
+  preview = function(max_w, max_h, x, y, w, h, viewport)
+    table.insert(develop_calls, {name = "preview", args = {max_w, max_h, x, y, w, h, viewport}})
+    return {
+      status = "ok", path = "/tmp/preview.png", width = 640, height = 480,
+      frame_width = 640, frame_height = 480,
+      viewport_source = viewport or "preview_pipe",
+    }
+  end,
   -- LUT tooling (2026-07-26): reads an arbitrary core conf key. Stub returns
   -- a canned lut3d root path for the one key the tests exercise, "" for
   -- anything else (matches the real C binding's never-nil contract).
@@ -644,6 +657,48 @@ do
   local ok, err = pcall(internals.methods.dev_restore_viewport, {previous = {zoom = 0, closeup = 0}})
   assertTrue(not ok, "dev_restore_viewport errors when previous is missing fields")
   assertTrue(string.find(err or "", "zoom_x") ~= nil, "error names a missing field")
+end
+
+-- ---- methods.dev_preview: viewport= forwarding (2026-07-31 set-viewport-
+-- design follow-up, the fix that makes capture_viewport('main') actually
+-- reflect a prior set_viewport zoom instead of always reading the
+-- fixed-resolution preview_pipe). Omitted viewport must still forward as
+-- nil -- no behavior change for every pre-existing dev_preview caller.
+do
+  develop_calls = {}
+  local result = internals.methods.dev_preview({max_w = 1024, max_h = 1024})
+  assertEq(result.viewport_source, "preview_pipe", "no viewport -> stub echoes preview_pipe")
+  local call = develop_calls[1]
+  assertEq(call.name, "preview", "correct C function called")
+  assertEq(call.args[1], 1024, "max_w forwarded")
+  assertEq(call.args[2], 1024, "max_h forwarded")
+  assertEq(call.args[3], nil, "region x forwarded as nil when omitted")
+  assertEq(call.args[7], nil, "viewport forwarded as nil when omitted")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_preview({max_w = 1400, max_h = 1400, viewport = "main"})
+  assertEq(result.viewport_source, "main", "viewport='main' forwarded and echoed")
+  local call = develop_calls[1]
+  assertEq(call.args[3], nil, "no region forwarded (capture_viewport's own fix: full.pipe's "
+    .. "backbuf IS already the zoomed crop, passing region would double-crop)")
+  assertEq(call.args[7], "main", "viewport forwarded")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_preview({
+    max_w = 800, max_h = 800, viewport = "preview2",
+    region = {x = 0.1, y = 0.2, w = 0.3, h = 0.4},
+  })
+  assertEq(result.viewport_source, "preview2", "viewport='preview2' forwarded and echoed")
+  local call = develop_calls[1]
+  assertEq(call.args[3], 0.1, "region.x forwarded when explicitly given together with viewport")
+  assertEq(call.args[4], 0.2, "region.y forwarded")
+  assertEq(call.args[5], 0.3, "region.w forwarded")
+  assertEq(call.args[6], 0.4, "region.h forwarded")
+  assertEq(call.args[7], "preview2", "viewport forwarded")
 end
 
 -- ---- methods.dev_backtransform_point: bridge-layer arg forwarding for the

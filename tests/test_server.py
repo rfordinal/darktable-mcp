@@ -578,6 +578,65 @@ async def test_handle_capture_viewport_success():
     # The snapshot must carry the image it is a picture of, so later mutating
     # calls can refuse to write to a different photo.
     assert snapshot["image"]["id"] == 13406
+    # 2026-07-31 fix: capture_viewport must read the pixels from THIS
+    # viewport's own pipe (dev_preview's viewport= param), and must NOT also
+    # pass `region` -- dev->full.pipe's own backbuf is already exactly that
+    # crop once zoomed, passing region again would double-crop it.
+    preview_call = server.bridge.call.call_args_list[2]
+    assert preview_call.args[0] == "dev_preview"
+    assert preview_call.args[1] == {"max_w": 1400, "max_h": 1400, "viewport": "main"}
+
+
+@pytest.mark.asyncio
+async def test_handle_capture_viewport_preview2_reads_preview2_pipe():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"preview2": {"active": True, "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}}},
+        IMAGE_13406,
+        {"path": "/tmp/preview2.png", "width": 900, "height": 600},
+        IMAGE_13406,
+    ]
+    result = await server._handle_capture_viewport({"viewport": "preview2", "return_image": False})
+    assert "snapshot_id=vp_" in result[0].text
+    preview_call = server.bridge.call.call_args_list[2]
+    assert preview_call.args[1] == {"max_w": 1400, "max_h": 1400, "viewport": "preview2"}
+
+
+@pytest.mark.asyncio
+async def test_handle_get_preview_viewport_passthrough():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "status": "ok", "path": "/tmp/p.png", "width": 500, "height": 400,
+        "viewport_source": "main",
+    }
+    result = await server._handle_get_preview({"viewport": "main"})
+    first_call = server.bridge.call.call_args_list[0]
+    assert first_call.args == ("dev_preview", {"max_w": 1024, "max_h": 1024, "viewport": "main"})
+    assert first_call.kwargs == {"timeout": 20.0}
+    assert "source: main" in result[-1].text
+
+
+@pytest.mark.asyncio
+async def test_handle_get_preview_omitted_viewport_unchanged():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"status": "ok", "path": "/tmp/p.png", "width": 500, "height": 400}
+    result = await server._handle_get_preview({})
+    first_call = server.bridge.call.call_args_list[0]
+    assert first_call.args == ("dev_preview", {"max_w": 1024, "max_h": 1024})
+    assert first_call.kwargs == {"timeout": 20.0}
+    assert "source: preview_pipe" in result[-1].text
+
+
+@pytest.mark.asyncio
+async def test_handle_get_preview_rejects_bad_viewport():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_get_preview({"viewport": "nope"})
+    assert "viewport must be" in result[0].text
+    server.bridge.call.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -858,6 +917,38 @@ async def test_handle_set_viewport_min_render_px_across_not_pursued_when_unmet()
     assert "note" in payload
     # exactly 4 bridge calls -- no extra "zoom in further" attempt.
     assert server.bridge.call.call_count == 4
+    # the probe itself must use viewport=, not region= -- same fix as
+    # capture_viewport (2026-07-31): full.pipe's backbuf IS already the
+    # achieved-region crop once zoomed, passing region again double-crops.
+    probe_call = server.bridge.call.call_args_list[3]
+    assert probe_call.args[1] == {"max_w": 8192, "max_h": 8192, "viewport": "main"}
+
+
+@pytest.mark.asyncio
+async def test_handle_set_viewport_min_render_px_across_satisfied():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"main": dict(_VP_MAIN_BASE)},
+        {
+            "ok": True, "viewport": "main", "previous": _SET_VIEWPORT_PREVIOUS,
+            "applied": {"zoom_x": -0.1, "zoom_y": 0.0, "scale": 2.5},
+            "clamped": [], "pipe_ready": True, "waited_ms": 20,
+        },
+        {"main": {"region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2}, "scale": 2.5}},
+        # 2026-07-31 fix: once capture_viewport reads dev->full.pipe's own
+        # backbuf, a zoomed-in region genuinely CAN reach a high pixel
+        # count (up to the darkroom window's own size) -- unlike before,
+        # this is now achievable, not permanently defeatist.
+        {"path": "/tmp/probe.png", "width": 1000, "height": 1000},
+    ]
+    result = await server._handle_set_viewport({
+        "region": {"x": 0.3, "y": 0.4, "w": 0.2, "h": 0.2},
+        "min_render_px_across": 800,
+    })
+    payload = json.loads(result[0].text)
+    assert payload["min_render_px_across_satisfied"] is True
+    assert "note" not in payload
 
 
 @pytest.mark.asyncio

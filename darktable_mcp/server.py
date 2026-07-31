@@ -1797,6 +1797,17 @@ class DarktableMCPServer:
                                 "h": {"type": "number", "minimum": 0, "maximum": 1},
                             },
                         },
+                        "viewport": {
+                            "type": "string",
+                            "enum": ["main", "preview2"],
+                            "description": (
+                                "Optional: read the darkroom canvas's own pipe "
+                                "instead of the default fixed-resolution preview "
+                                "pipe -- use after set_viewport to actually see "
+                                "the zoomed-in detail. Omit for the original "
+                                "behavior (unrelated to any darkroom zoom)."
+                            ),
+                        },
                     },
                 },
             ),
@@ -1823,7 +1834,13 @@ class DarktableMCPServer:
                     "Snapshots expire after a few minutes -- re-capture if a "
                     "later add/update call reports snapshot_not_found_or_expired. "
                     "Errors with viewport_not_active if 'preview2' is requested "
-                    "but the second window isn't open."
+                    "but the second window isn't open. Reads pixels from THIS "
+                    "viewport's own darkroom canvas pipe, so it actually reflects "
+                    "a prior set_viewport zoom: call set_viewport to zoom into a "
+                    "region first, then capture_viewport to get that region at "
+                    "up to the darkroom window's own resolution devoted entirely "
+                    "to it, instead of a fixed-resolution full-image render "
+                    "cropped down to a small, low-detail sliver."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1878,18 +1895,22 @@ class DarktableMCPServer:
                     "'ok'. 'scale' is clamped to darktable's own zoom range; "
                     "check 'clamped' for whether that happened. Errors with "
                     "viewport_not_active if 'preview2' is requested but the "
-                    "second window is not open (no state change). IMPORTANT: "
-                    "capture_viewport's own pixel source (dev->preview_pipe) "
-                    "has a FIXED native resolution independent of this call's "
-                    "zoom -- 'renderable_px' in the response is a real probe "
-                    "of what capture_viewport will actually return at the "
-                    "achieved region, and 'min_render_px_across' is honored "
-                    "on a best-effort basis: if the probe shows it can't be "
-                    "met, this does NOT zoom in further to chase it (that "
-                    "would shrink, not grow, the available pixels here -- see "
-                    "'note' in the response when this happens) and it does "
-                    "NOT report a false success. Call restore_viewport with "
-                    "the returned 'previous' when done, so you don't leave the "
+                    "second window is not open (no state change). "
+                    "capture_viewport(same viewport)/get_preview(viewport=...) "
+                    "now actually read this zoom's own pipe, so a tight region "
+                    "here genuinely yields more usable detail for that region -- "
+                    "'renderable_px' in the response is a real probe of what "
+                    "capture_viewport will actually return at the achieved "
+                    "region. Its ceiling is the darkroom window's own pixel "
+                    "size, not a fixed preview budget -- 'min_render_px_across' "
+                    "is honored on a best-effort basis against that ceiling: any "
+                    "non-full-image region already zooms in AT LEAST to it by "
+                    "construction, so if the probe still falls short this does "
+                    "NOT chase it with further zoom (there is nothing further "
+                    "zoom could do -- see 'note' in the response when this "
+                    "happens) and does NOT report a false success. Call "
+                    "restore_viewport with the returned 'previous' when done, "
+                    "so you don't leave the "
                     "human's darkroom zoomed into a random detail."
                 ),
                 inputSchema={
@@ -4480,6 +4501,19 @@ class DarktableMCPServer:
                 "w": float(region["w"]),
                 "h": float(region["h"]),
             }
+        # Optional (2026-07-31): read dev->full.pipe/dev->preview2.pipe's own
+        # backbuf instead of the default dev->preview_pipe -- see
+        # capture_viewport's own doc comment for why this is the fix that
+        # makes a prior set_viewport zoom actually show up in the render.
+        # Omitted: zero change from the original behavior.
+        viewport = arguments.get("viewport")
+        if viewport in ("main", "preview2"):
+            params["viewport"] = viewport
+        elif viewport not in (None, ""):
+            return [TextContent(
+                type="text",
+                text="get_preview: viewport must be 'main' or 'preview2' (or omitted)",
+            )]
         try:
             result = self.bridge.call("dev_preview", params, timeout=20.0)
         except BridgePluginNotInstalledError:
@@ -4517,6 +4551,7 @@ class DarktableMCPServer:
             lines.append(
                 f"processed frame: {result['frame_width']}x{result['frame_height']}"
             )
+        lines.append(f"source: {result.get('viewport_source') or 'preview_pipe'}")
         rendered_region = result.get("region")
         if isinstance(rendered_region, dict):
             lines.append(f"rendered region: {json.dumps(rendered_region)}")
@@ -5108,10 +5143,25 @@ class DarktableMCPServer:
                 "-- open an image in darkroom first"
             ))]
 
+        # 2026-07-31 fix: read the pixels from THIS viewport's own pipe
+        # (dev->full.pipe for "main", dev->preview2.pipe for "preview2") via
+        # dev_preview's viewport= parameter, NOT the default dev->preview_pipe.
+        # dev->preview_pipe has a fixed native resolution entirely decoupled
+        # from any darkroom zoom (confirmed by reading
+        # dt_dev_process_preview_job_run: it always runs with port=NULL) --
+        # capture_viewport used to always read it regardless of which
+        # viewport was asked for, so set_viewport's zoom changed what
+        # `region` above reported but never what the actual pixels were. The
+        # `region` we already have is METADATA (what get_viewport says is
+        # visible) for the response below; it is NOT passed to dev_preview
+        # here because dev->full.pipe/dev->preview2.pipe's own backbuf IS
+        # already exactly that crop once zoomed (the same "relative to what
+        # this pipe rendered" contract dev_preview's region param already
+        # had) -- passing it again would double-crop.
         try:
             preview_result = self.bridge.call(
                 "dev_preview",
-                {"max_w": max_w, "max_h": max_h, "region": region},
+                {"max_w": max_w, "max_h": max_h, "viewport": viewport},
                 timeout=20.0,
             )
         except BridgePluginNotInstalledError:
@@ -5160,11 +5210,12 @@ class DarktableMCPServer:
             "image": image,
         })
 
+        viewport_source = preview_result.get("viewport_source") or "preview_pipe"
         lines = [
             f"capture_viewport('{viewport}'): snapshot_id={snapshot_id}",
             f"  image: id={image.get('id')} filename={image.get('filename')}",
             f"  region: {json.dumps({k: round(region[k], 6) for k in ('x', 'y', 'w', 'h')})}",
-            f"  render: {render_w}x{render_h} path={host_path}",
+            f"  render: {render_w}x{render_h} path={host_path} (source: {viewport_source})",
             f"  snapshot_pixels for this snapshot means 0..{render_w} x "
             f"0..{render_h} (the render above), NOT the darktable window size",
             f"  expires in ~{int(self._viewport_snapshot_ttl_s)}s",
@@ -5368,18 +5419,21 @@ class DarktableMCPServer:
             achieved_region = vp2.get("region")
             achieved_scale = vp2.get("scale")
 
-        # renderable_px: an ACTUAL probe (dev_preview at the achieved region,
-        # generous max_w/max_h) rather than a formula -- capture_viewport's
-        # own pixel source (dev->preview_pipe) is a FIXED native resolution
-        # entirely decoupled from any dev->full/preview2 zoom (see
-        # set_viewport_cb's design note, src/lua/develop.c), so computing this
-        # from this call's own zoom state would NOT predict what
-        # capture_viewport actually returns. A probe measures the real thing.
+        # renderable_px: an ACTUAL probe -- dev_preview(viewport=viewport), NO
+        # region -- rather than a formula. This is the SAME call
+        # capture_viewport(viewport) itself now makes (2026-07-31 fix):
+        # dev->full.pipe/dev->preview2.pipe's own backbuf, once zoomed via
+        # the writes above, IS already the achieved-region crop, at up to
+        # the darkroom window's own pixel dimensions (viewport_width/
+        # viewport_height) devoted entirely to it -- NOT dev->preview_pipe's
+        # old fixed, zoom-independent native resolution. A probe measures
+        # the real thing instead of risking drift from capture_viewport's
+        # own logic.
         renderable_px = None
         if isinstance(achieved_region, dict):
             probe, perr = self._bridge_call_or_error(
                 "dev_preview",
-                {"max_w": 8192, "max_h": 8192, "region": achieved_region},
+                {"max_w": 8192, "max_h": 8192, "viewport": viewport},
             )
             if not perr and not probe.get("error"):
                 w, h = probe.get("width"), probe.get("height")
@@ -5398,15 +5452,16 @@ class DarktableMCPServer:
                 if not min_render_px_across_satisfied:
                     note = (
                         "min_render_px_across NOT satisfied, and NOT pursued by "
-                        "zooming in further: capture_viewport's pixel source "
-                        "(dev->preview_pipe) is a fixed native resolution "
-                        "decoupled from this viewport's zoom, so shrinking the "
-                        "region further would only shrink the crop taken from "
-                        "that fixed resolution, not increase it -- zooming in "
-                        "would make this WORSE, not better, and would also "
-                        "violate 'expand, never crop, the requested region'. "
-                        "See CLAUDE.md's 2026-07-31 set_viewport entry."
-                    )
+                        "zooming in further: capture_viewport('%s') is now capped "
+                        "by the darkroom window's own pixel width (viewport_width "
+                        "in get_viewport's response), not the old fixed preview "
+                        "resolution -- and any region smaller than the full image "
+                        "already zooms in AT LEAST to that window-size ceiling by "
+                        "construction (see set_viewport's region math), so "
+                        "additional zoom cannot raise this further. The window "
+                        "itself would need to be larger. See CLAUDE.md's "
+                        "2026-07-31 set_viewport entries for the full analysis."
+                    ) % viewport
 
         response: Dict[str, Any] = {
             "ok": True,

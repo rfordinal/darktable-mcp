@@ -732,17 +732,28 @@ end
 -- Optional `region` = {x,y,w,h} normalized 0..1 of the visible frame, passed
 -- through to dt.develop.preview(max_w, max_h, x, y, w, h) for a full-detail
 -- crop render (grain/sharpen/noise inspection). Omit for the full frame.
+--
+-- Optional `viewport` (2026-07-31 fix, set-viewport-design follow-up): "main"
+-- | "preview2" reads dev->full.pipe / dev->preview2.pipe's OWN backbuf
+-- instead of the default dev->preview_pipe -- see dt.develop.preview's own
+-- long doc comment in src/lua/develop.c for why this is the fix that makes
+-- set_viewport's zoom actually show up in captured pixels (preview_pipe has
+-- a fixed native resolution entirely decoupled from any darkroom zoom).
+-- Omitted: zero change from the original preview_pipe behavior.
 methods.dev_preview = function(p)
   p = p or {}
   local max_w = tonumber(p.max_w) or 0
   local max_h = tonumber(p.max_h) or 0
   local region = p.region
+  local rx, ry, rw, rh
   if type(region) == "table" and region.x ~= nil and region.y ~= nil
      and region.w ~= nil and region.h ~= nil then
-    return dt.develop.preview(max_w, max_h,
-      tonumber(region.x), tonumber(region.y), tonumber(region.w), tonumber(region.h))
+    rx = tonumber(region.x)
+    ry = tonumber(region.y)
+    rw = tonumber(region.w)
+    rh = tonumber(region.h)
   end
-  return dt.develop.preview(max_w, max_h)
+  return dt.develop.preview(max_w, max_h, rx, ry, rw, rh, p.viewport)
 end
 
 -- Toggle a module instance on/off and commit to history (PLAN.md T1.7).
