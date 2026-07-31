@@ -23,7 +23,8 @@ end
 -- so dt.database[id] always resolves via __index without colliding with
 -- the iteration storage.
 local images_by_id = {
-  [101] = {id = 101, filename = "DSC_0001.NEF", path = "/photos", rating = 5},
+  [101] = {id = 101, filename = "DSC_0001.NEF", path = "/photos", rating = 5,
+           sidecar = "/photos/DSC_0001.NEF.xmp"},
   [102] = {id = 102, filename = "DSC_0002.NEF", path = "/photos", rating = 3},
   [103] = {id = 103, filename = "OTHER.NEF",   path = "/photos", rating = 4},
 }
@@ -232,6 +233,10 @@ stub_dt.develop = {
   rename_mask = function(mask_id, name)
     table.insert(develop_calls, {name = "rename_mask", args = {mask_id, name}})
     return {ok = true, mask_id = mask_id, name = name}
+  end,
+  current_image = function()
+    table.insert(develop_calls, {name = "current_image", args = {}})
+    return {has_image = true, id = 101, path = "/photos/DSC_0001.NEF", filename = "DSC_0001.NEF"}
   end,
 }
 
@@ -794,6 +799,30 @@ end
 do
   local ok, err = pcall(internals.methods.dev_rename_mask, {name = "x"})
   assertTrue(not ok, "dev_rename_mask errors without mask_id")
+end
+
+-- ---- methods.dev_current_image sidecar field (2026-07-31) -- bugreport:
+-- export_images silently exported the base/version-0 duplicate's sidecar
+-- instead of the one open in darkroom. dev_current_image now merges in
+-- image.sidecar (stock darktable Lua field) so a caller can pass the exact
+-- sidecar to export_images's xmp_paths. -------------------------------------
+do
+  develop_calls = {}
+  local result = internals.methods.dev_current_image({})
+  assertEq(result.has_image, true, "dev_current_image forwards has_image")
+  assertEq(result.id, 101, "dev_current_image forwards id")
+  assertEq(result.sidecar, "/photos/DSC_0001.NEF.xmp", "dev_current_image merges in sidecar")
+  assertEq(develop_calls[1].name, "current_image", "correct C function called")
+end
+
+do
+  -- has_image=false: must NOT attempt a database lookup at all.
+  local original_current_image = stub_dt.develop.current_image
+  stub_dt.develop.current_image = function() return {has_image = false, id = -1} end
+  local result = internals.methods.dev_current_image({})
+  assertEq(result.has_image, false, "dev_current_image forwards has_image=false")
+  assertTrue(result.sidecar == nil, "no sidecar merged in when no image is open")
+  stub_dt.develop.current_image = original_current_image
 end
 
 -- ---- methods.tag_photo ------------------------------------------------------

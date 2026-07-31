@@ -227,6 +227,7 @@ methods.view_photos = function(p)
         id = tostring(image.id),
         filename = image.filename,
         path = _image_full_path(image),
+        sidecar = image.sidecar,
         rating = image.rating or 0,
       })
       count = count + 1
@@ -637,9 +638,21 @@ end
 -- Report the image currently open in darkroom: {has_image, id, path, filename}.
 -- Lets the server resolve the source file for an image the user opened BY HAND
 -- in the GUI (no open_darkroom call, so no MCP-side path cache). Returns the C
--- result verbatim; has_image=false when no darkroom image is loaded.
+-- result verbatim; has_image=false when no darkroom image is loaded. Also adds
+-- `sidecar` (2026-07-31 bugreport: export_images silently exported the WRONG
+-- duplicate/version because it never told darktable-cli which .xmp to use,
+-- so darktable-cli fell back to its own auto-detect of the base/version-0
+-- sidecar) -- `image.sidecar` is a stock darktable Lua field (already
+-- version/duplicate-aware, src/lua/image.c) the C current_image() binding
+-- itself doesn't return; fetched here in pure Lua via dt.database.get_image,
+-- no C change needed.
 methods.dev_current_image = function(p)
-  return dt.develop.current_image()
+  local result = dt.develop.current_image()
+  if result.has_image then
+    local image = dt.database.get_image(result.id)
+    if image then result.sidecar = image.sidecar end
+  end
+  return result
 end
 
 -- Read-only passthrough to an arbitrary core dt_conf key, e.g.

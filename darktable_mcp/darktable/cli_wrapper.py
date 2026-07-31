@@ -93,6 +93,7 @@ class CLIWrapper:
         max_height: Optional[int] = None,
         timeout: int = EXPORT_TIMEOUT_DEFAULT,
         configdir: Optional[Path] = None,
+        xmp_path: Optional[Path] = None,
     ) -> bool:
         """Export an image using darktable-cli.
 
@@ -104,6 +105,14 @@ class CLIWrapper:
             max_width: Maximum width in pixels
             max_height: Maximum height in pixels
             timeout: subprocess timeout in seconds (default 120 s).
+            xmp_path: Explicit sidecar to apply (darktable-cli's own
+                `<input> [<xmp>] <output>` positional form). Bugreport
+                2026-07-31: without this, darktable-cli auto-detects
+                `<input>.xmp` -- always the BASE/version-0 duplicate's
+                sidecar, silently ignoring any other duplicate/version the
+                caller actually wants exported (e.g. "version 3" open in
+                darkroom). Pass the `sidecar` field from view_photos/
+                get_current_image to export the exact edit intended.
             configdir: Override for this call's `--configdir`. Callers that
                 run several exports concurrently against the same
                 CLIWrapper must pass distinct directories per concurrent
@@ -121,9 +130,10 @@ class CLIWrapper:
         try:
             active_configdir = Path(configdir) if configdir else self.configdir
             active_configdir.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                self.darktable_cli_path,
-                str(input_path),
+            cmd = [self.darktable_cli_path, str(input_path)]
+            if xmp_path is not None:
+                cmd.append(str(xmp_path))
+            cmd += [
                 str(output_path),
                 "--core",
                 "--configdir",
@@ -170,6 +180,7 @@ class CLIWrapper:
         output_dir: Path,
         format_type: str = "jpeg",
         quality: int = 95,
+        xmp_paths: Optional[List[Optional[Path]]] = None,
     ) -> Dict[str, str]:
         """Export multiple images in batch.
 
@@ -178,6 +189,11 @@ class CLIWrapper:
             output_dir: Output directory
             format_type: Export format
             quality: Export quality
+            xmp_paths: Optional, same length as input_files -- explicit
+                sidecar per file (see export_image's xmp_path doc for why
+                this matters for a duplicated/versioned image). None or a
+                per-index None falls back to darktable-cli's own
+                auto-detected base/version-0 sidecar.
 
         Returns:
             Dict[str, str]: Mapping of input files to status messages
@@ -185,11 +201,14 @@ class CLIWrapper:
         results = {}
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        for input_file in input_files:
+        for i, input_file in enumerate(input_files):
             try:
                 output_file = output_dir / f"{input_file.stem}.{format_type.lower()}"
+                xmp_path = xmp_paths[i] if xmp_paths and i < len(xmp_paths) else None
 
-                success = self.export_image(input_file, output_file, format_type, quality)
+                success = self.export_image(
+                    input_file, output_file, format_type, quality, xmp_path=xmp_path
+                )
 
                 if success:
                     results[str(input_file)] = f"Exported to {output_file}"

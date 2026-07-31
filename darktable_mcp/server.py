@@ -881,7 +881,20 @@ class DarktableMCPServer:
                 description=(
                     "Export photos to JPEG/PNG/TIFF via darktable-cli. "
                     "Pass absolute file paths in photo_ids — the `path` field "
-                    "from view_photos drops in directly."
+                    "from view_photos drops in directly. IMPORTANT if any "
+                    "photo has multiple duplicates/versions (darktable's "
+                    "own duplicate manager): without an explicit xmp_paths "
+                    "entry, darktable-cli auto-detects `<path>.xmp` -- "
+                    "always the BASE/version-0 duplicate's sidecar, "
+                    "silently ignoring any other version, even the one "
+                    "currently open in darkroom (bugreport 2026-07-31: "
+                    "exported an older edit instead of the one being "
+                    "worked on). Pass the `sidecar` field from view_photos "
+                    "or get_current_image in xmp_paths (same order/length "
+                    "as photo_ids, use null for entries that should use "
+                    "the default) whenever you're exporting a SPECIFIC "
+                    "edited version rather than a fresh, never-duplicated "
+                    "image."
                 ),
                 inputSchema={
                     "type": "object",
@@ -890,6 +903,21 @@ class DarktableMCPServer:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Absolute paths to source images",
+                        },
+                        "xmp_paths": {
+                            "type": "array",
+                            "items": {"type": ["string", "null"]},
+                            "description": (
+                                "Optional, same length/order as photo_ids: "
+                                "explicit .xmp sidecar path per file (from "
+                                "view_photos's/get_current_image's "
+                                "`sidecar` field) -- see the tool "
+                                "description for why this matters on a "
+                                "duplicated/versioned image. null (or a "
+                                "shorter list) falls back to darktable-"
+                                "cli's own auto-detected sidecar for that "
+                                "entry."
+                            ),
                         },
                         "output_path": {"type": "string"},
                         "format": {
@@ -2661,6 +2689,7 @@ class DarktableMCPServer:
         output_path = arguments.get("output_path")
         format_type = arguments.get("format", "jpeg")
         quality = int(arguments.get("quality", 95))
+        xmp_paths_arg = arguments.get("xmp_paths")
 
         if not output_path:
             return [TextContent(type="text", text="output_path is required")]
@@ -2671,12 +2700,25 @@ class DarktableMCPServer:
                     text="photo_ids must contain at least one path",
                 )
             ]
+        if xmp_paths_arg is not None and len(xmp_paths_arg) != len(photo_ids):
+            return [TextContent(
+                type="text",
+                text=(
+                    f"xmp_paths length ({len(xmp_paths_arg)}) must match "
+                    f"photo_ids length ({len(photo_ids)}) -- use null for "
+                    "entries that should use the default sidecar."
+                ),
+            )]
 
         input_files = [Path(p) for p in photo_ids]
+        xmp_paths = (
+            [Path(p) if p else None for p in xmp_paths_arg] if xmp_paths_arg is not None else None
+        )
         out_dir = Path(output_path)
         results = self.cli.batch_export(
             input_files=input_files,
             output_dir=out_dir,
+            xmp_paths=xmp_paths,
             format_type=format_type,
             quality=quality,
         )
@@ -3331,7 +3373,10 @@ class DarktableMCPServer:
             type="text",
             text=(
                 f"Current darkroom image: id={info.get('id')} "
-                f"filename={info.get('filename')} path={host_path}"
+                f"filename={info.get('filename')} path={host_path} "
+                f"sidecar={info.get('sidecar')} "
+                "(pass this exact sidecar in export_images's xmp_paths to "
+                "export THIS specific duplicate/version, not the base one)"
             ),
         )]
 

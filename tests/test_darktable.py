@@ -92,6 +92,42 @@ class TestCLIWrapperExport:
 
     @patch("darktable_mcp.darktable.cli_wrapper.subprocess.run")
     @patch("shutil.which", return_value="/usr/bin/darktable-cli")
+    def test_export_without_xmp_path_omits_explicit_sidecar_arg(
+        self, _mock_which, mock_run, tmp_path
+    ):
+        """Regression guard: without xmp_path, the cmd must be exactly
+        [cli, input, output, ...] -- darktable-cli's own auto-detected
+        sidecar path, no explicit middle arg inserted."""
+        mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
+        wrapper = CLIWrapper(configdir=tmp_path)
+        wrapper.export_image(Path("/in.NEF"), tmp_path / "out.jpg", "jpeg", 95)
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[1] == "/in.NEF"
+        assert cmd[2] == str(tmp_path / "out.jpg")
+
+    @patch("darktable_mcp.darktable.cli_wrapper.subprocess.run")
+    @patch("shutil.which", return_value="/usr/bin/darktable-cli")
+    def test_export_with_xmp_path_inserts_explicit_sidecar_arg(
+        self, _mock_which, mock_run, tmp_path
+    ):
+        """Bugreport 2026-07-31: without an explicit sidecar, darktable-cli
+        auto-detects <input>.xmp (always the base/version-0 duplicate),
+        silently exporting the wrong version. xmp_path must land as the
+        explicit middle positional arg (darktable-cli's own
+        <input> [<xmp>] <output> form)."""
+        mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
+        wrapper = CLIWrapper(configdir=tmp_path)
+        xmp = Path("/in_03.NEF.xmp")
+        wrapper.export_image(Path("/in.NEF"), tmp_path / "out.jpg", "jpeg", 95, xmp_path=xmp)
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[1] == "/in.NEF"
+        assert cmd[2] == str(xmp)
+        assert cmd[3] == str(tmp_path / "out.jpg")
+
+    @patch("darktable_mcp.darktable.cli_wrapper.subprocess.run")
+    @patch("shutil.which", return_value="/usr/bin/darktable-cli")
     def test_export_failure_raises_export_error_with_stderr(
         self, _mock_which, mock_run, tmp_path
     ):
@@ -129,3 +165,20 @@ class TestCLIWrapperExport:
         for call in mock_run.call_args_list:
             cmd = call[0][0]
             assert "--configdir" in cmd
+
+    @patch("darktable_mcp.darktable.cli_wrapper.subprocess.run")
+    @patch("shutil.which", return_value="/usr/bin/darktable-cli")
+    def test_batch_export_threads_xmp_paths_per_file(self, _mock_which, mock_run, tmp_path):
+        mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
+        wrapper = CLIWrapper(configdir=tmp_path / "cfg")
+        wrapper.batch_export(
+            [Path("/a.NEF"), Path("/b.NEF")],
+            tmp_path / "out",
+            xmp_paths=[Path("/a_02.NEF.xmp"), None],
+        )
+        cmd_a = mock_run.call_args_list[0][0][0]
+        cmd_b = mock_run.call_args_list[1][0][0]
+        assert cmd_a[1] == "/a.NEF"
+        assert cmd_a[2] == "/a_02.NEF.xmp"  # explicit sidecar for the duplicate
+        assert cmd_b[1] == "/b.NEF"
+        assert cmd_b[2] != "None"  # no explicit sidecar -> falls straight to output arg

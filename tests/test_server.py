@@ -3,6 +3,7 @@
 import json
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
@@ -393,6 +394,40 @@ async def test_handle_export_images_validates_required_args():
     assert "output_path" in r[0].text
     r = await server._handle_export_images({"output_path": "/tmp/x"})
     assert "photo_ids" in r[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_export_images_forwards_xmp_paths(tmp_path):
+    """Bugreport 2026-07-31: export_images silently exported the wrong
+    duplicate/version because it never told darktable-cli which sidecar
+    to use. xmp_paths must reach cli.batch_export, null entries -> None."""
+    server = DarktableMCPServer()
+    server._cli = Mock()
+    server._cli.batch_export.return_value = {"/in/A.NEF": f"Exported to {tmp_path}/A.jpg"}
+
+    await server._handle_export_images({
+        "photo_ids": ["/in/A.NEF"],
+        "xmp_paths": ["/in/A_02.NEF.xmp"],
+        "output_path": str(tmp_path),
+        "format": "jpeg",
+    })
+
+    call_kwargs = server._cli.batch_export.call_args.kwargs
+    assert call_kwargs["xmp_paths"] == [Path("/in/A_02.NEF.xmp")]
+
+
+@pytest.mark.asyncio
+async def test_handle_export_images_rejects_mismatched_xmp_paths_length():
+    server = DarktableMCPServer()
+    server._cli = Mock()
+    result = await server._handle_export_images({
+        "photo_ids": ["/in/A.NEF", "/in/B.NEF"],
+        "xmp_paths": ["/in/A.NEF.xmp"],  # length 1, photo_ids length 2
+        "output_path": "/tmp/out",
+        "format": "jpeg",
+    })
+    assert "must match" in result[0].text
+    server._cli.batch_export.assert_not_called()
 
 
 @pytest.mark.asyncio
