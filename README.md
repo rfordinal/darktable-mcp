@@ -305,8 +305,22 @@ specific wavelet scale, so skin texture and base tones can be treated separately
 `retouch_list_shapes` gives back the real shapes plus the module's wavelet-scale state (rather than the
 raw 300-slot internal array), and `retouch_delete_shape` removes one by id — verified to restore the
 pixels exactly, so "no, try a different source" costs nothing. `retouch_delete_shapes` takes a list
-when a whole experiment needs undoing. Circles with heal/clone only so far; ellipse/path/brush and
-blur/fill are a later phase.
+when a whole experiment needs undoing. Circles only so far; ellipse/path/brush are a later phase.
+
+Heal/clone always rewrite the full pixel (texture *and* tone), which is wrong for something like a
+wrinkle: a heal circle sized to the crease also flattens the shadow underneath it. `blur`/`fill` fix
+that by acting on ONE wavelet scale instead of the base image — softening or erasing that scale's
+texture while every other scale (and the tone/shadow it carries) is left alone. Neither takes a
+`source` (there is nothing to sample from):
+
+```json
+{"name": "retouch_add_shape", "arguments": {
+  "algorithm": "blur",
+  "target": {"x": 0.52, "y": 0.41},
+  "radius": 0.02,
+  "wavelet_scale": 3,
+  "blur_radius": 8}}
+```
 
 Picking that target as a fraction of the whole frame is awkward when you are both looking at a 3:1
 zoom of one cheek. `capture_viewport` solves that: it snapshots the region you have on screen (the
@@ -411,7 +425,7 @@ Honest version, per layer:
 | Library / cull / rate / tag / export / camera import | Working, inherited from upstream `w1ne/darktable-mcp` and extended |
 | Scalar + array parameter editing, live preview (J1, J2, J5, J6) | Working, acceptance-tested against a live darktable |
 | Object masks via path mask (J3) | Working. Zero-install GrabCut segmentation is rough; SAM2 sidecar is the quality tier |
-| Retouch heal/clone circles | Verified on a live darktable against a fixture library, incl. exact-revert on delete. Circle + heal/clone only. Not yet exercised against a large real library |
+| Retouch heal/clone/blur/fill circles | Verified on a live darktable against a fixture library, incl. exact-revert on delete. Circle only (ellipse/path/brush not yet). Not yet exercised against a large real library |
 | Raster / matte masks (J4) | Newest and least exercised. The raster-injection binding started as a research spike, and this path is not hardened |
 | Before/after baseline render (J7) | Partial — per-module A/B only, no session-start baseline |
 | Interactive mask node editing (move/insert/delete points) | Not shipped. Written but unbuilt/untested; not exposed as tools |
@@ -593,16 +607,22 @@ receives are longer and written for it (see "The tools are designed for a model,
 - `mask_raster(op, adjustment, opacity?, new_instance?)` — soft alpha matte (MODNet) gating a local
   edit. Requires the matting sidecar.
 - `add_path_mask(op, points, instance?, opacity?)` — low-level: attach a polygon you already have.
-- `retouch_add_shape(algorithm, target, source, radius, feather?, opacity?, wavelet_scale?, instance?)`
-  — heal/clone circle on the retouch module.
-- `retouch_add_shape_in_viewport(snapshot_id, algorithm, target, source, radius, feather?,
-  coordinate_space?, radius_space?, opacity?, wavelet_scale?, instance?, return_preview?)` — the same
-  heal/clone circle, but placed in the coordinates of a `capture_viewport` render.
+- `retouch_add_shape(algorithm, target, source?, radius, feather?, opacity?, wavelet_scale?, instance?,
+  blur_type?, blur_radius?, fill_mode?, fill_color?, fill_brightness?)` — heal/clone/blur/fill circle
+  on the retouch module. `source` is required for heal/clone, ignored for blur/fill (they have none).
+  `blur`/`fill` on a nonzero `wavelet_scale` act on that scale's texture only, leaving tone/shadow on
+  the other scales untouched — heal/clone always rewrite the full pixel regardless of scale.
+- `retouch_add_shape_in_viewport(snapshot_id, algorithm, target, source?, radius, feather?,
+  coordinate_space?, radius_space?, opacity?, wavelet_scale?, instance?, return_preview?, blur_type?,
+  blur_radius?, fill_mode?, fill_color?, fill_brightness?)` — the same heal/clone/blur/fill circle, but
+  placed in the coordinates of a `capture_viewport` render.
   `coordinate_space` is `snapshot_normalized` (0..1 of the render) or `snapshot_pixels` (pixels of the
   render, not of the darktable window); the older `viewport_*` spellings still work. Refuses to write
   if darkroom has moved to a different image than the snapshot's.
-- `retouch_update_shape_in_viewport(snapshot_id, formid, target, source, radius, ...)` — move or
-  resize an existing shape in place, keeping its formid.
+- `retouch_update_shape_in_viewport(snapshot_id, formid, target, source?, radius, ...)` — move or
+  resize an existing shape in place, keeping its formid. `source` is required only if the shape's
+  EFFECTIVE algorithm (the one given here, or its current one if `algorithm` is omitted) is
+  heal/clone.
 - `retouch_list_shapes(instance?)` / `retouch_delete_shape(formid, instance?)` /
   `retouch_delete_shapes(formids, instance?)`. `retouch_list_shapes` reports every shape in both
   coordinate frames (mask storage, and the frame previews render in) plus its opacity.
