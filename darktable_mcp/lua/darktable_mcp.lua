@@ -931,10 +931,15 @@ methods.dev_retouch_update_shape = function(p)
       tonumber(fill_color.r), tonumber(fill_color.g), tonumber(fill_color.b)
   end
   local fill_brightness = tonumber(p.fill_brightness)
+  -- only meaningful for an existing ellipse shape; C rejects them (rather
+  -- than silently ignoring) if passed for a circle formid.
+  local radius_b = tonumber(p.radius_b)
+  local rotation = tonumber(p.rotation)
   return dt.develop.retouch_update_shape(op, instance, formid,
     tonumber(target.x), tonumber(target.y), radius, feather,
     source_x, source_y, algorithm, scale, opacity,
-    blur_type, blur_radius, fill_mode, fill_r, fill_g, fill_b, fill_brightness)
+    blur_type, blur_radius, fill_mode, fill_r, fill_g, fill_b, fill_brightness,
+    radius_b, rotation)
 end
 
 methods.dev_retouch_delete_shape = function(p)

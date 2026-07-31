@@ -6873,6 +6873,8 @@ class DarktableMCPServer:
                 f"opacity={s.get('opacity')} "
                 f"wavelet_scale={s.get('wavelet_scale')}"
             )
+            if s.get("shape_type") == "ellipse":
+                lines.append(f"    radius_b={s.get('radius_b')} rotation={s.get('rotation')}")
             # Display-frame values (dt.develop.transform_point): the SAME frame
             # capture_viewport/get_preview render in. The mask-frame numbers
             # above are what retouch_add_shape/retouch_update_shape take back,
@@ -6887,6 +6889,8 @@ class DarktableMCPServer:
                     f"radius={s.get('radius_display')} "
                     f"feather={s.get('feather_display')}"
                 )
+                if s.get("shape_type") == "ellipse" and s.get("radius_b_display") is not None:
+                    lines.append(f"    radius_b={s.get('radius_b_display')}")
         if shapes:
             lines.append(
                 "  target/source/radius/feather = mask storage frame (pass these "

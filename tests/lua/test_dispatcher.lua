@@ -597,6 +597,19 @@ do
 end
 
 do
+  -- 2026-07-31 ellipse step 2: radius_b/rotation forwarded as new trailing
+  -- C args (positions 20-21).
+  develop_calls = {}
+  internals.methods.dev_retouch_update_shape({
+    op = "retouch", formid = 42, target = {x = 0.4, y = 0.3}, radius = 0.02,
+    radius_b = 0.03, rotation = 45,
+  })
+  local call = develop_calls[1]
+  assertEq(call.args[20], 0.03, "radius_b forwarded")
+  assertEq(call.args[21], 45, "rotation forwarded")
+end
+
+do
   local ok, err = pcall(internals.methods.dev_retouch_update_shape, {
     op = "retouch", target = {x = 0.4, y = 0.3}, source = {x = 0.35, y = 0.3}, radius = 0.02,
   })

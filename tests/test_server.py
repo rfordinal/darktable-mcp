@@ -669,6 +669,31 @@ async def test_handle_retouch_list_shapes_formats_shapes():
 
 
 @pytest.mark.asyncio
+async def test_handle_retouch_list_shapes_shows_ellipse_geometry():
+    """2026-07-31 ellipse step 2: an ellipse shape's radius_b/rotation must be
+    visible in the report, not just circle's plain radius/feather."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "module": "retouch", "instance": 0,
+        "num_scales": 0, "curr_scale": 0, "merge_from_scale": 0,
+        "shapes": [
+            {
+                "formid": 77, "algorithm": "heal", "shape_type": "ellipse",
+                "target": {"x": 0.5, "y": 0.4}, "source": {"x": 0.55, "y": 0.4},
+                "radius": 0.06, "radius_b": 0.02, "rotation": 30.0,
+                "feather": 0.01, "wavelet_scale": 0,
+            },
+        ],
+    }
+    result = await server._handle_retouch_list_shapes({})
+    text = result[0].text
+    assert "shape_type=ellipse" in text
+    assert "radius_b=0.02" in text
+    assert "rotation=30.0" in text
+
+
+@pytest.mark.asyncio
 async def test_handle_capture_viewport_success():
     server = DarktableMCPServer()
     server.bridge = Mock()
