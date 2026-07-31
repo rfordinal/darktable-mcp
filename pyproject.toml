@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darktable-mcp"
-version = "1.0.33"
+version = "1.0.34"
 description = "MCP server bridging an AI assistant into a live darktable session for collaborative RAW editing, masking, and library management"
 authors = [{name = "w1ne", email = "14119286+w1ne@users.noreply.github.com"}]
 maintainers = [{name = "Roman Fordinal", email = "roman.fordinal@comsultia.com"}]
@@ -24,7 +24,19 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # Pinned to the 1.x major (2026-07-31 incident): build-deb-mcp.sh installs
+    # via plain `pip install /work/src` inside a fresh container, which
+    # resolves this spec directly from PyPI and does NOT honor uv.lock's
+    # pinned 1.28.1 -- an unbounded "mcp>=1.0.0" here silently pulled
+    # mcp==2.0.0 on a real desktop install and crashed at startup with
+    # "'Server' object has no attribute 'list_tools'": mcp 2.0.0's Server
+    # class dropped list_tools/call_tool entirely (confirmed by installing
+    # both versions fresh and inspecting dir(Server(...))) -- a real
+    # major-version breaking change upstream, not a bug in this package's
+    # own code. Keep this upper bound until the code is migrated to
+    # whatever mcp 2.x's replacement API is, and bump deliberately, not by
+    # a lockfile going stale.
+    "mcp>=1.0.0,<2.0.0",
     "pydantic>=2.0.0",
     "typing-extensions>=4.0.0",
     # Zero-install mask_object fallback (darktable_mcp/tools/local_segment.py):
