@@ -60,6 +60,11 @@ EXPECTED_TOOLS = {
     "compare_luts",
     "add_instance",
     "get_viewport",
+    # Writable viewport zoom/pan (2026-07-31 set-viewport-design): the write
+    # counterpart to get_viewport()/capture_viewport, whose render detail is
+    # otherwise capped by whatever zoom the human last left it at.
+    "set_viewport",
+    "restore_viewport",
     # Viewport-relative retouch (2026-07-25 design proposal): capture a
     # snapshot of what the user sees in main/preview2, then place retouch
     # points relative to that snapshot instead of the full image.

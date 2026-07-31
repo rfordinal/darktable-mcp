@@ -959,6 +959,67 @@ methods.dev_get_viewport = function(p)
   return dt.develop.get_viewport()
 end
 
+-- Writable counterpart to dev_get_viewport (2026-07-31 set-viewport-design):
+-- set an ABSOLUTE zoom_x/zoom_y/scale on "main" (dev->full) or "preview2".
+-- Free zoom only (no fit/fill/1:1 snapping) -- the C side clamps `scale` to
+-- darktable's own unconstrained-zoom bound and reports the clamp. This
+-- wrapper does NOT do region math (aspect-expand, mode translation,
+-- min_render_px_across) -- that lives in server.py, which reads
+-- dev_get_viewport()'s processed_width/processed_height + current region/
+-- scale to invert the region formula, then calls this with the resulting
+-- zoom_x/zoom_y/scale. `wait_for_pipe` (default true) blocks (bounded by
+-- `timeout_ms`, default 4000) until dev->full.pipe/dev->preview2.pipe has
+-- actually reprocessed at the new zoom -- see dt.develop.set_viewport's own
+-- long doc comment in src/lua/develop.c for why this is NOT the same
+-- freshness check dev_preview uses. Returns the C result verbatim:
+-- {ok, viewport, previous={zoom,zoom_label,closeup,zoom_x,zoom_y,scale},
+-- applied={zoom_x,zoom_y,scale}, clamped=[...], pipe_ready, waited_ms} |
+-- {error="viewport_not_active: ..."} | {error=...}.
+methods.dev_set_viewport = function(p)
+  p = p or {}
+  local viewport = p.viewport or "main"
+  local zoom_x = tonumber(p.zoom_x)
+  local zoom_y = tonumber(p.zoom_y)
+  local scale = tonumber(p.scale)
+  if zoom_x == nil or zoom_y == nil or scale == nil then
+    error("dev_set_viewport: zoom_x, zoom_y, scale required")
+  end
+  local wait_for_pipe = p.wait_for_pipe
+  if wait_for_pipe == nil then wait_for_pipe = true end
+  local timeout_ms = tonumber(p.timeout_ms)
+  return dt.develop.set_viewport(viewport, zoom_x, zoom_y, scale,
+    wait_for_pipe and true or false, timeout_ms)
+end
+
+-- Put a viewport's zoom/pan back exactly as dev_set_viewport (or
+-- dev_get_viewport) reported it in `previous`/its own snapshot -- pass that
+-- SAME table straight through as `previous` (no new state to invent, per
+-- the set-viewport-design task's requirement 7). Same wait_for_pipe/
+-- timeout_ms semantics as dev_set_viewport; no clamping (a state that was
+-- once valid is restored as-is). Returns {ok, viewport, pipe_ready,
+-- waited_ms} | {error="viewport_not_active: ..."} | {error=...}.
+methods.dev_restore_viewport = function(p)
+  p = p or {}
+  local viewport = p.viewport or "main"
+  local prev = p.previous
+  if type(prev) ~= "table" then
+    error("dev_restore_viewport: previous table required (zoom, closeup, zoom_x, zoom_y, scale)")
+  end
+  local zoom = tonumber(prev.zoom)
+  local closeup = tonumber(prev.closeup)
+  local zoom_x = tonumber(prev.zoom_x)
+  local zoom_y = tonumber(prev.zoom_y)
+  local scale = tonumber(prev.scale)
+  if zoom == nil or closeup == nil or zoom_x == nil or zoom_y == nil or scale == nil then
+    error("dev_restore_viewport: previous must have zoom, closeup, zoom_x, zoom_y, scale")
+  end
+  local wait_for_pipe = p.wait_for_pipe
+  if wait_for_pipe == nil then wait_for_pipe = true end
+  local timeout_ms = tonumber(p.timeout_ms)
+  return dt.develop.restore_viewport(viewport, zoom, closeup, zoom_x, zoom_y, scale,
+    wait_for_pipe and true or false, timeout_ms)
+end
+
 -- Bugreport (2026-07-25): a caller deriving a normalized point from
 -- get_viewport()/get_preview() (the PROCESSED/display frame) and handing it
 -- STRAIGHT to dev_retouch_add_shape/dev_add_path_mask (which store points in

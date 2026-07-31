@@ -164,6 +164,27 @@ stub_dt.develop = {
     if len2 ~= nil then out.len2 = len2 end
     return out
   end,
+  -- Writable viewport zoom/pan (2026-07-31 set-viewport-design). Only the
+  -- bridge-layer arg-forwarding/defaulting contract is under test here (the
+  -- real dt_dev_zoom_move/clamp/wait-for-pipe semantics can only be verified
+  -- against a live darktable process) -- canned response mirrors the C
+  -- binding's documented shape.
+  set_viewport = function(viewport, zoom_x, zoom_y, scale, wait_for_pipe, timeout_ms)
+    table.insert(develop_calls, {name = "set_viewport",
+      args = {viewport, zoom_x, zoom_y, scale, wait_for_pipe, timeout_ms}})
+    return {
+      ok = true, viewport = viewport,
+      previous = {zoom = 3, zoom_label = "free", closeup = 0,
+                  zoom_x = -0.02, zoom_y = 0.05, scale = 0.4},
+      applied = {zoom_x = zoom_x, zoom_y = zoom_y, scale = scale},
+      clamped = {}, pipe_ready = true, waited_ms = 15,
+    }
+  end,
+  restore_viewport = function(viewport, zoom, closeup, zoom_x, zoom_y, scale, wait_for_pipe, timeout_ms)
+    table.insert(develop_calls, {name = "restore_viewport",
+      args = {viewport, zoom, closeup, zoom_x, zoom_y, scale, wait_for_pipe, timeout_ms}})
+    return {ok = true, viewport = viewport, pipe_ready = true, waited_ms = 8}
+  end,
   -- LUT tooling (2026-07-26): reads an arbitrary core conf key. Stub returns
   -- a canned lut3d root path for the one key the tests exercise, "" for
   -- anything else (matches the real C binding's never-nil contract).
@@ -542,6 +563,87 @@ do
   assertEq(call.name, "retouch_list_shapes", "correct C function called")
   assertEq(call.args[1], "retouch", "op forwarded")
   assertEq(call.args[2], 0, "instance defaults to 0")
+end
+
+-- ---- methods.dev_set_viewport / methods.dev_restore_viewport: bridge-layer
+-- arg forwarding + defaulting for the writable zoom/pan control
+-- (2026-07-31 set-viewport-design). Only the wrapper contract is under test
+-- (defaults, required-arg validation, previous-table unpacking) -- the real
+-- dt_dev_zoom_move/clamp/wait-for-pipe semantics need a live darktable
+-- process, flagged as such in the delegated task report.
+do
+  develop_calls = {}
+  local result = internals.methods.dev_set_viewport({zoom_x = -0.1, zoom_y = 0.05, scale = 2.5})
+  assertTrue(result.ok, "dev_set_viewport forwards the C result")
+  assertEq(result.viewport, "main", "result viewport echoed back")
+  local call = develop_calls[1]
+  assertEq(call.name, "set_viewport", "correct C function called")
+  assertEq(call.args[1], "main", "viewport defaults to 'main'")
+  assertEq(call.args[2], -0.1, "zoom_x forwarded")
+  assertEq(call.args[3], 0.05, "zoom_y forwarded")
+  assertEq(call.args[4], 2.5, "scale forwarded")
+  assertEq(call.args[5], true, "wait_for_pipe defaults to true")
+  assertEq(call.args[6], nil, "timeout_ms forwarded as nil when omitted (C applies its own default)")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_set_viewport({
+    viewport = "preview2", zoom_x = 0.0, zoom_y = 0.0, scale = 1.0,
+    wait_for_pipe = false, timeout_ms = 1000,
+  })
+  assertTrue(result.ok, "dev_set_viewport forwards the C result (preview2)")
+  local call = develop_calls[1]
+  assertEq(call.args[1], "preview2", "viewport forwarded when given")
+  assertEq(call.args[5], false, "wait_for_pipe forwarded when explicitly false")
+  assertEq(call.args[6], 1000, "timeout_ms forwarded when given")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_set_viewport, {zoom_x = 0.1, zoom_y = 0.1})
+  assertTrue(not ok, "dev_set_viewport errors without scale")
+  assertTrue(string.find(err or "", "zoom_x, zoom_y, scale") ~= nil,
+    "error names the missing required fields")
+end
+
+do
+  develop_calls = {}
+  local previous = {zoom = 0, zoom_label = "fit", closeup = 0, zoom_x = 0.0, zoom_y = 0.0, scale = 0.35}
+  local result = internals.methods.dev_restore_viewport({previous = previous})
+  assertTrue(result.ok, "dev_restore_viewport forwards the C result")
+  local call = develop_calls[1]
+  assertEq(call.name, "restore_viewport", "correct C function called")
+  assertEq(call.args[1], "main", "viewport defaults to 'main'")
+  assertEq(call.args[2], 0, "previous.zoom unpacked positionally")
+  assertEq(call.args[3], 0, "previous.closeup unpacked positionally")
+  assertEq(call.args[4], 0.0, "previous.zoom_x unpacked positionally")
+  assertEq(call.args[5], 0.0, "previous.zoom_y unpacked positionally")
+  assertEq(call.args[6], 0.35, "previous.scale unpacked positionally")
+  assertEq(call.args[7], true, "wait_for_pipe defaults to true")
+end
+
+do
+  develop_calls = {}
+  local previous = {zoom = 3, zoom_label = "free", closeup = 1, zoom_x = -0.2, zoom_y = 0.3, scale = 4.0}
+  internals.methods.dev_restore_viewport({
+    viewport = "preview2", previous = previous, wait_for_pipe = false, timeout_ms = 2000,
+  })
+  local call = develop_calls[1]
+  assertEq(call.args[1], "preview2", "viewport forwarded when given")
+  assertEq(call.args[7], false, "wait_for_pipe forwarded when explicitly false")
+  assertEq(call.args[8], 2000, "timeout_ms forwarded when given")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_restore_viewport, {})
+  assertTrue(not ok, "dev_restore_viewport errors without previous")
+  assertTrue(string.find(err or "", "previous") ~= nil, "error mentions previous")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_restore_viewport, {previous = {zoom = 0, closeup = 0}})
+  assertTrue(not ok, "dev_restore_viewport errors when previous is missing fields")
+  assertTrue(string.find(err or "", "zoom_x") ~= nil, "error names a missing field")
 end
 
 -- ---- methods.dev_backtransform_point: bridge-layer arg forwarding for the
