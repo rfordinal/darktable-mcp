@@ -825,8 +825,11 @@ end
 -- Retouch module: local heal/clone/blur/fill shapes tied to the module's own
 -- wavelet scale + rt_forms array (dt.develop.retouch_add_shape/delete_shape/
 -- list_shapes, src/lua/develop.c) -- distinct from dev_add_path_mask's
--- generic "restrict this module's blend to a region". Only circle shapes are
--- supported this phase; ellipse/path/brush are a later phase (see PLAN.md).
+-- generic "restrict this module's blend to a region". retouch_add_shape
+-- creates circle or ellipse; retouch_update_shape/list_shapes are still
+-- circle-only (ellipse read/move is a later step -- see
+-- docs/superpowers/specs/2026-07-31-retouch-ellipse-path-shapes-design.md).
+-- path/brush are a later phase too.
 -- blur/fill let you soften/erase texture on a nonzero wavelet scale WITHOUT
 -- touching tone/shadow on the other scales -- unlike heal/clone at scale 0,
 -- which always rewrites the full pixel (tone included). See
@@ -839,8 +842,9 @@ methods.dev_retouch_add_shape = function(p)
   local op = p.op
   if not op or op == "" then error("dev_retouch_add_shape: op required") end
   local instance = tonumber(p.instance) or 0
-  if p.shape_type and p.shape_type ~= "circle" then
-    error("dev_retouch_add_shape: only shape_type 'circle' supported in this build")
+  local shape_type = p.shape_type
+  if shape_type and shape_type ~= "circle" and shape_type ~= "ellipse" then
+    error("dev_retouch_add_shape: shape_type must be 'circle' or 'ellipse' in this build")
   end
   local algorithm = p.algorithm
   if not algorithm or algorithm == "" then error("dev_retouch_add_shape: algorithm required") end
@@ -874,10 +878,15 @@ methods.dev_retouch_add_shape = function(p)
       tonumber(fill_color.r), tonumber(fill_color.g), tonumber(fill_color.b)
   end
   local fill_brightness = tonumber(p.fill_brightness) -- nil -> C default
+  -- radius_b defaults to radius (a circle-shaped ellipse) if omitted; only
+  -- meaningful when shape_type="ellipse", ignored by C otherwise.
+  local radius_b = tonumber(p.radius_b)
+  local rotation = tonumber(p.rotation)
   return dt.develop.retouch_add_shape(op, instance, algorithm,
     tonumber(target.x), tonumber(target.y), radius, feather,
     source_x, source_y, scale, opacity,
-    blur_type, blur_radius, fill_mode, fill_r, fill_g, fill_b, fill_brightness)
+    blur_type, blur_radius, fill_mode, fill_r, fill_g, fill_b, fill_brightness,
+    shape_type, radius_b, rotation)
 end
 
 -- Move/resize an existing shape in place (same formid) -- see

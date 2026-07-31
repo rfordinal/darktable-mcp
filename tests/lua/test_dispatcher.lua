@@ -487,6 +487,35 @@ do
   assertTrue(string.find(err or "", "circle") ~= nil, "error mentions circle")
 end
 
+do
+  -- 2026-07-31 ellipse batch: shape_type="ellipse" forwards radius_b/rotation
+  -- as the new trailing C args (positions 19-21).
+  develop_calls = {}
+  internals.methods.dev_retouch_add_shape({
+    op = "retouch", algorithm = "heal", shape_type = "ellipse",
+    target = {x = 0.4, y = 0.3}, source = {x = 0.35, y = 0.3},
+    radius = 0.04, radius_b = 0.02, rotation = 30,
+  })
+  local call = develop_calls[1]
+  assertEq(call.args[19], "ellipse", "shape_type forwarded")
+  assertEq(call.args[20], 0.02, "radius_b forwarded")
+  assertEq(call.args[21], 30, "rotation forwarded")
+end
+
+do
+  -- shape_type="ellipse" without radius_b: still succeeds (C defaults
+  -- radius_b to radius), Lua does not inject a value itself.
+  develop_calls = {}
+  internals.methods.dev_retouch_add_shape({
+    op = "retouch", algorithm = "heal", shape_type = "ellipse",
+    target = {x = 0.4, y = 0.3}, source = {x = 0.35, y = 0.3}, radius = 0.04,
+  })
+  local call = develop_calls[1]
+  assertEq(call.args[19], "ellipse", "shape_type forwarded")
+  assertEq(call.args[20], nil, "radius_b omitted -> nil (C defaults to radius)")
+  assertEq(call.args[21], nil, "rotation omitted -> nil (C defaults to 0)")
+end
+
 -- ---- methods.dev_retouch_update_shape: bridge-layer arg validation/
 -- defaults/forwarding for in-place move/resize (2026-07-25 viewport-relative
 -- retouch design). algorithm/wavelet_scale/opacity are all optional (nil ->

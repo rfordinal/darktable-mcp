@@ -567,6 +567,46 @@ async def test_handle_retouch_add_shape_rejects_non_circle():
 
 
 @pytest.mark.asyncio
+async def test_handle_retouch_add_shape_ellipse_success():
+    """2026-07-31 ellipse batch: shape_type='ellipse' forwards radius_b/rotation
+    and reports them back."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "formid": 77, "algorithm": "heal", "shape_type": "ellipse",
+        "wavelet_scale": 0, "radius_b": 0.02, "rotation": 30.0,
+    }
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "heal",
+        "shape_type": "ellipse",
+        "target": {"x": 0.4, "y": 0.3},
+        "source": {"x": 0.35, "y": 0.3},
+        "radius": 0.04,
+        "radius_b": 0.02,
+        "rotation": 30.0,
+    })
+    assert "shape_type=ellipse" in result[0].text
+    assert "radius_b=0.02" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_retouch_add_shape",
+        {
+            "op": "retouch",
+            "instance": 0,
+            "algorithm": "heal",
+            "target": {"x": 0.4, "y": 0.3},
+            "radius": 0.04,
+            "feather": 0.0,
+            "opacity": 1.0,
+            "source": {"x": 0.35, "y": 0.3},
+            "shape_type": "ellipse",
+            "radius_b": 0.02,
+            "rotation": 30.0,
+        },
+        timeout=15.0,
+    )
+
+
+@pytest.mark.asyncio
 async def test_handle_retouch_add_shape_propagates_c_error():
     server = DarktableMCPServer()
     server.bridge = Mock()

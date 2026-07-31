@@ -2721,9 +2721,10 @@ class DarktableMCPServer:
                     "scale's texture, leaving tone/shadow on other scales "
                     "untouched — the fix for wrinkles/pores, where heal at "
                     "scale 0 visibly brightens/flattens shadow it should not "
-                    "touch. Only "
-                    "'circle' shapes are supported so far — ellipse/path/brush "
-                    "are a later phase. Requires a retouch module instance to "
+                    "touch. 'circle' and 'ellipse' shapes are supported so far "
+                    "(retouch_update_shape/retouch_list_shapes are still "
+                    "circle-only) — path/brush are a later phase. Requires a "
+                    "retouch module instance to "
                     "already exist in the open image's history (call "
                     "enable_module/add_instance first if needed) and "
                     "darktable running with the darktable-mcp Lua plugin. "
@@ -2744,9 +2745,30 @@ class DarktableMCPServer:
                         },
                         "shape_type": {
                             "type": "string",
-                            "enum": ["circle"],
+                            "enum": ["circle", "ellipse"],
                             "default": "circle",
-                            "description": "Only 'circle' is supported so far",
+                            "description": (
+                                "'circle' (default) or 'ellipse'. path/brush not yet "
+                                "supported. For 'ellipse', 'radius' is the first "
+                                "semi-axis (radius_a) and 'feather' is the border, "
+                                "same convention as circle; see radius_b/rotation."
+                            ),
+                        },
+                        "radius_b": {
+                            "type": "number",
+                            "minimum": 0.0005,
+                            "maximum": 0.5,
+                            "description": (
+                                "Ellipse's second semi-axis, only used when "
+                                "shape_type='ellipse'. Same normalization as "
+                                "radius/radius_a (against mask storage frame's "
+                                "mindim(width,height)). Defaults to 'radius' (a "
+                                "circle-shaped ellipse) if omitted."
+                            ),
+                        },
+                        "rotation": {
+                            "type": "number",
+                            "description": "Ellipse rotation in degrees, only used when shape_type='ellipse'. Default 0.",
                         },
                         "target": {
                             "type": "object",
@@ -6308,8 +6330,10 @@ class DarktableMCPServer:
         if radius is None:
             return [TextContent(type="text", text="radius is required")]
         shape_type = arguments.get("shape_type", "circle")
-        if shape_type != "circle":
-            return [TextContent(type="text", text="only shape_type 'circle' is supported so far")]
+        if shape_type not in ("circle", "ellipse"):
+            return [TextContent(
+                type="text", text="shape_type must be 'circle' or 'ellipse' so far"
+            )]
         instance = int(arguments.get("instance", 0))
 
         params: Dict[str, Any] = {
@@ -6325,6 +6349,12 @@ class DarktableMCPServer:
             params["source"] = {"x": float(source["x"]), "y": float(source["y"])}
         if arguments.get("wavelet_scale") is not None:
             params["wavelet_scale"] = int(arguments["wavelet_scale"])
+        if shape_type == "ellipse":
+            params["shape_type"] = "ellipse"
+            if arguments.get("radius_b") is not None:
+                params["radius_b"] = float(arguments["radius_b"])
+            if arguments.get("rotation") is not None:
+                params["rotation"] = float(arguments["rotation"])
         if arguments.get("blur_type") is not None:
             params["blur_type"] = arguments["blur_type"]
         if arguments.get("blur_radius") is not None:
@@ -6368,9 +6398,14 @@ class DarktableMCPServer:
         lines = [
             f"retouch_add_shape(instance={instance}): ok=True "
             f"formid={result.get('formid')} algorithm={result.get('algorithm')} "
+            f"shape_type={result.get('shape_type')} "
             f"wavelet_scale={result.get('wavelet_scale')} radius={result.get('radius')} "
             f"feather={result.get('feather')} opacity={result.get('opacity')}",
         ]
+        if result.get("shape_type") == "ellipse":
+            lines.append(
+                f"  radius_b={result.get('radius_b')} rotation={result.get('rotation')}"
+            )
         if result.get("algorithm") == "blur":
             lines.append(
                 f"  blur_type={result.get('blur_type')} blur_radius={result.get('blur_radius')}"

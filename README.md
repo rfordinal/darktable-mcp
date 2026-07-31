@@ -608,10 +608,15 @@ receives are longer and written for it (see "The tools are designed for a model,
   edit. Requires the matting sidecar.
 - `add_path_mask(op, points, instance?, opacity?)` — low-level: attach a polygon you already have.
 - `retouch_add_shape(algorithm, target, source?, radius, feather?, opacity?, wavelet_scale?, instance?,
-  blur_type?, blur_radius?, fill_mode?, fill_color?, fill_brightness?)` — heal/clone/blur/fill circle
-  on the retouch module. `source` is required for heal/clone, ignored for blur/fill (they have none).
-  `blur`/`fill` on a nonzero `wavelet_scale` act on that scale's texture only, leaving tone/shadow on
-  the other scales untouched — heal/clone always rewrite the full pixel regardless of scale.
+  blur_type?, blur_radius?, fill_mode?, fill_color?, fill_brightness?, shape_type?, radius_b?,
+  rotation?)` — heal/clone/blur/fill circle or ellipse on the retouch module. `source` is required
+  for heal/clone, ignored for blur/fill (they have none). `blur`/`fill` on a nonzero `wavelet_scale`
+  act on that scale's texture only, leaving tone/shadow on the other scales untouched — heal/clone
+  always rewrite the full pixel regardless of scale. `shape_type="ellipse"` treats `radius` as the
+  first semi-axis and adds `radius_b` (second semi-axis, defaults to `radius`) and `rotation`
+  (degrees) — useful for anything elongated (a scar, a stray hair) that a circle can't cover cleanly.
+  `retouch_update_shape`/`retouch_list_shapes` are still circle-only (ellipse read/move is a later
+  step); an ellipse created this way just reports `shape_type: "unknown"` if listed in the meantime.
 - `retouch_add_shape_in_viewport(snapshot_id, algorithm, target, source?, radius, feather?,
   coordinate_space?, radius_space?, opacity?, wavelet_scale?, instance?, return_preview?, blur_type?,
   blur_radius?, fill_mode?, fill_color?, fill_brightness?)` — the same heal/clone/blur/fill circle, but
