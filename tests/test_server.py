@@ -557,13 +557,65 @@ async def test_handle_retouch_add_shape_rejects_non_circle():
     server.bridge = Mock()
     result = await server._handle_retouch_add_shape({
         "algorithm": "heal",
-        "shape_type": "path",
+        "shape_type": "brush",
         "target": {"x": 0.4, "y": 0.3},
         "source": {"x": 0.35, "y": 0.3},
         "radius": 0.02,
     })
     assert "circle" in result[0].text
     server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_path_requires_points():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "heal",
+        "shape_type": "path",
+        "source": {"x": 0.35, "y": 0.3},
+    })
+    assert "points" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_path_success():
+    """2026-07-31 path batch: target/radius are NOT required for a path
+    (a polygon has no single center/radius); points is forwarded instead."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "formid": 88, "algorithm": "heal", "shape_type": "path",
+        "wavelet_scale": 0, "points": 3, "smooth": False,
+    }
+    result = await server._handle_retouch_add_shape({
+        "algorithm": "heal",
+        "shape_type": "path",
+        "source": {"x": 0.35, "y": 0.3},
+        "points": [
+            {"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.1}, {"x": 0.15, "y": 0.2},
+        ],
+        "smooth": False,
+    })
+    assert "shape_type=path" in result[0].text
+    server.bridge.call.assert_called_once_with(
+        "dev_retouch_add_shape",
+        {
+            "op": "retouch",
+            "instance": 0,
+            "algorithm": "heal",
+            "feather": 0.0,
+            "opacity": 1.0,
+            "source": {"x": 0.35, "y": 0.3},
+            "shape_type": "path",
+            "points": [
+                {"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.1}, {"x": 0.15, "y": 0.2},
+            ],
+            "smooth": False,
+        },
+        timeout=15.0,
+    )
 
 
 @pytest.mark.asyncio
@@ -1213,6 +1265,127 @@ async def test_handle_retouch_add_shape_in_viewport_blur_skips_source_backtransf
     assert "source" not in params
     assert params["blur_type"] == "gaussian"
     assert params["blur_radius"] == 8.0
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_in_viewport_path_backtransforms_each_node():
+    """2026-07-31 path viewport step: a path has no single target/radius --
+    each node goes through its own viewport-local -> display -> mask-frame
+    backtransform (reusing _backtransform_polygon_to_mask_space), plus one
+    extra call for source (heal/clone)."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"x": 0.11, "y": 0.11}, {"x": 0.21, "y": 0.11}, {"x": 0.16, "y": 0.21},
+        {"x": 0.6, "y": 0.6},
+        {"ok": True, "formid": 66, "algorithm": "heal", "shape_type": "path", "points": 3},
+    ]
+    result = await server._handle_retouch_add_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "algorithm": "heal",
+        "shape_type": "path",
+        "points": [{"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.1}, {"x": 0.15, "y": 0.2}],
+        "source": {"x": 0.6, "y": 0.6},
+        "return_preview": False,
+    })
+    assert "shape_type=path" in result[0].text
+    assert server.bridge.call.call_count == 6
+    call_args_list = server.bridge.call.call_args_list
+    assert call_args_list[0][0][0] == "dev_current_image"
+    assert all(c[0][0] == "dev_backtransform_point" for c in call_args_list[1:5])
+    assert call_args_list[5][0][0] == "dev_retouch_add_shape"
+    params = call_args_list[5][0][1]
+    assert params["points"] == [
+        {"x": 0.11, "y": 0.11}, {"x": 0.21, "y": 0.11}, {"x": 0.16, "y": 0.21},
+    ]
+    assert params["source"] == {"x": 0.6, "y": 0.6}
+    assert "target" not in params
+    assert "radius" not in params
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_add_shape_in_viewport_ellipse_backtransforms_radius_b():
+    """2026-07-31 ellipse viewport step: radius_b needs its OWN
+    backtransform_point call (its own len1 slot), separate from the main
+    target+radius+feather call."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"x": 0.5, "y": 0.4, "len1": 0.06},
+        {"x": 0.55, "y": 0.4},
+        {"x": 0.5, "y": 0.4, "len1": 0.02},
+        {"ok": True, "formid": 77, "algorithm": "heal", "shape_type": "ellipse",
+         "radius_b": 0.02, "rotation": 30.0},
+    ]
+    result = await server._handle_retouch_add_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "algorithm": "heal",
+        "shape_type": "ellipse",
+        "target": {"x": 0.5, "y": 0.4},
+        "source": {"x": 0.55, "y": 0.4},
+        "radius": 0.06,
+        "radius_b": 0.02,
+        "rotation": 30,
+        "return_preview": False,
+    })
+    assert "shape_type=ellipse" in result[0].text
+    call_args_list = server.bridge.call.call_args_list
+    assert call_args_list[0][0][0] == "dev_current_image"
+    assert call_args_list[1][0][0] == "dev_backtransform_point"  # target+radius+feather
+    assert call_args_list[2][0][0] == "dev_backtransform_point"  # source
+    assert call_args_list[3][0][0] == "dev_backtransform_point"  # radius_b (its own call)
+    assert call_args_list[4][0][0] == "dev_retouch_add_shape"
+    params = call_args_list[4][0][1]
+    assert params["radius_b"] == pytest.approx(0.02)
+    assert params["rotation"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_handle_retouch_update_shape_in_viewport_path_replaces_points():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"x": 0.51, "y": 0.41}, {"x": 0.56, "y": 0.41}, {"x": 0.53, "y": 0.46},
+        {"ok": True, "formid": 66, "shape_type": "path", "points": 3},
+    ]
+    result = await server._handle_retouch_update_shape_in_viewport({
+        "snapshot_id": snapshot_id,
+        "formid": 66,
+        "points": [{"x": 0.5, "y": 0.4}, {"x": 0.55, "y": 0.4}, {"x": 0.52, "y": 0.45}],
+        "return_preview": False,
+    })
+    assert "shape_type=path" in result[0].text
+    call_args_list = server.bridge.call.call_args_list
+    assert call_args_list[0][0][0] == "dev_current_image"
+    assert all(c[0][0] == "dev_backtransform_point" for c in call_args_list[1:4])
+    assert call_args_list[4][0][0] == "dev_retouch_update_shape"
+    params = call_args_list[4][0][1]
+    assert params["points"] == [
+        {"x": 0.51, "y": 0.41}, {"x": 0.56, "y": 0.41}, {"x": 0.53, "y": 0.46},
+    ]
+    assert "target" not in params
+    assert "radius" not in params
 
 
 @pytest.mark.asyncio

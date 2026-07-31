@@ -479,12 +479,41 @@ do
 end
 
 do
+  -- "path" used to be unsupported (this test predates the path batch); now
+  -- only genuinely unsupported types (e.g. "brush") are still rejected.
   local ok, err = pcall(internals.methods.dev_retouch_add_shape, {
-    op = "retouch", algorithm = "heal", shape_type = "path",
+    op = "retouch", algorithm = "heal", shape_type = "brush",
     target = {x = 0.4, y = 0.3}, source = {x = 0.35, y = 0.3}, radius = 0.02,
   })
   assertTrue(not ok, "dev_retouch_add_shape errors on unsupported shape_type")
   assertTrue(string.find(err or "", "circle") ~= nil, "error mentions circle")
+end
+
+do
+  -- 2026-07-31 path batch: shape_type="path" requires >=3 points, and
+  -- target/radius are NOT required (a polygon has no single center/radius).
+  local ok, err = pcall(internals.methods.dev_retouch_add_shape, {
+    op = "retouch", algorithm = "heal", shape_type = "path",
+    source = {x = 0.35, y = 0.3},
+  })
+  assertTrue(not ok, "dev_retouch_add_shape errors without points for shape_type='path'")
+  assertTrue(string.find(err or "", "points") ~= nil, "error mentions points")
+end
+
+do
+  develop_calls = {}
+  internals.methods.dev_retouch_add_shape({
+    op = "retouch", algorithm = "heal", shape_type = "path",
+    source = {x = 0.35, y = 0.3},
+    points = {{x = 0.1, y = 0.1}, {x = 0.2, y = 0.1}, {x = 0.15, y = 0.2}},
+    smooth = false,
+  })
+  local call = develop_calls[1]
+  assertEq(call.args[19], "path", "shape_type forwarded")
+  local pts = call.args[22]
+  assertEq(#pts, 3, "points table forwarded with 3 nodes")
+  assertEq(pts[1].x, 0.1, "point 1 x forwarded")
+  assertEq(call.args[23], false, "smooth forwarded")
 end
 
 do
@@ -607,6 +636,30 @@ do
   local call = develop_calls[1]
   assertEq(call.args[20], 0.03, "radius_b forwarded")
   assertEq(call.args[21], 45, "rotation forwarded")
+end
+
+do
+  -- 2026-07-31 path batch: `points` implies path-update mode -- target/
+  -- radius are NOT required in this case (a polygon has no single
+  -- center/radius), and points/smooth forward to positions 22-23.
+  develop_calls = {}
+  internals.methods.dev_retouch_update_shape({
+    op = "retouch", formid = 42,
+    points = {{x = 0.5, y = 0.5}, {x = 0.55, y = 0.5}, {x = 0.52, y = 0.55}},
+    smooth = false,
+  })
+  local call = develop_calls[1]
+  local pts = call.args[22]
+  assertEq(#pts, 3, "points forwarded with 3 nodes")
+  assertEq(call.args[23], false, "smooth forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_retouch_update_shape, {
+    op = "retouch", formid = 42, points = {{x = 0.1, y = 0.1}, {x = 0.2, y = 0.1}},
+  })
+  assertTrue(not ok, "dev_retouch_update_shape errors with fewer than 3 points")
+  assertTrue(string.find(err or "", "points") ~= nil, "error mentions points")
 end
 
 do

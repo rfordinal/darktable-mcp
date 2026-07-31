@@ -825,11 +825,11 @@ end
 -- Retouch module: local heal/clone/blur/fill shapes tied to the module's own
 -- wavelet scale + rt_forms array (dt.develop.retouch_add_shape/delete_shape/
 -- list_shapes, src/lua/develop.c) -- distinct from dev_add_path_mask's
--- generic "restrict this module's blend to a region". retouch_add_shape
--- creates circle or ellipse; retouch_update_shape/list_shapes are still
--- circle-only (ellipse read/move is a later step -- see
+-- generic "restrict this module's blend to a region". retouch_add_shape/
+-- update_shape/list_shapes support circle, ellipse, and path (see
 -- docs/superpowers/specs/2026-07-31-retouch-ellipse-path-shapes-design.md).
--- path/brush are a later phase too.
+-- brush is a later phase (per-vertex pressure data doesn't map cleanly to
+-- an API caller).
 -- blur/fill let you soften/erase texture on a nonzero wavelet scale WITHOUT
 -- touching tone/shadow on the other scales -- unlike heal/clone at scale 0,
 -- which always rewrites the full pixel (tone included). See
@@ -843,14 +843,27 @@ methods.dev_retouch_add_shape = function(p)
   if not op or op == "" then error("dev_retouch_add_shape: op required") end
   local instance = tonumber(p.instance) or 0
   local shape_type = p.shape_type
-  if shape_type and shape_type ~= "circle" and shape_type ~= "ellipse" then
-    error("dev_retouch_add_shape: shape_type must be 'circle' or 'ellipse' in this build")
+  if shape_type and shape_type ~= "circle" and shape_type ~= "ellipse" and shape_type ~= "path" then
+    error("dev_retouch_add_shape: shape_type must be 'circle', 'ellipse', or 'path'")
   end
+  local is_path = (shape_type == "path")
   local algorithm = p.algorithm
   if not algorithm or algorithm == "" then error("dev_retouch_add_shape: algorithm required") end
+  -- target/radius are meaningless for a path (a polygon has no single
+  -- center/radius) -- C ignores them for shape_type="path", so this wrapper
+  -- accepts (but does not require) them for that case, substituting a
+  -- placeholder 0.0 for the unconditional positional C args.
   local target = p.target
-  if type(target) ~= "table" or tonumber(target.x) == nil or tonumber(target.y) == nil then
-    error("dev_retouch_add_shape: target {x,y} required")
+  local target_x, target_y = 0.0, 0.0
+  if is_path then
+    if type(target) == "table" then
+      target_x, target_y = tonumber(target.x) or 0.0, tonumber(target.y) or 0.0
+    end
+  else
+    if type(target) ~= "table" or tonumber(target.x) == nil or tonumber(target.y) == nil then
+      error("dev_retouch_add_shape: target {x,y} required")
+    end
+    target_x, target_y = tonumber(target.x), tonumber(target.y)
   end
   local source = p.source
   local source_x, source_y
@@ -863,7 +876,8 @@ methods.dev_retouch_add_shape = function(p)
     source_x, source_y = tonumber(source.x), tonumber(source.y)
   end
   local radius = tonumber(p.radius)
-  if radius == nil then error("dev_retouch_add_shape: radius required") end
+  if not is_path and radius == nil then error("dev_retouch_add_shape: radius required") end
+  radius = radius or 0.01 -- placeholder for path, ignored by C
   local feather = tonumber(p.feather) or 0.0
   local scale = tonumber(p.wavelet_scale) -- nil -> C default (module's curr_scale)
   local opacity = tonumber(p.opacity)
@@ -882,11 +896,22 @@ methods.dev_retouch_add_shape = function(p)
   -- meaningful when shape_type="ellipse", ignored by C otherwise.
   local radius_b = tonumber(p.radius_b)
   local rotation = tonumber(p.rotation)
+  local points = nil
+  if is_path then
+    if type(p.points) ~= "table" or #p.points < 3 then
+      error("dev_retouch_add_shape: points (>=3 {x,y}) required for shape_type='path'")
+    end
+    points = p.points
+  elseif p.points ~= nil then
+    error("dev_retouch_add_shape: points only applies to shape_type='path'")
+  end
+  local smooth
+  if p.smooth ~= nil then smooth = p.smooth and true or false end -- nil -> C default (true)
   return dt.develop.retouch_add_shape(op, instance, algorithm,
-    tonumber(target.x), tonumber(target.y), radius, feather,
+    target_x, target_y, radius, feather,
     source_x, source_y, scale, opacity,
     blur_type, blur_radius, fill_mode, fill_r, fill_g, fill_b, fill_brightness,
-    shape_type, radius_b, rotation)
+    shape_type, radius_b, rotation, points, smooth)
 end
 
 -- Move/resize an existing shape in place (same formid) -- see
@@ -904,9 +929,31 @@ methods.dev_retouch_update_shape = function(p)
   local instance = tonumber(p.instance) or 0
   local formid = tonumber(p.formid)
   if formid == nil then error("dev_retouch_update_shape: formid required") end
+  -- `points` implies the caller means to update a path -- in that mode
+  -- target/radius are meaningless (a polygon has no single center/radius)
+  -- and are NOT required, unlike the circle/ellipse case below. Whether the
+  -- formid is ACTUALLY a path is something only C can verify (this wrapper
+  -- has no way to look up the shape's current type), so a mismatch (points
+  -- given for a non-path formid) surfaces as C's own graceful error.
+  local points = nil
+  if type(p.points) == "table" then
+    if #p.points < 3 then
+      error("dev_retouch_update_shape: points needs at least 3 {x,y} nodes")
+    end
+    points = p.points
+  end
   local target = p.target
-  if type(target) ~= "table" or tonumber(target.x) == nil or tonumber(target.y) == nil then
-    error("dev_retouch_update_shape: target {x,y} required")
+  local target_x, target_y
+  if points then
+    target_x, target_y = 0.0, 0.0
+    if type(target) == "table" then
+      target_x, target_y = tonumber(target.x) or 0.0, tonumber(target.y) or 0.0
+    end
+  else
+    if type(target) ~= "table" or tonumber(target.x) == nil or tonumber(target.y) == nil then
+      error("dev_retouch_update_shape: target {x,y} required")
+    end
+    target_x, target_y = tonumber(target.x), tonumber(target.y)
   end
   local algorithm = p.algorithm -- nil -> C keeps the shape's current algorithm
   local source = p.source
@@ -917,7 +964,8 @@ methods.dev_retouch_update_shape = function(p)
     error("dev_retouch_update_shape: source {x,y} required for heal/clone")
   end
   local radius = tonumber(p.radius)
-  if radius == nil then error("dev_retouch_update_shape: radius required") end
+  if not points and radius == nil then error("dev_retouch_update_shape: radius required") end
+  radius = radius or 0.01 -- placeholder for path, ignored by C
   local feather = tonumber(p.feather) or 0.0
   local scale = tonumber(p.wavelet_scale) -- nil -> C keeps the shape's current scale
   local opacity = tonumber(p.opacity) -- nil -> C leaves opacity untouched
@@ -932,14 +980,16 @@ methods.dev_retouch_update_shape = function(p)
   end
   local fill_brightness = tonumber(p.fill_brightness)
   -- only meaningful for an existing ellipse shape; C rejects them (rather
-  -- than silently ignoring) if passed for a circle formid.
+  -- than silently ignoring) if passed for a circle/path formid.
   local radius_b = tonumber(p.radius_b)
   local rotation = tonumber(p.rotation)
+  local smooth
+  if p.smooth ~= nil then smooth = p.smooth and true or false end -- nil -> C default (true)
   return dt.develop.retouch_update_shape(op, instance, formid,
-    tonumber(target.x), tonumber(target.y), radius, feather,
+    target_x, target_y, radius, feather,
     source_x, source_y, algorithm, scale, opacity,
     blur_type, blur_radius, fill_mode, fill_r, fill_g, fill_b, fill_brightness,
-    radius_b, rotation)
+    radius_b, rotation, points, smooth)
 end
 
 methods.dev_retouch_delete_shape = function(p)

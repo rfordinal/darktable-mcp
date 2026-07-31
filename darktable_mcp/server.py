@@ -2096,9 +2096,53 @@ class DarktableMCPServer:
                                 "size doesn't depend on the window's aspect ratio."
                             ),
                         },
+                        "shape_type": {
+                            "type": "string",
+                            "enum": ["circle", "ellipse", "path"],
+                            "default": "circle",
+                            "description": (
+                                "'circle' (default), 'ellipse', or 'path'. brush not "
+                                "yet supported. For 'path', 'target'/'radius' are NOT "
+                                "used -- use 'points' instead."
+                            ),
+                        },
+                        "radius_b": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": (
+                                "Ellipse's second semi-axis, in radius_space units. "
+                                "Only used when shape_type='ellipse'; defaults to "
+                                "'radius' (a circle-shaped ellipse) if omitted."
+                            ),
+                        },
+                        "rotation": {
+                            "type": "number",
+                            "description": "Ellipse rotation in degrees, only used when shape_type='ellipse'. Default 0.",
+                        },
+                        "points": {
+                            "type": "array",
+                            "minItems": 3,
+                            "description": (
+                                "Polygon nodes, in coordinate_space units. REQUIRED "
+                                "for shape_type='path', REJECTED otherwise."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"},
+                                },
+                                "required": ["x", "y"],
+                            },
+                        },
+                        "smooth": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Only used with shape_type='path'. true (default) = Catmull-Rom bezier boundary; false = faceted polygon.",
+                        },
                         "target": {
                             "type": "object",
-                            "description": "Shape center, in coordinate_space units",
+                            "description": "Shape center, in coordinate_space units. Not used for shape_type='path'.",
                             "properties": {
                                 "x": {"type": "number"},
                                 "y": {"type": "number"},
@@ -2122,13 +2166,18 @@ class DarktableMCPServer:
                         "radius": {
                             "type": "number",
                             "minimum": 0,
-                            "description": "Circle radius, in radius_space units",
+                            "description": "Circle/ellipse radius, in radius_space units. Not used for shape_type='path'.",
                         },
                         "feather": {
                             "type": "number",
                             "default": 0.0,
                             "minimum": 0,
-                            "description": "Soft edge width, in radius_space units",
+                            "description": (
+                                "Soft edge width, in radius_space units. For "
+                                "shape_type='path' this is instead a FRACTION of "
+                                "the path's own bounding box (same as "
+                                "add_path_mask), not a radius_space length."
+                            ),
                         },
                         "opacity": {
                             "type": "number",
@@ -2184,7 +2233,7 @@ class DarktableMCPServer:
                             "description": "Render the same captured region again after the edit, for immediate visual verification",
                         },
                     },
-                    "required": ["snapshot_id", "algorithm", "target", "radius"],
+                    "required": ["snapshot_id", "algorithm"],
                 },
             ),
             Tool(
@@ -2196,8 +2245,9 @@ class DarktableMCPServer:
                     "conversion and containment rejection as "
                     "retouch_add_shape_in_viewport, but keeps the shape's "
                     "identity instead of deleting and recreating it. "
-                    "target/source/radius/feather must be resent in full "
-                    "each call (this moves the whole shape, not a single field)."
+                    "target/source/radius/feather (circle/ellipse) or points "
+                    "(path) must be resent in full each call (this moves the "
+                    "whole shape, not a single field)."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2243,7 +2293,7 @@ class DarktableMCPServer:
                         },
                         "target": {
                             "type": "object",
-                            "description": "New shape center, in coordinate_space units",
+                            "description": "New shape center, in coordinate_space units. Not used when updating a path (pass 'points' instead).",
                             "properties": {
                                 "x": {"type": "number"},
                                 "y": {"type": "number"},
@@ -2267,13 +2317,52 @@ class DarktableMCPServer:
                         "radius": {
                             "type": "number",
                             "minimum": 0,
-                            "description": "New circle radius, in radius_space units",
+                            "description": "New circle/ellipse radius, in radius_space units. Not used when updating a path.",
+                        },
+                        "radius_b": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": "New ellipse second semi-axis, in radius_space units. Only applies if the shape is an ellipse (rejected otherwise); omit to keep its current value.",
+                        },
+                        "rotation": {
+                            "type": "number",
+                            "description": "New ellipse rotation in degrees. Only applies if the shape is an ellipse; omit to keep its current value.",
+                        },
+                        "points": {
+                            "type": "array",
+                            "minItems": 3,
+                            "description": (
+                                "New polygon nodes, in coordinate_space units. "
+                                "REQUIRED to update a path shape (a path's "
+                                "geometry IS its point list -- there is no "
+                                "separate target/radius to move independently); "
+                                "REJECTED for any other shape type. REPLACES the "
+                                "entire point list."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"},
+                                },
+                                "required": ["x", "y"],
+                            },
+                        },
+                        "smooth": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Only used together with 'points'. true (default) = Catmull-Rom bezier boundary; false = faceted polygon.",
                         },
                         "feather": {
                             "type": "number",
                             "default": 0.0,
                             "minimum": 0,
-                            "description": "New soft edge width, in radius_space units",
+                            "description": (
+                                "New soft edge width, in radius_space units. "
+                                "When updating a path, this is instead a "
+                                "FRACTION of the path's own bounding box (same "
+                                "as add_path_mask), not a radius_space length."
+                            ),
                         },
                         "opacity": {
                             "type": "number",
@@ -2321,7 +2410,7 @@ class DarktableMCPServer:
                             "description": "Render the same captured region again after the edit, for immediate visual verification",
                         },
                     },
-                    "required": ["snapshot_id", "formid", "target", "radius"],
+                    "required": ["snapshot_id", "formid"],
                 },
             ),
             Tool(
@@ -2721,10 +2810,8 @@ class DarktableMCPServer:
                     "scale's texture, leaving tone/shadow on other scales "
                     "untouched — the fix for wrinkles/pores, where heal at "
                     "scale 0 visibly brightens/flattens shadow it should not "
-                    "touch. 'circle' and 'ellipse' shapes are supported so far "
-                    "(retouch_update_shape/retouch_list_shapes are still "
-                    "circle-only) — path/brush are a later phase. Requires a "
-                    "retouch module instance to "
+                    "touch. 'circle', 'ellipse', and 'path' shapes are supported "
+                    "(brush is a later phase). Requires a retouch module instance to "
                     "already exist in the open image's history (call "
                     "enable_module/add_instance first if needed) and "
                     "darktable running with the darktable-mcp Lua plugin. "
@@ -2745,13 +2832,18 @@ class DarktableMCPServer:
                         },
                         "shape_type": {
                             "type": "string",
-                            "enum": ["circle", "ellipse"],
+                            "enum": ["circle", "ellipse", "path"],
                             "default": "circle",
                             "description": (
-                                "'circle' (default) or 'ellipse'. path/brush not yet "
-                                "supported. For 'ellipse', 'radius' is the first "
+                                "'circle' (default), 'ellipse', or 'path'. brush not "
+                                "yet supported. For 'ellipse', 'radius' is the first "
                                 "semi-axis (radius_a) and 'feather' is the border, "
-                                "same convention as circle; see radius_b/rotation."
+                                "same convention as circle; see radius_b/rotation. "
+                                "For 'path', 'target'/'radius' are NOT used (a "
+                                "polygon has no single center/radius) -- use "
+                                "'points' instead, and note 'feather' switches to a "
+                                "FRACTION of the path's own bounding box (same as "
+                                "add_path_mask), not circle/ellipse's absolute value."
                             ),
                         },
                         "radius_b": {
@@ -2770,9 +2862,37 @@ class DarktableMCPServer:
                             "type": "number",
                             "description": "Ellipse rotation in degrees, only used when shape_type='ellipse'. Default 0.",
                         },
+                        "points": {
+                            "type": "array",
+                            "minItems": 3,
+                            "description": (
+                                "Polygon nodes, normalized 0..1 against the MASK "
+                                "STORAGE frame. REQUIRED for shape_type='path', "
+                                "REJECTED (error) otherwise. Same node format as "
+                                "add_path_mask's 'points'."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "x": {"type": "number", "minimum": 0, "maximum": 1},
+                                    "y": {"type": "number", "minimum": 0, "maximum": 1},
+                                },
+                                "required": ["x", "y"],
+                            },
+                        },
+                        "smooth": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": (
+                                "Only used with shape_type='path'. true (default) = "
+                                "Catmull-Rom bezier boundary; false = faceted "
+                                "straight-segment polygon. Same as add_path_mask's "
+                                "'smooth'."
+                            ),
+                        },
                         "target": {
                             "type": "object",
-                            "description": "Shape center, normalized 0..1 against the MASK STORAGE frame (pipe-input, pre-crop) -- NOT get_preview's frame. Use retouch_add_shape_in_viewport instead if unsure.",
+                            "description": "Shape center, normalized 0..1 against the MASK STORAGE frame (pipe-input, pre-crop) -- NOT get_preview's frame. Use retouch_add_shape_in_viewport instead if unsure. Not used for shape_type='path'.",
                             "properties": {
                                 "x": {"type": "number", "minimum": 0, "maximum": 1},
                                 "y": {"type": "number", "minimum": 0, "maximum": 1},
@@ -2858,7 +2978,7 @@ class DarktableMCPServer:
                             "description": "Only used when algorithm='fill'; default = module's current fill_brightness",
                         },
                     },
-                    "required": ["algorithm", "target", "radius"],
+                    "required": ["algorithm"],
                 },
             ),
             Tool(
@@ -4713,6 +4833,7 @@ class DarktableMCPServer:
         display_source: Optional[Dict[str, float]],
         display_radius: float,
         display_feather: float,
+        display_radius_b: Optional[float] = None,
     ):
         """Second stage of the viewport-relative retouch pipeline: convert
         PROCESSED/DISPLAY-frame-normalized coordinates (viewport_coords.py's
@@ -4725,9 +4846,16 @@ class DarktableMCPServer:
         see retouch_add_shape's doc comment on why); the source leg is then
         skipped entirely rather than backtransforming a meaningless point.
 
+        display_radius_b (ellipse only) is a SEPARATE bridge call using its
+        own len1 slot -- dt.develop.backtransform_point only has two length
+        slots (len1/len2), already spent on radius/feather in the main
+        target call, so radius_b needs its own round-trip rather than a
+        len3 that doesn't exist. One extra call only when an ellipse is
+        actually involved; circles/paths never pay for it.
+
         Returns (mask_dict, error_response) -- exactly one is None. mask_dict
-        has target ({x,y}), source ({x,y} or None), and radius/feather
-        (floats)."""
+        has target ({x,y}), source ({x,y} or None), radius/feather (floats),
+        and radius_b (float, only present when display_radius_b was given)."""
         target_params: Dict[str, Any] = {
             "x": display_target["x"], "y": display_target["y"], "len1": display_radius,
         }
@@ -4752,12 +4880,12 @@ class DarktableMCPServer:
                 type="text", text=f"backtransform_point(target): {target_result['error']}"
             )]
 
-        source_out = None
-        if display_source is not None:
+        radius_b_out = None
+        if display_radius_b is not None:
             try:
-                source_result = self.bridge.call(
+                radius_b_result = self.bridge.call(
                     "dev_backtransform_point",
-                    {"x": display_source["x"], "y": display_source["y"]},
+                    {"x": display_target["x"], "y": display_target["y"], "len1": display_radius_b},
                     timeout=15.0,
                 )
             except BridgePluginNotInstalledError:
@@ -4772,18 +4900,57 @@ class DarktableMCPServer:
                 )]
             except BridgeError as e:
                 return None, [TextContent(type="text", text=f"Plugin error: {e}")]
-            if source_result.get("error"):
+            if radius_b_result.get("error"):
                 return None, [TextContent(
-                    type="text", text=f"backtransform_point(source): {source_result['error']}"
+                    type="text", text=f"backtransform_point(radius_b): {radius_b_result['error']}"
                 )]
-            source_out = {"x": source_result["x"], "y": source_result["y"]}
+            radius_b_out = radius_b_result.get("len1", display_radius_b)
 
-        return {
+        source_out = None
+        if display_source is not None:
+            source_out, source_err = self._backtransform_single_point(display_source)
+            if source_err is not None:
+                return None, source_err
+
+        result = {
             "target": {"x": target_result["x"], "y": target_result["y"]},
             "source": source_out,
             "radius": target_result.get("len1", display_radius),
             "feather": target_result.get("len2", 0.0) if display_feather > 0 else 0.0,
-        }, None
+        }
+        if radius_b_out is not None:
+            result["radius_b"] = radius_b_out
+        return result, None
+
+    def _backtransform_single_point(self, display_pt: Dict[str, float]):
+        """One dev_backtransform_point call for a point with no associated
+        length -- shared by _backtransform_to_mask_space's source leg and
+        the viewport retouch handlers' path-shape source leg (a path has no
+        single target to piggyback the source call onto the way circle/
+        ellipse do). Returns (mask_pt, None) or (None, error_response)."""
+        try:
+            result = self.bridge.call(
+                "dev_backtransform_point",
+                {"x": display_pt["x"], "y": display_pt["y"]},
+                timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return None, [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return None, [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return None, [TextContent(type="text", text=f"Plugin error: {e}")]
+        if result.get("error"):
+            return None, [TextContent(
+                type="text", text=f"backtransform_point(source): {result['error']}"
+            )]
+        return {"x": result["x"], "y": result["y"]}, None
 
     def _backtransform_polygon_to_mask_space(
         self, polygon_display: List[Dict[str, float]]
@@ -6319,32 +6486,47 @@ class DarktableMCPServer:
         algorithm = arguments.get("algorithm")
         if not algorithm:
             return [TextContent(type="text", text="algorithm is required")]
-        target = arguments.get("target")
-        if not isinstance(target, dict) or "x" not in target or "y" not in target:
-            return [TextContent(type="text", text="target {x,y} is required")]
+        shape_type = arguments.get("shape_type", "circle")
+        if shape_type not in ("circle", "ellipse", "path"):
+            return [TextContent(
+                type="text", text="shape_type must be 'circle', 'ellipse', or 'path' so far"
+            )]
+        is_path = shape_type == "path"
         source = arguments.get("source")
         needs_source = algorithm in ("heal", "clone")
         if needs_source and (not isinstance(source, dict) or "x" not in source or "y" not in source):
             return [TextContent(type="text", text="source {x,y} is required for heal/clone")]
+
+        points = arguments.get("points")
+        if is_path:
+            if not isinstance(points, list) or len(points) < 3:
+                return [TextContent(
+                    type="text", text="points (>=3 {x,y}) is required for shape_type='path'"
+                )]
+            for pt in points:
+                if not isinstance(pt, dict) or "x" not in pt or "y" not in pt:
+                    return [TextContent(type="text", text="each point must be {x,y}")]
+        elif points is not None:
+            return [TextContent(type="text", text="points only applies to shape_type='path'")]
+
+        target = arguments.get("target")
+        if not is_path and (not isinstance(target, dict) or "x" not in target or "y" not in target):
+            return [TextContent(type="text", text="target {x,y} is required")]
         radius = arguments.get("radius")
-        if radius is None:
+        if not is_path and radius is None:
             return [TextContent(type="text", text="radius is required")]
-        shape_type = arguments.get("shape_type", "circle")
-        if shape_type not in ("circle", "ellipse"):
-            return [TextContent(
-                type="text", text="shape_type must be 'circle' or 'ellipse' so far"
-            )]
         instance = int(arguments.get("instance", 0))
 
         params: Dict[str, Any] = {
             "op": "retouch",
             "instance": instance,
             "algorithm": algorithm,
-            "target": {"x": float(target["x"]), "y": float(target["y"])},
-            "radius": float(radius),
             "feather": float(arguments.get("feather", 0.0)),
             "opacity": float(arguments.get("opacity", 1.0)),
         }
+        if not is_path:
+            params["target"] = {"x": float(target["x"]), "y": float(target["y"])}
+            params["radius"] = float(radius)
         if isinstance(source, dict) and "x" in source and "y" in source:
             params["source"] = {"x": float(source["x"]), "y": float(source["y"])}
         if arguments.get("wavelet_scale") is not None:
@@ -6355,6 +6537,11 @@ class DarktableMCPServer:
                 params["radius_b"] = float(arguments["radius_b"])
             if arguments.get("rotation") is not None:
                 params["rotation"] = float(arguments["rotation"])
+        if is_path:
+            params["shape_type"] = "path"
+            params["points"] = [{"x": float(p["x"]), "y": float(p["y"])} for p in points]
+            if arguments.get("smooth") is not None:
+                params["smooth"] = bool(arguments["smooth"])
         if arguments.get("blur_type") is not None:
             params["blur_type"] = arguments["blur_type"]
         if arguments.get("blur_radius") is not None:
@@ -6399,13 +6586,20 @@ class DarktableMCPServer:
             f"retouch_add_shape(instance={instance}): ok=True "
             f"formid={result.get('formid')} algorithm={result.get('algorithm')} "
             f"shape_type={result.get('shape_type')} "
-            f"wavelet_scale={result.get('wavelet_scale')} radius={result.get('radius')} "
-            f"feather={result.get('feather')} opacity={result.get('opacity')}",
+            f"wavelet_scale={result.get('wavelet_scale')} "
+            + (
+                f"points={result.get('points')} "
+                if result.get("shape_type") == "path"
+                else f"radius={result.get('radius')} "
+            )
+            + f"feather={result.get('feather')} opacity={result.get('opacity')}",
         ]
         if result.get("shape_type") == "ellipse":
             lines.append(
                 f"  radius_b={result.get('radius_b')} rotation={result.get('rotation')}"
             )
+        elif result.get("shape_type") == "path":
+            lines.append(f"  smooth={result.get('smooth')}")
         if result.get("algorithm") == "blur":
             lines.append(
                 f"  blur_type={result.get('blur_type')} blur_radius={result.get('blur_radius')}"
@@ -6426,27 +6620,23 @@ class DarktableMCPServer:
         algorithm = arguments.get("algorithm")
         if not algorithm:
             return [TextContent(type="text", text="algorithm is required")]
+        shape_type = arguments.get("shape_type", "circle")
+        if shape_type not in ("circle", "ellipse", "path"):
+            return [TextContent(
+                type="text", text="shape_type must be 'circle', 'ellipse', or 'path' so far"
+            )]
+        is_path = shape_type == "path"
+        is_ellipse = shape_type == "ellipse"
         needs_source = algorithm in ("heal", "clone")
-        target = arguments.get("target")
         source = arguments.get("source")
         if needs_source and not isinstance(source, dict):
             return [TextContent(type="text", text="source {x,y} is required for heal/clone")]
-        radius = arguments.get("radius")
-        if radius is None:
-            return [TextContent(type="text", text="radius is required")]
 
         coordinate_space = canonical_space(
             arguments.get("coordinate_space", "snapshot_normalized")
         )
         radius_space = canonical_space(arguments.get("radius_space", coordinate_space))
 
-        # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized
-        # (same frame get_viewport()/get_preview() use). source is skipped
-        # for blur/fill (no source point at all -- see retouch_add_shape's
-        # doc comment).
-        display_target = viewport_point_to_image(
-            region, target, coordinate_space, render["width"], render["height"], label="target"
-        )
         display_source = (
             viewport_point_to_image(
                 region, source, coordinate_space, render["width"], render["height"], label="source"
@@ -6454,46 +6644,123 @@ class DarktableMCPServer:
             if isinstance(source, dict)
             else None
         )
-        display_radius = viewport_radius_to_image(region, float(radius), radius_space, render["width"])
-        feather_local = float(arguments.get("feather", 0.0))
-        display_feather = (
-            viewport_radius_to_image(region, feather_local, radius_space, render["width"])
-            if feather_local > 0
-            else 0.0
-        )
 
-        # Same-image guard: the snapshot's coordinates only mean something on
-        # the image it was captured from, so refuse before touching darktable
-        # if darkroom has moved on. Runs after the (free, local) stage-1
-        # transform so malformed input still fails without a bridge call.
-        guard = self._snapshot_image_guard(snapshot, "retouch_add_shape_in_viewport")
-        if guard is not None:
-            return guard
+        full_target = full_radius = full_feather = full_radius_b = None
+        full_points = None
+        target = radius = points = None
 
-        # Stage 2: display-frame -> PIPE-INPUT/mask-frame normalized (the
-        # frame retouch_add_shape actually stores coordinates in -- these two
-        # frames differ whenever orientation/crop/rotate/lens-correction is
-        # active; see _backtransform_to_mask_space's doc comment).
-        mask, err = self._backtransform_to_mask_space(
-            display_target, display_source, display_radius, display_feather
-        )
-        if err is not None:
-            return err
-        full_target = mask["target"]
-        full_source = mask["source"]
-        full_radius = mask["radius"]
-        full_feather = mask["feather"]
+        if is_path:
+            points = arguments.get("points")
+            if not isinstance(points, list) or len(points) < 3:
+                return [TextContent(
+                    type="text", text="points (>=3 {x,y}) is required for shape_type='path'"
+                )]
+            # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized,
+            # one point per node (a polygon has no single center/radius to
+            # transform, unlike circle/ellipse). Raises ViewportCoordinateError
+            # uncaught on an out-of-bounds node, same convention as target/
+            # source below (see test_handle_retouch_add_shape_in_viewport_
+            # rejects_out_of_bounds).
+            display_points = [
+                viewport_point_to_image(
+                    region, pt, coordinate_space, render["width"], render["height"],
+                    label=f"points[{i}]",
+                )
+                for i, pt in enumerate(points)
+            ]
+
+            guard = self._snapshot_image_guard(snapshot, "retouch_add_shape_in_viewport")
+            if guard is not None:
+                return guard
+
+            # Stage 2: reuse mask_object/add_path_mask's existing N-point
+            # backtransform (already generic over point count).
+            full_points, poly_err = self._backtransform_polygon_to_mask_space(display_points)
+            if poly_err is not None:
+                return poly_err
+            full_source = None
+            if display_source is not None:
+                full_source, source_err = self._backtransform_single_point(display_source)
+                if source_err is not None:
+                    return source_err
+        else:
+            target = arguments.get("target")
+            if not isinstance(target, dict):
+                return [TextContent(type="text", text="target {x,y} is required")]
+            radius = arguments.get("radius")
+            if radius is None:
+                return [TextContent(type="text", text="radius is required")]
+
+            # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized
+            # (same frame get_viewport()/get_preview() use). source is
+            # skipped for blur/fill (no source point at all -- see
+            # retouch_add_shape's doc comment).
+            display_target = viewport_point_to_image(
+                region, target, coordinate_space, render["width"], render["height"], label="target"
+            )
+            display_radius = viewport_radius_to_image(region, float(radius), radius_space, render["width"])
+            feather_local = float(arguments.get("feather", 0.0))
+            display_feather = (
+                viewport_radius_to_image(region, feather_local, radius_space, render["width"])
+                if feather_local > 0
+                else 0.0
+            )
+            radius_b_local = arguments.get("radius_b")
+            display_radius_b = (
+                viewport_radius_to_image(region, float(radius_b_local), radius_space, render["width"])
+                if is_ellipse and radius_b_local is not None
+                else None
+            )
+
+            # Same-image guard: the snapshot's coordinates only mean
+            # something on the image it was captured from, so refuse before
+            # touching darktable if darkroom has moved on. Runs after the
+            # (free, local) stage-1 transform so malformed input still
+            # fails without a bridge call.
+            guard = self._snapshot_image_guard(snapshot, "retouch_add_shape_in_viewport")
+            if guard is not None:
+                return guard
+
+            # Stage 2: display-frame -> PIPE-INPUT/mask-frame normalized
+            # (the frame retouch_add_shape actually stores coordinates in --
+            # these two frames differ whenever orientation/crop/rotate/
+            # lens-correction is active; see _backtransform_to_mask_space's
+            # doc comment).
+            mask, err = self._backtransform_to_mask_space(
+                display_target, display_source, display_radius, display_feather,
+                display_radius_b=display_radius_b,
+            )
+            if err is not None:
+                return err
+            full_target = mask["target"]
+            full_source = mask["source"]
+            full_radius = mask["radius"]
+            full_feather = mask["feather"]
+            full_radius_b = mask.get("radius_b")
 
         instance = int(arguments.get("instance", 0))
         params: Dict[str, Any] = {
             "op": "retouch",
             "instance": instance,
             "algorithm": algorithm,
-            "target": full_target,
-            "radius": full_radius,
-            "feather": full_feather,
             "opacity": float(arguments.get("opacity", 1.0)),
         }
+        if is_path:
+            params["shape_type"] = "path"
+            params["points"] = full_points
+            params["feather"] = float(arguments.get("feather", 0.0))  # bbox-fraction, no backtransform needed
+            if arguments.get("smooth") is not None:
+                params["smooth"] = bool(arguments["smooth"])
+        else:
+            params["target"] = full_target
+            params["radius"] = full_radius
+            params["feather"] = full_feather
+            if is_ellipse:
+                params["shape_type"] = "ellipse"
+                if arguments.get("rotation") is not None:
+                    params["rotation"] = float(arguments["rotation"])
+                if full_radius_b is not None:
+                    params["radius_b"] = full_radius_b
         if full_source is not None:
             params["source"] = full_source
         if arguments.get("wavelet_scale") is not None:
@@ -6542,18 +6809,38 @@ class DarktableMCPServer:
         lines = [
             f"retouch_add_shape_in_viewport(instance={instance}): ok=True "
             f"formid={result.get('formid')} algorithm={result.get('algorithm')} "
+            f"shape_type={result.get('shape_type')} "
             f"wavelet_scale={result.get('wavelet_scale')}",
             f"  image: id={snap_image.get('id')} filename={snap_image.get('filename')} "
             f"(snapshot_id={arguments.get('snapshot_id')})",
-            f"  input ({coordinate_space}): target={target} source={source} radius={radius}",
-            f"  display-frame: target={display_target} source={display_source} "
-            f"radius={display_radius} feather={display_feather}",
-            f"  mask-frame (actual write): target={full_target} source={full_source} "
-            f"radius={full_radius} feather={full_feather}",
+        ]
+        if is_path:
+            lines.append(
+                f"  input ({coordinate_space}): points={len(points)} nodes source={source}"
+            )
+            lines.append(
+                f"  mask-frame (actual write): points={result.get('points')} nodes "
+                f"source={full_source}"
+            )
+        else:
+            lines.append(
+                f"  input ({coordinate_space}): target={target} source={source} radius={radius}"
+            )
+            lines.append(
+                f"  display-frame: target={display_target} source={display_source} "
+                f"radius={display_radius} feather={display_feather}"
+            )
+            lines.append(
+                f"  mask-frame (actual write): target={full_target} source={full_source} "
+                f"radius={full_radius} feather={full_feather}"
+            )
+            if is_ellipse:
+                lines.append(f"  radius_b (mask-frame)={full_radius_b}")
+        lines.append(
             f"  check placement: retouch_render_overlay(snapshot_id="
             f"'{arguments.get('snapshot_id')}', mode='source_and_target', "
-            f"highlight_formid={result.get('formid')})",
-        ]
+            f"highlight_formid={result.get('formid')})"
+        )
         if result.get("algorithm") == "blur":
             lines.append(
                 f"  blur_type={result.get('blur_type')} blur_radius={result.get('blur_radius')}"
@@ -6581,6 +6868,15 @@ class DarktableMCPServer:
         formid = arguments.get("formid")
         if formid is None:
             return [TextContent(type="text", text="formid is required")]
+        # `points` implies path-update mode -- target/radius are not
+        # required in that case (a polygon has no single center/radius).
+        # Whether the formid is ACTUALLY a path is something only C can
+        # verify (same as the raw, non-viewport retouch_update_shape); a
+        # mismatch surfaces as C's own graceful error.
+        points = arguments.get("points")
+        is_path = isinstance(points, list)
+        if is_path and len(points) < 3:
+            return [TextContent(type="text", text="points needs at least 3 {x,y} nodes")]
         target = arguments.get("target")
         source = arguments.get("source")
         # algorithm is optional here (omit to keep the shape's current one),
@@ -6590,7 +6886,7 @@ class DarktableMCPServer:
         if arguments.get("algorithm") in ("heal", "clone") and not isinstance(source, dict):
             return [TextContent(type="text", text="source {x,y} is required for heal/clone")]
         radius = arguments.get("radius")
-        if radius is None:
+        if not is_path and radius is None:
             return [TextContent(type="text", text="radius is required")]
 
         coordinate_space = canonical_space(
@@ -6598,10 +6894,6 @@ class DarktableMCPServer:
         )
         radius_space = canonical_space(arguments.get("radius_space", coordinate_space))
 
-        # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized.
-        display_target = viewport_point_to_image(
-            region, target, coordinate_space, render["width"], render["height"], label="target"
-        )
         display_source = (
             viewport_point_to_image(
                 region, source, coordinate_space, render["width"], render["height"], label="source"
@@ -6609,40 +6901,88 @@ class DarktableMCPServer:
             if isinstance(source, dict)
             else None
         )
-        display_radius = viewport_radius_to_image(region, float(radius), radius_space, render["width"])
-        feather_local = float(arguments.get("feather", 0.0))
-        display_feather = (
-            viewport_radius_to_image(region, feather_local, radius_space, render["width"])
-            if feather_local > 0
-            else 0.0
-        )
 
-        # Same-image guard (see _snapshot_image_guard).
-        guard = self._snapshot_image_guard(snapshot, "retouch_update_shape_in_viewport")
-        if guard is not None:
-            return guard
+        full_target = full_radius = full_feather = full_radius_b = None
+        full_points = None
 
-        # Stage 2: display-frame -> PIPE-INPUT/mask-frame normalized (see
-        # _backtransform_to_mask_space's doc comment).
-        mask, err = self._backtransform_to_mask_space(
-            display_target, display_source, display_radius, display_feather
-        )
-        if err is not None:
-            return err
-        full_target = mask["target"]
-        full_source = mask["source"]
-        full_radius = mask["radius"]
-        full_feather = mask["feather"]
+        if is_path:
+            display_points = [
+                viewport_point_to_image(
+                    region, pt, coordinate_space, render["width"], render["height"],
+                    label=f"points[{i}]",
+                )
+                for i, pt in enumerate(points)
+            ]
+
+            guard = self._snapshot_image_guard(snapshot, "retouch_update_shape_in_viewport")
+            if guard is not None:
+                return guard
+
+            full_points, poly_err = self._backtransform_polygon_to_mask_space(display_points)
+            if poly_err is not None:
+                return poly_err
+            full_source = None
+            if display_source is not None:
+                full_source, source_err = self._backtransform_single_point(display_source)
+                if source_err is not None:
+                    return source_err
+        else:
+            # Stage 1: viewport-local -> PROCESSED/DISPLAY-frame normalized.
+            display_target = viewport_point_to_image(
+                region, target, coordinate_space, render["width"], render["height"], label="target"
+            )
+            display_radius = viewport_radius_to_image(region, float(radius), radius_space, render["width"])
+            feather_local = float(arguments.get("feather", 0.0))
+            display_feather = (
+                viewport_radius_to_image(region, feather_local, radius_space, render["width"])
+                if feather_local > 0
+                else 0.0
+            )
+            radius_b_local = arguments.get("radius_b")
+            display_radius_b = (
+                viewport_radius_to_image(region, float(radius_b_local), radius_space, render["width"])
+                if radius_b_local is not None
+                else None
+            )
+
+            # Same-image guard (see _snapshot_image_guard).
+            guard = self._snapshot_image_guard(snapshot, "retouch_update_shape_in_viewport")
+            if guard is not None:
+                return guard
+
+            # Stage 2: display-frame -> PIPE-INPUT/mask-frame normalized (see
+            # _backtransform_to_mask_space's doc comment).
+            mask, err = self._backtransform_to_mask_space(
+                display_target, display_source, display_radius, display_feather,
+                display_radius_b=display_radius_b,
+            )
+            if err is not None:
+                return err
+            full_target = mask["target"]
+            full_source = mask["source"]
+            full_radius = mask["radius"]
+            full_feather = mask["feather"]
+            full_radius_b = mask.get("radius_b")
 
         instance = int(arguments.get("instance", 0))
         params: Dict[str, Any] = {
             "op": "retouch",
             "instance": instance,
             "formid": int(formid),
-            "target": full_target,
-            "radius": full_radius,
-            "feather": full_feather,
         }
+        if is_path:
+            params["points"] = full_points
+            params["feather"] = float(arguments.get("feather", 0.0))  # bbox-fraction, no backtransform
+            if arguments.get("smooth") is not None:
+                params["smooth"] = bool(arguments["smooth"])
+        else:
+            params["target"] = full_target
+            params["radius"] = full_radius
+            params["feather"] = full_feather
+            if full_radius_b is not None:
+                params["radius_b"] = full_radius_b
+            if arguments.get("rotation") is not None:
+                params["rotation"] = float(arguments["rotation"])
         if full_source is not None:
             params["source"] = full_source
         if arguments.get("algorithm"):
@@ -6694,19 +7034,38 @@ class DarktableMCPServer:
         snap_image = snapshot.get("image") or {}
         lines = [
             f"retouch_update_shape_in_viewport(formid={formid}, instance={instance}): ok=True "
-            f"algorithm={result.get('algorithm')} wavelet_scale={result.get('wavelet_scale')} "
-            f"opacity={result.get('opacity')}",
+            f"algorithm={result.get('algorithm')} shape_type={result.get('shape_type')} "
+            f"wavelet_scale={result.get('wavelet_scale')} opacity={result.get('opacity')}",
             f"  image: id={snap_image.get('id')} filename={snap_image.get('filename')} "
             f"(snapshot_id={arguments.get('snapshot_id')})",
-            f"  input ({coordinate_space}): target={target} source={source} radius={radius}",
-            f"  display-frame: target={display_target} source={display_source} "
-            f"radius={display_radius} feather={display_feather}",
-            f"  mask-frame (actual write): target={full_target} source={full_source} "
-            f"radius={full_radius} feather={full_feather}",
+        ]
+        if is_path:
+            lines.append(
+                f"  input ({coordinate_space}): points={len(points)} nodes source={source}"
+            )
+            lines.append(
+                f"  mask-frame (actual write): points={result.get('points')} nodes "
+                f"source={full_source}"
+            )
+        else:
+            lines.append(
+                f"  input ({coordinate_space}): target={target} source={source} radius={radius}"
+            )
+            lines.append(
+                f"  display-frame: target={display_target} source={display_source} "
+                f"radius={display_radius} feather={display_feather}"
+            )
+            lines.append(
+                f"  mask-frame (actual write): target={full_target} source={full_source} "
+                f"radius={full_radius} feather={full_feather}"
+            )
+            if full_radius_b is not None:
+                lines.append(f"  radius_b (mask-frame)={full_radius_b}")
+        lines.append(
             f"  check placement: retouch_render_overlay(snapshot_id="
             f"'{arguments.get('snapshot_id')}', mode='source_and_target', "
-            f"highlight_formid={formid})",
-        ]
+            f"highlight_formid={formid})"
+        )
         if result.get("algorithm") == "blur":
             lines.append(
                 f"  blur_type={result.get('blur_type')} blur_radius={result.get('blur_radius')}"
@@ -6862,14 +7221,20 @@ class DarktableMCPServer:
             f"merge_from_scale={result.get('merge_from_scale')} shapes={len(shapes)}",
         ]
         for s in shapes:
-            target = s.get("target") or {}
             source = s.get("source") or {}
+            is_path = s.get("shape_type") == "path"
+            geom = (
+                f"points={len(s.get('points') or [])}"
+                if is_path
+                else f"target=({(s.get('target') or {}).get('x')},{(s.get('target') or {}).get('y')}) "
+                     f"radius={s.get('radius')}"
+            )
             lines.append(
                 f"  formid={s.get('formid')} algorithm={s.get('algorithm')} "
                 f"shape_type={s.get('shape_type')} "
-                f"target=({target.get('x')},{target.get('y')}) "
+                f"{geom} "
                 f"source=({source.get('x')},{source.get('y')}) "
-                f"radius={s.get('radius')} feather={s.get('feather')} "
+                f"feather={s.get('feather')} "
                 f"opacity={s.get('opacity')} "
                 f"wavelet_scale={s.get('wavelet_scale')}"
             )
