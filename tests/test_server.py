@@ -1203,6 +1203,35 @@ async def test_retouch_list_shapes_reports_both_frames():
     assert "retouch_render_overlay" in text
 
 
+@pytest.mark.asyncio
+async def test_retouch_list_shapes_display_frame_unavailable_hint_covers_staleness():
+    """2026-07-31 mask-image-size-race investigation: has_display_frame=False now
+    also fires when dt.develop.retouch_list_shapes' C-side freshness check
+    (_mask_pipe_is_fresh) rejects a mid-rebuild preview pipe, not just a
+    never-rendered one. The C side omits *_display fields either way (same
+    field, same boolean) -- this pins that the Python-facing hint text
+    reflects BOTH causes so a caller doesn't misread a timing race as
+    "image never opened"."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "module": "retouch", "instance": 0, "num_scales": 4, "curr_scale": 1,
+        "merge_from_scale": 0, "has_display_frame": False,
+        "shapes": [
+            {
+                "formid": 42, "algorithm": "heal", "shape_type": "circle",
+                "target": {"x": 0.4, "y": 0.3}, "source": {"x": 0.35, "y": 0.3},
+                "radius": 0.02, "feather": 0.1, "wavelet_scale": 2,
+            },
+        ],
+    }
+    result = await server._handle_retouch_list_shapes({})
+    text = result[0].text
+    assert "display-frame values unavailable" in text
+    assert "mid-refresh" in text
+    assert "call get_preview once and list again" in text
+
+
 # ---- list_luts / preview_lut / compare_luts (2026-07-26) -------------------
 
 LUT3D_SNAPSHOT_FIELDS = {

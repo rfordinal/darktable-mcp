@@ -5570,8 +5570,9 @@ class DarktableMCPServer:
             )
             if not result.get("has_display_frame"):
                 lines.append(
-                    "  display-frame values unavailable (no processed pipe yet) -- "
-                    "call get_preview once and list again"
+                    "  display-frame values unavailable (no processed pipe yet, "
+                    "or the preview pipe was mid-refresh at the moment of this "
+                    "call) -- call get_preview once and list again"
                 )
             lines.append(
                 "  Use retouch_render_overlay to SEE these shapes drawn on a "
