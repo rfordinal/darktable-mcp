@@ -1220,6 +1220,66 @@ class DarktableMCPServer:
                 },
             ),
             Tool(
+                name="get_mask_geometry",
+                description=(
+                    "Read one drawn mask's full point geometry: for a "
+                    "path/brush shape, every node's corner/ctrl1/ctrl2/"
+                    "border(feather) coordinates plus a per-node state "
+                    "code; for circle/ellipse, its single center/radius "
+                    "descriptor. Use this to verify a mask's actual shape "
+                    "after creation (e.g. whether a node is a smooth or a "
+                    "corner point: ctrl1/ctrl2 equal to corner means "
+                    "corner, differing means smooth -- there is no single "
+                    "'smooth' flag on the mask as a whole, it's per node) "
+                    "instead of re-segmenting to check. Points are in the "
+                    "same PIPE-INPUT/mask-frame convention add_path_mask "
+                    "expects on write -- NOT the display frame get_preview "
+                    "renders (see mask_object's bbox_display_frame/"
+                    "bbox_mask_frame for that distinction)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "mask_id": {
+                            "type": "integer",
+                            "description": (
+                                "The shape's own formid -- from list_masks/"
+                                "list_all_masks, or the 'formid' returned "
+                                "by add_path_mask/mask_object/"
+                                "retouch_add_shape."
+                            ),
+                        },
+                    },
+                    "required": ["mask_id"],
+                },
+            ),
+            Tool(
+                name="rename_mask",
+                description=(
+                    "Give a drawn mask a caller-chosen name instead of "
+                    "the auto-generated 'path #7'/'circle #3' -- useful "
+                    "once a session has created several masks and formid "
+                    "alone is hard to keep straight (e.g. name one "
+                    "'model body', another 'background sky'). Purely "
+                    "cosmetic -- does not touch geometry, opacity, or "
+                    "which module(s) reference the shape."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "mask_id": {
+                            "type": "integer",
+                            "description": "The shape's own formid (see get_mask_geometry)",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "New display name for the mask",
+                        },
+                    },
+                    "required": ["mask_id", "name"],
+                },
+            ),
+            Tool(
                 name="attach_mask",
                 description=(
                     "Wire an EXISTING drawn mask shape (formid, from "
@@ -2559,6 +2619,8 @@ class DarktableMCPServer:
             "set_blend_params": self._handle_set_blend_params,
             "list_masks": self._handle_list_masks,
             "get_module_mask": self._handle_get_module_mask,
+            "get_mask_geometry": self._handle_get_mask_geometry,
+            "rename_mask": self._handle_rename_mask,
             "attach_mask": self._handle_attach_mask,
             "detach_mask": self._handle_detach_mask,
             "set_module_mask": self._handle_set_module_mask,
@@ -3568,6 +3630,62 @@ class DarktableMCPServer:
             "shapes": shapes,
         }
         return [TextContent(type="text", text=json.dumps(response, indent=2))]
+
+    async def _handle_get_mask_geometry(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        mask_id = arguments.get("mask_id")
+        if mask_id is None:
+            return [TextContent(type="text", text="mask_id is required")]
+        try:
+            result = self.bridge.call(
+                "dev_get_mask", {"mask_id": int(mask_id)}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(type="text", text=f"get_mask_geometry({mask_id}): {result['error']}")]
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    async def _handle_rename_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        mask_id = arguments.get("mask_id")
+        name = arguments.get("name")
+        if mask_id is None:
+            return [TextContent(type="text", text="mask_id is required")]
+        if not name:
+            return [TextContent(type="text", text="name is required")]
+        try:
+            result = self.bridge.call(
+                "dev_rename_mask", {"mask_id": int(mask_id), "name": str(name)}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(type="text", text=f"rename_mask({mask_id}): {result['error']}")]
+        return [TextContent(
+            type="text",
+            text=f"rename_mask: ok=True mask_id={result.get('mask_id')} name={result.get('name')!r}",
+        )]
 
     async def _handle_attach_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
         op = arguments.get("op")
@@ -5629,7 +5747,9 @@ class DarktableMCPServer:
             f"  polygon: {len(polygon)} nodes, score={seg.get('score')}, "
             f"bbox_display_frame={json.dumps(seg.get('bbox'))} "
             f"bbox_mask_frame={json.dumps(_polygon_bbox(mask_polygon))}",
-            f"  mask_id={mask_result.get('mask_id')} opacity={mask_result.get('opacity')}",
+            f"  formid={mask_result.get('formid')} mask_id={mask_result.get('mask_id')} "
+            f"opacity={mask_result.get('opacity')} "
+            f"(rename this shape for orientation: rename_mask(mask_id={mask_result.get('formid')}, name=...))",
             f"  applied: {json.dumps(set_result.get('applied') or {})}",
         ]
         resolved_box = seg.get("resolved_box")

@@ -1035,6 +1035,38 @@ methods.dev_list_all_masks = function(p)
   return dt.develop.list_all_masks()
 end
 
+-- Read-only dump of ONE mask form's full point geometry (corner/ctrl1/ctrl2/
+-- border/state per node for path/brush; single-entry descriptor for circle/
+-- ellipse), plus its name -- so a caller can inspect/verify a mask's actual
+-- shape (e.g. whether a node is a smooth or corner point: ctrl1/ctrl2 equal
+-- to corner means corner, differing means smooth) without re-segmenting.
+-- dt.develop.get_mask itself already existed in C (registered, unused until
+-- 2026-07-31) -- this was the missing Lua-bridge wiring, not new C.
+-- Points are in the same PIPE-INPUT/mask-frame convention as
+-- add_path_mask's input -- see dt.develop.backtransform_point's doc comment
+-- for why that differs from get_preview's display frame under crop/rotate/
+-- orientation.
+methods.dev_get_mask = function(p)
+  p = p or {}
+  local mask_id = tonumber(p.mask_id)
+  if mask_id == nil then error("dev_get_mask: mask_id required") end
+  return dt.develop.get_mask(mask_id)
+end
+
+-- Give a drawn mask a caller-chosen name instead of the auto-generated
+-- "path #7"/"circle #3" (bugreport 2026-07-31: no way to tell masks apart
+-- afterward except by formid, once several have been created in one
+-- session). Returns {ok, mask_id, name} with name read back from the live
+-- struct, not the requested string.
+methods.dev_rename_mask = function(p)
+  p = p or {}
+  local mask_id = tonumber(p.mask_id)
+  if mask_id == nil then error("dev_rename_mask: mask_id required") end
+  local name = p.name
+  if name == nil then error("dev_rename_mask: name required") end
+  return dt.develop.rename_mask(mask_id, tostring(name))
+end
+
 -- Wire an EXISTING drawn mask shape (formid, from dev_list_all_masks or the
 -- return value of dev_add_path_mask/dev_mask_object/dev_retouch_add_shape)
 -- into module (op, instance)'s blend group WITHOUT copying it -- the shape

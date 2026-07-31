@@ -222,6 +222,17 @@ stub_dt.develop = {
     table.insert(develop_calls, {name = "detach_mask", args = {op, instance, formid}})
     return {ok = true, op = op, instance = instance, formid = formid}
   end,
+  get_mask = function(mask_id)
+    table.insert(develop_calls, {name = "get_mask", args = {mask_id}})
+    return {
+      mask_id = mask_id, type = "path", name = "path #1",
+      points = {{corner = {0.1, 0.2}, ctrl1 = {0.1, 0.2}, ctrl2 = {0.1, 0.2}, border = {0.02, 0.02}, state = 1}},
+    }
+  end,
+  rename_mask = function(mask_id, name)
+    table.insert(develop_calls, {name = "rename_mask", args = {mask_id, name}})
+    return {ok = true, mask_id = mask_id, name = name}
+  end,
 }
 
 -- Make `require("darktable")` return our stub by pre-populating package.loaded.
@@ -744,6 +755,45 @@ end
 do
   local ok, err = pcall(internals.methods.dev_detach_mask, {op = "exposure", instance = 1})
   assertTrue(not ok, "dev_detach_mask errors without formid")
+end
+
+-- ---- methods.dev_get_mask / dev_rename_mask (2026-07-31) -- mask geometry
+-- read + rename, closing the gap a bugreport found: get_mask already
+-- existed in C (registered) but was never wired through the Lua bridge. ----
+do
+  develop_calls = {}
+  local result = internals.methods.dev_get_mask({mask_id = 42})
+  assertEq(result.mask_id, 42, "dev_get_mask forwards the C result")
+  assertEq(result.points[1].corner[1], 0.1, "dev_get_mask includes point geometry")
+  local call = develop_calls[1]
+  assertEq(call.name, "get_mask", "correct C function called")
+  assertEq(call.args[1], 42, "mask_id forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_get_mask, {})
+  assertTrue(not ok, "dev_get_mask errors without mask_id")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_rename_mask({mask_id = 42, name = "model body"})
+  assertEq(result.ok, true, "dev_rename_mask reports ok")
+  assertEq(result.name, "model body", "dev_rename_mask returns the new name")
+  local call = develop_calls[1]
+  assertEq(call.name, "rename_mask", "correct C function called")
+  assertEq(call.args[1], 42, "mask_id forwarded")
+  assertEq(call.args[2], "model body", "name forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_rename_mask, {mask_id = 42})
+  assertTrue(not ok, "dev_rename_mask errors without name")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_rename_mask, {name = "x"})
+  assertTrue(not ok, "dev_rename_mask errors without mask_id")
 end
 
 -- ---- methods.tag_photo ------------------------------------------------------

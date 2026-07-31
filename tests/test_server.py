@@ -75,6 +75,8 @@ class TestDarktableMCPServer:
             "mask_raster",
             "list_masks",
             "get_module_mask",
+            "get_mask_geometry",
+            "rename_mask",
             "attach_mask",
             "detach_mask",
             "set_module_mask",
@@ -1473,6 +1475,82 @@ async def test_handle_get_module_mask_requires_op():
     result = await server._handle_get_module_mask({})
     assert "op is required" in result[0].text
     server.bridge.call.assert_not_called()
+
+
+# ---- get_mask_geometry / rename_mask (2026-07-31) --------------------------
+# Bugreport: agent creating several masks in one session had no way to tell
+# them apart afterward except by formid ("orientation among masks"). Also
+# closes a gap found while investigating: dt.develop.get_mask already
+# existed in C (registered) but was never wired through the Lua bridge or
+# an MCP tool -- completely unreachable until this fix.
+
+
+@pytest.mark.asyncio
+async def test_handle_get_mask_geometry_forwards_result():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "mask_id": 42, "type": "path", "name": "path #1",
+        "points": [{"corner": [0.1, 0.2], "ctrl1": [0.1, 0.2], "ctrl2": [0.1, 0.2],
+                    "border": [0.02, 0.02], "state": 1}],
+    }
+    result = await server._handle_get_mask_geometry({"mask_id": 42})
+    response = json.loads(result[0].text)
+    assert response["mask_id"] == 42
+    assert response["points"][0]["corner"] == [0.1, 0.2]
+    server.bridge.call.assert_called_once_with("dev_get_mask", {"mask_id": 42}, timeout=15.0)
+
+
+@pytest.mark.asyncio
+async def test_handle_get_mask_geometry_requires_mask_id():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_get_mask_geometry({})
+    assert "mask_id is required" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_get_mask_geometry_surfaces_error():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"error": "mask 99 not found in darkroom forms"}
+    result = await server._handle_get_mask_geometry({"mask_id": 99})
+    assert "not found" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_rename_mask_reports_ok_and_readback_name():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"ok": True, "mask_id": 42, "name": "model body"}
+    result = await server._handle_rename_mask({"mask_id": 42, "name": "model body"})
+    text = result[0].text
+    assert "ok=True" in text
+    assert "model body" in text
+    server.bridge.call.assert_called_once_with(
+        "dev_rename_mask", {"mask_id": 42, "name": "model body"}, timeout=15.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_rename_mask_requires_mask_id_and_name():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_rename_mask({"name": "x"})
+    assert "mask_id is required" in result[0].text
+    result = await server._handle_rename_mask({"mask_id": 42})
+    assert "name is required" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_rename_mask_surfaces_error():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"error": "mask 99 not found in darkroom forms"}
+    result = await server._handle_rename_mask({"mask_id": 99, "name": "x"})
+    assert "not found" in result[0].text
 
 
 @pytest.mark.asyncio

@@ -87,6 +87,8 @@ EXPECTED_TOOLS = {
     # instances instead of redrawn per instance.
     "list_masks",
     "get_module_mask",
+    "get_mask_geometry",
+    "rename_mask",
     "attach_mask",
     "detach_mask",
     "set_module_mask",
