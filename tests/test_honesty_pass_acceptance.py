@@ -67,6 +67,14 @@ EXPECTED_TOOLS = {
     # T2.3: object masks (see PLAN.md §5 T2.2/T2.3).
     "add_path_mask",
     "mask_object",
+    # Viewport-relative drawn masks (2026-07-31 delegated block C): the
+    # add_path_mask/generic-overlay counterpart to retouch's own viewport kit
+    # above -- points relative to a capture_viewport snapshot instead of the
+    # full image, plus a generic drawn-mask overlay renderer (path/brush
+    # polygons, circles) since darktable's own mask overlay is painted on the
+    # GUI widget for every mask type, not just retouch's.
+    "add_path_mask_in_viewport",
+    "render_module_mask",
     # T3.3: raster (matte) masks (see PLAN.md §5 T3.3).
     "mask_raster",
     # Retouch Phase 1: local heal/clone circle shapes (rt_forms + wavelet

@@ -65,6 +65,8 @@ class TestDarktableMCPServer:
             "get_viewport",
             "capture_viewport",
             "add_path_mask",
+            "add_path_mask_in_viewport",
+            "render_module_mask",
             "retouch_add_shape",
             "retouch_add_shape_in_viewport",
             "retouch_update_shape_in_viewport",
@@ -1693,6 +1695,372 @@ async def test_handle_add_path_mask_without_name_skips_rename():
     })
     methods_called = [c.args[0] for c in server.bridge.call.call_args_list]
     assert "dev_rename_mask" not in methods_called
+
+
+# ---- add_path_mask_in_viewport (2026-07-31, delegated block C) -------------
+#
+# Mirrors retouch_add_shape_in_viewport's own two-stage pipeline (viewport-
+# local -> display-frame locally, then display-frame -> mask-frame via
+# _backtransform_polygon_to_mask_space, already shipped for mask_object) but
+# for an N-point polygon instead of a single target/source pair.
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_in_viewport_success():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    points = [{"x": 0.1, "y": 0.1}, {"x": 0.5, "y": 0.1}, {"x": 0.3, "y": 0.4}]
+    server.bridge.call.side_effect = [
+        IMAGE_13406,
+        {"x": 0.1, "y": 0.1},  # identity backtransform, one call per vertex
+        {"x": 0.5, "y": 0.1},
+        {"x": 0.3, "y": 0.4},
+        {"ok": True, "mask_id": 501, "formid": 501, "points": 3, "opacity": 1.0,
+         "feather": 0.02, "smooth": True},
+    ]
+    result = await server._handle_add_path_mask_in_viewport({
+        "snapshot_id": snapshot_id,
+        "op": "exposure",
+        "points": points,
+        "return_preview": False,
+    })
+    text = result[0].text
+    assert "formid=501" in text
+    assert server.bridge.call.call_count == 5
+    calls = server.bridge.call.call_args_list
+    assert calls[0].args[0] == "dev_current_image"
+    for i in range(1, 4):
+        assert calls[i].args[0] == "dev_backtransform_point"
+    assert calls[4].args[0] == "dev_add_path_mask"
+    written = calls[4].args[1]["points"]
+    assert written == points  # identity region + identity backtransform
+    assert "mask-frame (actual write) bbox" in text
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_in_viewport_uses_backtransformed_coords():
+    """Regression guard: a non-identity backtransform mock (simulating a
+    portrait orientation swap) must show up in the written polygon -- proves
+    the handler goes through _backtransform_polygon_to_mask_space rather than
+    writing the raw display-frame points straight to dev_add_path_mask."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    points = [{"x": 0.1, "y": 0.1}, {"x": 0.5, "y": 0.1}, {"x": 0.3, "y": 0.4}]
+    backtransformed = [{"x": 0.9, "y": 0.05}, {"x": 0.8, "y": 0.15}, {"x": 0.7, "y": 0.25}]
+    server.bridge.call.side_effect = [IMAGE_13406] + backtransformed + [
+        {"ok": True, "mask_id": 502, "formid": 502, "points": 3, "opacity": 1.0,
+         "feather": 0.02, "smooth": True},
+    ]
+    await server._handle_add_path_mask_in_viewport({
+        "snapshot_id": snapshot_id,
+        "op": "exposure",
+        "points": points,
+        "return_preview": False,
+    })
+    written = server.bridge.call.call_args_list[-1].args[1]["points"]
+    assert written == backtransformed
+    assert written != points
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_in_viewport_rejects_out_of_bounds():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    with pytest.raises(ViewportCoordinateError):
+        await server._handle_add_path_mask_in_viewport({
+            "snapshot_id": snapshot_id,
+            "op": "exposure",
+            "points": [{"x": 1.5, "y": 0.1}, {"x": 0.5, "y": 0.1}, {"x": 0.3, "y": 0.4}],
+        })
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_in_viewport_rejects_unknown_snapshot():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    with pytest.raises(ViewportCoordinateError):
+        await server._handle_add_path_mask_in_viewport({
+            "snapshot_id": "vp_doesnotexist",
+            "op": "exposure",
+            "points": [{"x": 0.1, "y": 0.1}, {"x": 0.5, "y": 0.1}, {"x": 0.3, "y": 0.4}],
+        })
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_in_viewport_rejects_too_few_points():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    result = await server._handle_add_path_mask_in_viewport({
+        "snapshot_id": snapshot_id,
+        "op": "exposure",
+        "points": [{"x": 0.1, "y": 0.1}, {"x": 0.5, "y": 0.1}],
+    })
+    assert "at least 3" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_in_viewport_refuses_on_image_mismatch():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        {"has_image": True, "id": 99999, "filename": "other.ARW"},
+    ]
+    result = await server._handle_add_path_mask_in_viewport({
+        "snapshot_id": snapshot_id,
+        "op": "exposure",
+        "points": [{"x": 0.1, "y": 0.1}, {"x": 0.5, "y": 0.1}, {"x": 0.3, "y": 0.4}],
+    })
+    text = result[0].text
+    assert "image mismatch" in text
+    assert "13406" in text and "99999" in text
+    # never reached the backtransform/write stage.
+    assert server.bridge.call.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_in_viewport_forwards_feather_smooth_opacity():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    points = [{"x": 0.1, "y": 0.1}, {"x": 0.5, "y": 0.1}, {"x": 0.3, "y": 0.4}]
+    server.bridge.call.side_effect = [IMAGE_13406] + points + [
+        {"ok": True, "mask_id": 503, "formid": 503, "points": 3, "opacity": 0.5,
+         "feather": 0.1, "smooth": False},
+    ]
+    await server._handle_add_path_mask_in_viewport({
+        "snapshot_id": snapshot_id,
+        "op": "exposure",
+        "points": points,
+        "opacity": 0.5,
+        "feather": 0.1,
+        "smooth": False,
+        "return_preview": False,
+    })
+    write_call = server.bridge.call.call_args_list[-1]
+    assert write_call.args[1]["opacity"] == pytest.approx(0.5)
+    assert write_call.args[1]["feather"] == pytest.approx(0.1)
+    assert write_call.args[1]["smooth"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_in_viewport_with_name_chains_rename():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": "/tmp/snap.png", "width": 500, "height": 500},
+        "image": IMAGE_13406,
+    })
+    points = [{"x": 0.1, "y": 0.1}, {"x": 0.5, "y": 0.1}, {"x": 0.3, "y": 0.4}]
+    server.bridge.call.side_effect = [IMAGE_13406] + points + [
+        {"ok": True, "mask_id": 504, "formid": 504, "points": 3, "opacity": 1.0,
+         "feather": 0.02, "smooth": True},
+        {"ok": True, "mask_id": 504, "name": "hand-picked area"},
+    ]
+    result = await server._handle_add_path_mask_in_viewport({
+        "snapshot_id": snapshot_id,
+        "op": "exposure",
+        "points": points,
+        "name": "hand-picked area",
+        "return_preview": False,
+    })
+    text = result[0].text
+    assert "hand-picked area" in text
+    assert server.bridge.call.call_args_list[-1].args[0] == "dev_rename_mask"
+
+
+# ---- render_module_mask (2026-07-31, delegated block C) --------------------
+#
+# The generic-mask counterpart to retouch_render_overlay's own tests above:
+# darktable's mask overlay is painted on the GUI widget for every mask type,
+# not just retouch's circles, so this is synthesized the same way from
+# get_mask_geometry's node data, forward-transformed via dev_transform_point
+# (already shipped, used here for the first time from the Python side).
+
+PATH_NODE_CORNER = {
+    "corner": {"x": 0.3, "y": 0.3}, "ctrl1": {"x": 0.3, "y": 0.3},
+    "ctrl2": {"x": 0.3, "y": 0.3}, "border": {"x": 0.01, "y": 0.01}, "state": 1,
+}
+PATH_NODE_SMOOTH = {
+    "corner": {"x": 0.5, "y": 0.3}, "ctrl1": {"x": 0.45, "y": 0.3},
+    "ctrl2": {"x": 0.55, "y": 0.3}, "border": {"x": 0.01, "y": 0.01}, "state": 1,
+}
+PATH_NODE_3 = {
+    "corner": {"x": 0.4, "y": 0.5}, "ctrl1": {"x": 0.4, "y": 0.5},
+    "ctrl2": {"x": 0.4, "y": 0.5}, "border": {"x": 0.01, "y": 0.01}, "state": 1,
+}
+
+
+def _module_mask_server(tmp_path, mask_refs, get_mask_replies, width=400, height=200, region=None):
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    render_path = _write_test_render(tmp_path / "snap.png", width, height)
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": region or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": render_path, "width": width, "height": height},
+        "image": IMAGE_13406,
+    })
+    return server, snapshot_id, [IMAGE_13406, mask_refs] + get_mask_replies
+
+
+@pytest.mark.asyncio
+async def test_handle_render_module_mask_draws_path_with_node_states(tmp_path):
+    mask_refs = [{"mask_id": 61, "type": "path", "opacity": 1.0, "nb_points": 3,
+                  "name": "path #1", "module": "exposure", "instance": 0,
+                  "operation": "union", "invert": False}]
+    get_mask = {"mask_id": 61, "type": "path", "name": "path #1",
+                "points": [PATH_NODE_CORNER, PATH_NODE_SMOOTH, PATH_NODE_3]}
+    server, snapshot_id, side_effect = _module_mask_server(
+        tmp_path, mask_refs,
+        [get_mask,
+         {"x": 0.3, "y": 0.3}, {"x": 0.5, "y": 0.3}, {"x": 0.4, "y": 0.5}],
+    )
+    server.bridge.call.side_effect = side_effect
+    result = await server._handle_render_module_mask({
+        "snapshot_id": snapshot_id, "op": "exposure", "return_image": False,
+    })
+    text = result[-1].text
+    assert "formid=61" in text
+    assert "type=path" in text
+    assert "node_count=3" in text
+    assert "corner_node_count=2" in text
+    out = text.split("\n")[0].split(": ")[-1]
+    assert os.path.isfile(out)
+
+
+@pytest.mark.asyncio
+async def test_handle_render_module_mask_draws_circle_with_transformed_radius(tmp_path):
+    mask_refs = [{"mask_id": 62, "type": "circle", "opacity": 1.0, "nb_points": 1,
+                  "name": "circle #1", "module": "exposure", "instance": 0,
+                  "operation": "union", "invert": False}]
+    get_mask = {"mask_id": 62, "type": "circle", "name": "circle #1",
+                "points": [{"center": {"x": 0.5, "y": 0.5}, "radius": 0.02, "border": 0.01}]}
+    server, snapshot_id, side_effect = _module_mask_server(
+        tmp_path, mask_refs, [get_mask, {"x": 0.5, "y": 0.5, "len1": 0.05}],
+    )
+    server.bridge.call.side_effect = side_effect
+    result = await server._handle_render_module_mask({
+        "snapshot_id": snapshot_id, "op": "exposure", "return_image": False,
+    })
+    text = result[-1].text
+    assert "formid=62" in text
+    assert "type=circle" in text
+    # full-frame region, 400x200 render, display center 0.5,0.5 -> 200,100px;
+    # radius normalized against display WIDTH 0.05*400=20 -> bbox spans it.
+    assert "bbox_px=[180.0, 80.0, 220.0, 120.0]" in text
+
+
+@pytest.mark.asyncio
+async def test_handle_render_module_mask_refuses_on_image_mismatch(tmp_path):
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    render_path = _write_test_render(tmp_path / "snap.png")
+    snapshot_id = server._store_viewport_snapshot({
+        "viewport": "main",
+        "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "render": {"path": render_path, "width": 400, "height": 200},
+        "image": IMAGE_13406,
+    })
+    server.bridge.call.side_effect = [
+        {"has_image": True, "id": 99999, "filename": "other.ARW"},
+    ]
+    result = await server._handle_render_module_mask({
+        "snapshot_id": snapshot_id, "op": "exposure",
+    })
+    text = result[0].text
+    assert "image mismatch" in text
+    assert server.bridge.call.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_render_module_mask_no_masks_attached(tmp_path):
+    server, snapshot_id, side_effect = _module_mask_server(tmp_path, [], [])
+    server.bridge.call.side_effect = side_effect
+    result = await server._handle_render_module_mask({
+        "snapshot_id": snapshot_id, "op": "exposure",
+    })
+    assert "no drawn masks attached" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_render_module_mask_skips_ellipse_as_unsupported(tmp_path):
+    mask_refs = [{"mask_id": 63, "type": "ellipse", "opacity": 1.0, "nb_points": 1,
+                  "name": "ellipse #1", "module": "exposure", "instance": 0,
+                  "operation": "union", "invert": False}]
+    get_mask = {"mask_id": 63, "type": "ellipse", "name": "ellipse #1",
+                "points": [{"center": {"x": 0.5, "y": 0.5}, "radius_a": 0.05,
+                            "radius_b": 0.02, "rotation": 0.0, "border": 0.01}]}
+    server, snapshot_id, side_effect = _module_mask_server(tmp_path, mask_refs, [get_mask])
+    server.bridge.call.side_effect = side_effect
+    result = await server._handle_render_module_mask({
+        "snapshot_id": snapshot_id, "op": "exposure",
+    })
+    assert "no drawable shapes" in result[0].text
+    assert "63" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_render_module_mask_only_greyscale(tmp_path):
+    from PIL import Image
+
+    mask_refs = [{"mask_id": 64, "type": "circle", "opacity": 1.0, "nb_points": 1,
+                  "name": "circle #1", "module": "exposure", "instance": 0,
+                  "operation": "union", "invert": False}]
+    get_mask = {"mask_id": 64, "type": "circle", "name": "circle #1",
+                "points": [{"center": {"x": 0.5, "y": 0.5}, "radius": 0.02, "border": 0.0}]}
+    server, snapshot_id, side_effect = _module_mask_server(
+        tmp_path, mask_refs, [get_mask, {"x": 0.5, "y": 0.5, "len1": 0.05}],
+    )
+    server.bridge.call.side_effect = side_effect
+    result = await server._handle_render_module_mask({
+        "snapshot_id": snapshot_id, "op": "exposure", "mode": "mask_only",
+        "return_image": False,
+    })
+    text = result[-1].text
+    out = text.split("\n")[0].split(": ")[-1]
+    img = Image.open(out)
+    assert img.mode == "L"
+    assert img.getpixel((200, 100)) == 255
+    assert img.getpixel((399, 199)) == 0
 
 
 @pytest.mark.asyncio
