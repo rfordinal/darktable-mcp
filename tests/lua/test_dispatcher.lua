@@ -234,6 +234,10 @@ stub_dt.develop = {
     table.insert(develop_calls, {name = "rename_mask", args = {mask_id, name}})
     return {ok = true, mask_id = mask_id, name = name}
   end,
+  delete_mask = function(mask_id)
+    table.insert(develop_calls, {name = "delete_mask", args = {mask_id}})
+    return {ok = true, mask_id = mask_id}
+  end,
   current_image = function()
     table.insert(develop_calls, {name = "current_image", args = {}})
     return {has_image = true, id = 101, path = "/photos/DSC_0001.NEF", filename = "DSC_0001.NEF"}
@@ -799,6 +803,20 @@ end
 do
   local ok, err = pcall(internals.methods.dev_rename_mask, {name = "x"})
   assertTrue(not ok, "dev_rename_mask errors without mask_id")
+end
+
+do
+  develop_calls = {}
+  local result = internals.methods.dev_delete_mask({mask_id = 42})
+  assertEq(result.ok, true, "dev_delete_mask reports ok")
+  local call = develop_calls[1]
+  assertEq(call.name, "delete_mask", "correct C function called")
+  assertEq(call.args[1], 42, "mask_id forwarded")
+end
+
+do
+  local ok, err = pcall(internals.methods.dev_delete_mask, {})
+  assertTrue(not ok, "dev_delete_mask errors without mask_id")
 end
 
 -- ---- methods.dev_current_image sidecar field (2026-07-31) -- bugreport:

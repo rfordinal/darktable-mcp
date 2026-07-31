@@ -1080,6 +1080,17 @@ methods.dev_rename_mask = function(p)
   return dt.develop.rename_mask(mask_id, tostring(name))
 end
 
+-- Permanently delete a drawn mask shape, whether or not it's currently
+-- attached to any module (2026-07-31 bugreport: no way to clean up an
+-- orphan mask left over from experimentation -- detach_mask only unwires
+-- it, still leaving it in dev->forms forever).
+methods.dev_delete_mask = function(p)
+  p = p or {}
+  local mask_id = tonumber(p.mask_id)
+  if mask_id == nil then error("dev_delete_mask: mask_id required") end
+  return dt.develop.delete_mask(mask_id)
+end
+
 -- Wire an EXISTING drawn mask shape (formid, from dev_list_all_masks or the
 -- return value of dev_add_path_mask/dev_mask_object/dev_retouch_add_shape)
 -- into module (op, instance)'s blend group WITHOUT copying it -- the shape

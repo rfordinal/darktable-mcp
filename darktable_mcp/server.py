@@ -1308,6 +1308,31 @@ class DarktableMCPServer:
                 },
             ),
             Tool(
+                name="delete_mask",
+                description=(
+                    "Permanently delete a drawn mask shape, whether or "
+                    "not it's currently attached to any module -- unlike "
+                    "detach_mask, which only unwires a shape from ONE "
+                    "module's blend group and leaves the shape itself "
+                    "around forever. Use this to clean up an orphan/"
+                    "unwanted mask (e.g. left over from calibration or a "
+                    "failed attempt) that list_all_masks shows with an "
+                    "empty or stale `used_by`. Every module still "
+                    "referencing this shape loses that reference "
+                    "(mirrors darktable's own mask-manager delete action)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "mask_id": {
+                            "type": "integer",
+                            "description": "The shape's own formid (see list_all_masks/get_mask_geometry)",
+                        },
+                    },
+                    "required": ["mask_id"],
+                },
+            ),
+            Tool(
                 name="attach_mask",
                 description=(
                     "Wire an EXISTING drawn mask shape (formid, from "
@@ -2129,16 +2154,28 @@ class DarktableMCPServer:
             Tool(
                 name="add_path_mask",
                 description=(
-                    "LOW-LEVEL: attach a drawn polygon path mask to a module "
-                    "instance so its effect only applies inside that shape. "
-                    "You usually want mask_object instead — it does the "
-                    "vision-pick -> segment -> mask -> edit sequence for you "
-                    "in one call. Use add_path_mask directly only if you "
-                    "already have a normalized polygon from somewhere (e.g. "
-                    "you already called mask_object and want to attach the "
-                    "same polygon to a different module/instance). points "
-                    "must be an array of >=3 {x,y} nodes normalized 0..1 "
-                    "against the full image frame."
+                    "You almost certainly want mask_object instead (does "
+                    "vision-pick -> segment -> mask -> edit in one call) -- "
+                    "LOW-LEVEL: attach a drawn polygon path mask to a "
+                    "module instance so its effect only applies inside "
+                    "that shape. Use add_path_mask directly only if you "
+                    "already have a normalized polygon from somewhere "
+                    "(e.g. you already called mask_object and want to "
+                    "attach the same polygon to a different module/"
+                    "instance). points must be an array of >=3 {x,y} "
+                    "nodes normalized 0..1 -- but NOT against get_preview's "
+                    "frame. This is the MASK STORAGE frame: pipe-input, "
+                    "pre-crop, and rotated per EXIF orientation -- NOT the "
+                    "post-crop/post-rotate frame get_preview/"
+                    "capture_viewport render. The two are identical only "
+                    "when no crop/rotate/orientation is active. Hand-"
+                    "computing this frame from a preview image (e.g. "
+                    "deriving it empirically by placing a mask, exporting, "
+                    "and looking where it landed) is the #1 cause of "
+                    "misplaced shapes -- mask_object does this conversion "
+                    "for you internally; prefer it whenever the prompt is "
+                    "point/box/label-shaped instead of an already-known "
+                    "polygon."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2193,6 +2230,17 @@ class DarktableMCPServer:
                                 "Set false for a straight-segment polygon."
                             ),
                         },
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Optional display name for the new mask "
+                                "(default is darktable's own auto-generated "
+                                "'path #7' etc) -- useful for orientation "
+                                "once a session has created several masks "
+                                "on one image. Equivalent to calling "
+                                "rename_mask right after this returns."
+                            ),
+                        },
                     },
                     "required": ["op", "points"],
                 },
@@ -2200,6 +2248,16 @@ class DarktableMCPServer:
             Tool(
                 name="retouch_add_shape",
                 description=(
+                    "You almost certainly want "
+                    "retouch_add_shape_in_viewport instead -- it takes "
+                    "coordinates in the SAME frame capture_viewport/"
+                    "get_preview render in and converts them for you. "
+                    "This tool's target/source/radius are normalized 0..1 "
+                    "against the MASK STORAGE frame -- pipe-input, "
+                    "pre-crop, rotated per EXIF orientation -- NOT the "
+                    "post-crop/post-rotate frame get_preview renders. "
+                    "Hand-deriving this frame from a preview image is the "
+                    "#1 cause of misplaced shapes. "
                     "Create a local HEAL or CLONE circle shape on the retouch "
                     "module — the module's actual local-editing surface, "
                     "distinct from add_path_mask's generic 'restrict this "
@@ -2237,7 +2295,7 @@ class DarktableMCPServer:
                         },
                         "target": {
                             "type": "object",
-                            "description": "Shape center, normalized 0..1 against the full image frame",
+                            "description": "Shape center, normalized 0..1 against the MASK STORAGE frame (pipe-input, pre-crop) -- NOT get_preview's frame. Use retouch_add_shape_in_viewport instead if unsure.",
                             "properties": {
                                 "x": {"type": "number", "minimum": 0, "maximum": 1},
                                 "y": {"type": "number", "minimum": 0, "maximum": 1},
@@ -2261,7 +2319,7 @@ class DarktableMCPServer:
                             "type": "number",
                             "minimum": 0.0005,
                             "maximum": 0.5,
-                            "description": "Circle radius, normalized 0..1 against the full image frame",
+                            "description": "Circle radius, normalized 0..1 against the mask storage frame's mindim(width,height) -- see target's description.",
                         },
                         "feather": {
                             "type": "number",
@@ -2531,6 +2589,19 @@ class DarktableMCPServer:
                                 "otherwise very simple/convex shape."
                             ),
                         },
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Optional display name for the new mask -- "
+                                "NOT the same as `label` (which is a "
+                                "segmentation PROMPT, e.g. 'the red car'; "
+                                "this is just a human-readable name like "
+                                "'model body' for orientation once a "
+                                "session has created several masks on one "
+                                "image). Default is darktable's own "
+                                "auto-generated 'path #7' etc."
+                            ),
+                        },
                     },
                     "required": ["op", "adjustment"],
                 },
@@ -2649,6 +2720,7 @@ class DarktableMCPServer:
             "get_module_mask": self._handle_get_module_mask,
             "get_mask_geometry": self._handle_get_mask_geometry,
             "rename_mask": self._handle_rename_mask,
+            "delete_mask": self._handle_delete_mask,
             "attach_mask": self._handle_attach_mask,
             "detach_mask": self._handle_detach_mask,
             "set_module_mask": self._handle_set_module_mask,
@@ -3730,6 +3802,33 @@ class DarktableMCPServer:
         return [TextContent(
             type="text",
             text=f"rename_mask: ok=True mask_id={result.get('mask_id')} name={result.get('name')!r}",
+        )]
+
+    async def _handle_delete_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        mask_id = arguments.get("mask_id")
+        if mask_id is None:
+            return [TextContent(type="text", text="mask_id is required")]
+        try:
+            result = self.bridge.call(
+                "dev_delete_mask", {"mask_id": int(mask_id)}, timeout=15.0,
+            )
+        except BridgePluginNotInstalledError:
+            return [TextContent(
+                type="text",
+                text="darktable-mcp plugin not installed. Run: darktable-mcp install-plugin",
+            )]
+        except BridgeTimeoutError:
+            return [TextContent(
+                type="text",
+                text="darktable not running, or plugin not loaded. Open darktable and try again.",
+            )]
+        except BridgeError as e:
+            return [TextContent(type="text", text=f"Plugin error: {e}")]
+
+        if result.get("error"):
+            return [TextContent(type="text", text=f"delete_mask({mask_id}): {result['error']}")]
+        return [TextContent(
+            type="text", text=f"delete_mask: ok=True mask_id={result.get('mask_id')}",
         )]
 
     async def _handle_attach_mask(self, arguments: Dict[str, Any]) -> List[TextContent]:
@@ -4981,8 +5080,21 @@ class DarktableMCPServer:
             f"mask_id={result.get('mask_id')} formid={result.get('formid')} "
             f"nodes={result.get('points')} opacity={result.get('opacity')} "
             f"feather={result.get('feather')} smooth={result.get('smooth')}",
-            "Call get_preview() to see the masked result.",
         ]
+        name = arguments.get("name")
+        if name:
+            try:
+                rename_result = self.bridge.call(
+                    "dev_rename_mask", {"mask_id": result.get("formid"), "name": str(name)},
+                    timeout=15.0,
+                )
+                if rename_result.get("error"):
+                    lines.append(f"  name NOT set: {rename_result['error']}")
+                else:
+                    lines.append(f"  name={rename_result.get('name')!r}")
+            except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+                lines.append(f"  name NOT set: {e}")
+        lines.append("Call get_preview() to see the masked result.")
         return [TextContent(type="text", text="\n".join(lines))]
 
     async def _handle_retouch_add_shape(self, arguments: Dict[str, Any]) -> List[TextContent]:
@@ -5759,6 +5871,26 @@ class DarktableMCPServer:
                 lines.append(self._rollback_orphan_instance(op, instance))
             return [TextContent(type="text", text="\n".join(lines))]
 
+        mask_name = arguments.get("name")
+        if mask_name:
+            try:
+                rename_result = self.bridge.call(
+                    "dev_rename_mask",
+                    {"mask_id": mask_result.get("formid"), "name": str(mask_name)},
+                    timeout=15.0,
+                )
+                name_line = (
+                    f"name={rename_result.get('name')!r}" if not rename_result.get("error")
+                    else f"name NOT set: {rename_result['error']}"
+                )
+            except (BridgePluginNotInstalledError, BridgeTimeoutError, BridgeError) as e:
+                name_line = f"name NOT set: {e}"
+        else:
+            name_line = (
+                f"rename this shape for orientation: "
+                f"rename_mask(mask_id={mask_result.get('formid')}, name=...)"
+            )
+
         # (e) set_params -- apply the requested adjustment on the masked instance
         try:
             set_result = self.bridge.call(
@@ -5793,8 +5925,7 @@ class DarktableMCPServer:
             f"bbox_display_frame={json.dumps(seg.get('bbox'))} "
             f"bbox_mask_frame={json.dumps(_polygon_bbox(mask_polygon))}",
             f"  formid={mask_result.get('formid')} mask_id={mask_result.get('mask_id')} "
-            f"opacity={mask_result.get('opacity')} "
-            f"(rename this shape for orientation: rename_mask(mask_id={mask_result.get('formid')}, name=...))",
+            f"opacity={mask_result.get('opacity')} ({name_line})",
             f"  applied: {json.dumps(set_result.get('applied') or {})}",
         ]
         resolved_box = seg.get("resolved_box")

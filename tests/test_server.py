@@ -78,6 +78,7 @@ class TestDarktableMCPServer:
             "get_module_mask",
             "get_mask_geometry",
             "rename_mask",
+            "delete_mask",
             "attach_mask",
             "detach_mask",
             "set_module_mask",
@@ -1588,6 +1589,83 @@ async def test_handle_rename_mask_surfaces_error():
     assert "not found" in result[0].text
 
 
+# ---- delete_mask (2026-07-31) -- housekeeping gap: no way to permanently
+# remove an orphan/unwanted mask (detach_mask only unwires it from one
+# module, leaving it in dev->forms forever).
+
+
+@pytest.mark.asyncio
+async def test_handle_delete_mask_reports_ok():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"ok": True, "mask_id": 42}
+    result = await server._handle_delete_mask({"mask_id": 42})
+    text = result[0].text
+    assert "ok=True" in text
+    assert "42" in text
+    server.bridge.call.assert_called_once_with("dev_delete_mask", {"mask_id": 42}, timeout=15.0)
+
+
+@pytest.mark.asyncio
+async def test_handle_delete_mask_requires_mask_id():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    result = await server._handle_delete_mask({})
+    assert "mask_id is required" in result[0].text
+    server.bridge.call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_delete_mask_surfaces_error():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {"error": "mask 99 not found in darkroom forms"}
+    result = await server._handle_delete_mask({"mask_id": 99})
+    assert "not found" in result[0].text
+
+
+# ---- add_path_mask's optional name param (2026-07-31) -- chains
+# rename_mask right after creation so a caller doesn't need a second
+# round-trip call just to name the mask it just made.
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_with_name_chains_rename():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.side_effect = [
+        {"ok": True, "formid": 42, "mask_id": 43, "points": 4, "opacity": 1.0,
+         "feather": 0.02, "smooth": True},
+        {"ok": True, "mask_id": 42, "name": "model body"},
+    ]
+    result = await server._handle_add_path_mask({
+        "op": "exposure",
+        "points": [{"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.1}, {"x": 0.2, "y": 0.2}],
+        "name": "model body",
+    })
+    text = result[0].text
+    assert "model body" in text
+    calls = server.bridge.call.call_args_list
+    assert calls[1].args[0] == "dev_rename_mask"
+    assert calls[1].args[1] == {"mask_id": 42, "name": "model body"}
+
+
+@pytest.mark.asyncio
+async def test_handle_add_path_mask_without_name_skips_rename():
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    server.bridge.call.return_value = {
+        "ok": True, "formid": 42, "mask_id": 43, "points": 4, "opacity": 1.0,
+        "feather": 0.02, "smooth": True,
+    }
+    await server._handle_add_path_mask({
+        "op": "exposure",
+        "points": [{"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.1}, {"x": 0.2, "y": 0.2}],
+    })
+    methods_called = [c.args[0] for c in server.bridge.call.call_args_list]
+    assert "dev_rename_mask" not in methods_called
+
+
 @pytest.mark.asyncio
 async def test_handle_attach_mask_forwards_args():
     server = DarktableMCPServer()
@@ -1913,6 +1991,45 @@ async def test_handle_mask_object_forwards_smooth_and_max_nodes():
     calls = server.bridge.call.call_args_list
     add_path_mask_call = next(c for c in calls if c.args[0] == "dev_add_path_mask")
     assert add_path_mask_call.args[1]["smooth"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_mask_object_with_name_chains_rename():
+    """Optional name param -- NOT the same as `label` (the segmentation
+    prompt) -- chains a dev_rename_mask call right after add_path_mask."""
+    server = DarktableMCPServer()
+    server.bridge = Mock()
+    sidecar_polygon = [{"x": 0.1, "y": 0.2}, {"x": 0.3, "y": 0.2}, {"x": 0.2, "y": 0.4}]
+    calls = [{"path": "/tmp/preview.png"}]
+    calls.extend([{"x": 0.9, "y": 0.05}] * len(sidecar_polygon))
+    calls.append({"instance": 1})
+    calls.append({"ok": True, "formid": 42, "mask_id": 555, "opacity": 1.0})
+    calls.append({"ok": True, "mask_id": 42, "name": "model body"})
+    calls.append({"applied": {"exposure": 0.2}})
+    calls.append({"path": "/tmp/preview2.png"})
+    server.bridge.call.side_effect = calls
+
+    with patch(
+        "darktable_mcp.server.run_segmentation",
+        return_value={
+            "polygon": sidecar_polygon,
+            "bbox": {"x": 0.1, "y": 0.2, "w": 0.2, "h": 0.2},
+            "score": 0.86,
+            "backend": "sam2",
+        },
+    ):
+        result = await server._handle_mask_object({
+            "op": "exposure",
+            "adjustment": {"exposure": 0.2},
+            "box": {"x": 0.2, "y": 0.3, "w": 0.2, "h": 0.4},
+            "name": "model body",
+        })
+
+    text = result[0].text
+    assert "model body" in text
+    call_list = server.bridge.call.call_args_list
+    rename_call = next(c for c in call_list if c.args[0] == "dev_rename_mask")
+    assert rename_call.args[1] == {"mask_id": 42, "name": "model body"}
 
 
 @pytest.mark.asyncio

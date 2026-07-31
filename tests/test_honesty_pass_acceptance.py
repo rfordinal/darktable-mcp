@@ -89,6 +89,7 @@ EXPECTED_TOOLS = {
     "get_module_mask",
     "get_mask_geometry",
     "rename_mask",
+    "delete_mask",
     "attach_mask",
     "detach_mask",
     "set_module_mask",
